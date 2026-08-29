@@ -661,6 +661,28 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         self.assertEqual(group["created_count"], 1)
         self.assertEqual(self.count_recipient_links(), 1)
 
+    def test_import_single_file_prefers_outlook_email_among_multiple_candidates(self):
+        account_id = self.insert_account("owner@outlook.com")
+
+        response = self.import_links(
+            mode="single",
+            files=[
+                (
+                    "mixed.txt",
+                    b"Primary Gmail----Owner@Gmail.com----Owner@Outlook.com\nRecipient01@iCloud.com\n",
+                )
+            ],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        group = payload["groups"][0]
+        self.assertEqual(group["main_email"], "Owner@Outlook.com")
+        self.assertEqual(group["account_id"], account_id)
+        self.assertEqual(group["created_count"], 1)
+        self.assertEqual(self.count_recipient_links(), 1)
+
     def test_import_requires_login_with_no_store_header(self):
         self.insert_account("owner@example.com")
 

@@ -11,6 +11,19 @@ from urllib.parse import SplitResult, urlsplit
 MAX_RECIPIENT_LINE_LENGTH = 320
 
 _INVALID_EXPORT_STEM_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RECIPIENT_EMAIL_CANDIDATE_RE = re.compile(
+    r"(?<![A-Za-z0-9!#$%&'*+/=?^_`{|}~-])"
+    r"([A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
+    r"(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*"
+    r"@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)"
+    r"(?![A-Za-z0-9!#$%&'*+/=?^_`{|}~-])"
+)
+_PREFERRED_MAIN_EMAIL_DOMAINS = {
+    "outlook.com",
+    "hotmail.com",
+    "live.com",
+    "msn.com",
+}
 _LOCAL_PART_RE = re.compile(
     r"^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*$"
 )
@@ -140,21 +153,45 @@ def normalize_public_base_url(value: Any) -> str:
     return SplitResult(*normalized).geturl()
 
 
-def _recipient_email_from_import_line(line: str) -> str:
-    if "----" not in line:
-        return line
+def _recipient_email_candidates_from_import_line(line: str) -> list[str]:
+    candidates: list[str] = []
+    seen_normalized: set[str] = set()
 
-    parts = [part.strip() for part in line.split("----")]
+    parts = [line] if "----" not in line else [part.strip() for part in line.split("----")]
     for part in parts:
         if not part:
             continue
-        try:
-            normalize_recipient_email(part)
-        except RecipientLinkInputError:
-            continue
-        return part
+        for match in _RECIPIENT_EMAIL_CANDIDATE_RE.finditer(part):
+            candidate = match.group(1).strip()
+            if not candidate:
+                continue
+            try:
+                normalized = normalize_recipient_email(candidate)
+            except RecipientLinkInputError:
+                continue
+            if normalized.normalized in seen_normalized:
+                continue
+            seen_normalized.add(normalized.normalized)
+            candidates.append(normalized.display)
 
-    return parts[0] if parts else line
+    return candidates
+
+
+def _is_preferred_main_email(email: str) -> bool:
+    domain = email.rsplit("@", 1)[-1].lower()
+    return domain in _PREFERRED_MAIN_EMAIL_DOMAINS
+
+
+def _recipient_email_from_import_line(line: str) -> str:
+    candidates = _recipient_email_candidates_from_import_line(line)
+    if not candidates:
+        return line
+
+    for candidate in candidates:
+        if _is_preferred_main_email(candidate):
+            return candidate
+
+    return candidates[0]
 
 
 def _parse_recipient_txt_lines(lines: list[tuple[int, str]]) -> ParsedRecipientFile:
