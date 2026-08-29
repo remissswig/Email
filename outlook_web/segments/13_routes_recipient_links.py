@@ -14,6 +14,7 @@ import zipfile
 from outlook_web.recipient_links import (
     RecipientLinkInputError,
     decode_recipient_txt,
+    decode_recipient_txt_with_main_email,
     normalize_public_base_url,
     normalize_recipient_email,
     parse_expiry,
@@ -30,6 +31,7 @@ RECIPIENT_LINK_MAX_FILES = 20
 RECIPIENT_LINK_MAX_TOTAL_BYTES = 5 * 1024 * 1024
 RECIPIENT_LINK_MAX_BINDINGS = 10_000
 RECIPIENT_LINK_MAX_PAGE_SIZE = 100
+RECIPIENT_LINK_MAX_MAILBOX_OPTIONS = 10
 
 RECIPIENT_LINK_ERROR_MESSAGES = {
     "invalid_mode": "导入模式无效",
@@ -42,6 +44,8 @@ RECIPIENT_LINK_ERROR_MESSAGES = {
     "expires_at_timezone_required": "自定义过期时间必须包含时区",
     "invalid_utf8": "TXT 文件编码无效，请使用 UTF-8",
     "main_mailbox_not_found": "主邮箱不存在或未导入",
+    "main_mailbox_data_exists": "导入失败，主邮箱数据已存在",
+    "main_mailbox_required": "请选择主邮箱",
     "no_valid_recipients": "文件中没有可导入的有效收件人",
     "file_persistence_failed": "文件导入失败，已回滚该文件",
     "no_valid_records": "没有可导入的有效记录",
@@ -97,9 +101,7 @@ def recipient_link_no_store(f):
 @app.after_request
 def recipient_link_import_after_request(response):
     path = request.path or ""
-    if path == "/api/verification-links/import" or path == "/verification-links" or path.startswith(
-        "/api/verification-links"
-    ):
+    if path in {"/verification-links", "/verification-links/manage"} or path.startswith("/api/verification-links"):
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -147,16 +149,14 @@ def parse_recipient_import_request() -> dict[str, Any]:
         content = _read_recipient_import_upload(item, remaining)
         total_bytes += len(content)
 
-        main_email = (
-            explicit_main_email
-            if mode == "single" and explicit_main_email
-            else _main_email_from_filename(source_file)
-        )
-
         parsed = None
         file_error = None
+        main_email = explicit_main_email if mode == "single" and explicit_main_email else ""
         try:
-            parsed = decode_recipient_txt(content)
+            if main_email:
+                parsed = decode_recipient_txt(content)
+            else:
+                main_email, parsed = decode_recipient_txt_with_main_email(content)
             total_bindings += len(parsed.recipients)
         except RecipientLinkInputError as exc:
             file_error = exc.code
@@ -353,6 +353,56 @@ def upsert_recipient_mail_link(
     raise RuntimeError("recipient token collision limit reached")
 
 
+def _recipient_import_export_response(export_items: list[dict[str, Any]], *, force_zip: bool = False):
+    if not export_items:
+        return None
+    if len(export_items) == 1 and not force_zip:
+        item = export_items[0]
+        if item["status"] == "failed":
+            return _recipient_link_attachment_response(
+                _recipient_link_import_failure_text(
+                    source_file=item["source_file"],
+                    main_email=item["main_email"],
+                    error_code=item["error_code"],
+                    errors=item.get("errors") or [],
+                ),
+                "text/plain; charset=utf-8",
+                _recipient_link_source_export_name(item["source_file"], failed=True),
+            )
+        group = item
+        return _recipient_link_attachment_response(
+            _recipient_link_txt_for_import_records(group["main_email"], group["records"]),
+            "text/plain; charset=utf-8",
+            _recipient_link_source_export_name(group["source_file"]),
+        )
+
+    used_names: set[str] = set()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+        for item in export_items:
+            if item["status"] == "failed":
+                archive.writestr(
+                    _recipient_link_source_export_name(item["source_file"], failed=True, used_names=used_names),
+                    _recipient_link_import_failure_text(
+                        source_file=item["source_file"],
+                        main_email=item["main_email"],
+                        error_code=item["error_code"],
+                        errors=item.get("errors") or [],
+                    ),
+                )
+            else:
+                archive.writestr(
+                    _recipient_link_source_export_name(item["source_file"], used_names=used_names),
+                    _recipient_link_txt_for_import_records(item["main_email"], item["records"]),
+                )
+    timestamp = recipient_link_now().strftime("%Y%m%d-%H%M%S")
+    return _recipient_link_attachment_response(
+        buffer.getvalue(),
+        "application/zip",
+        f"verification-links-{timestamp}.zip",
+    )
+
+
 @app.route("/api/verification-links/import", methods=["POST"])
 @recipient_link_no_store
 @csrf_exempt
@@ -372,7 +422,9 @@ def api_import_recipient_verification_links():
     created_total = 0
     reused_total = 0
     invalid_total = 0
+    export_items: list[dict[str, Any]] = []
     started_transaction = False
+    auto_export = str(request.form.get("auto_export") or "").strip().lower() in {"1", "true", "yes"}
 
     try:
         started_transaction = _begin_recipient_import_transaction(db)
@@ -393,6 +445,16 @@ def api_import_recipient_verification_links():
                         "errors": [],
                     }
                 )
+                if auto_export and parsed_request["mode"] == "batch":
+                    export_items.append(
+                        {
+                            "status": "failed",
+                            "source_file": import_file["source_file"],
+                            "main_email": import_file["main_email"],
+                            "error_code": import_file["file_error"],
+                            "errors": [],
+                        }
+                    )
                 continue
 
             account = resolve_account_by_address(import_file["main_email"])
@@ -406,6 +468,16 @@ def api_import_recipient_verification_links():
                         "errors": file_errors,
                     }
                 )
+                if auto_export and parsed_request["mode"] == "batch":
+                    export_items.append(
+                        {
+                            "status": "failed",
+                            "source_file": import_file["source_file"],
+                            "main_email": import_file["main_email"],
+                            "error_code": "main_mailbox_not_found",
+                            "errors": file_errors,
+                        }
+                    )
                 continue
 
             if not parsed_file.recipients:
@@ -418,7 +490,34 @@ def api_import_recipient_verification_links():
                         "errors": file_errors,
                     }
                 )
+                if auto_export and parsed_request["mode"] == "batch":
+                    export_items.append(
+                        {
+                            "status": "failed",
+                            "source_file": import_file["source_file"],
+                            "main_email": import_file["main_email"],
+                            "error_code": "no_valid_recipients",
+                            "errors": file_errors,
+                        }
+                    )
                 continue
+
+            if parsed_request["mode"] == "single":
+                existing_count = int(
+                    db.execute(
+                        "SELECT COUNT(*) AS count FROM recipient_mail_links WHERE account_id = ?",
+                        (int(account["id"]),),
+                    ).fetchone()["count"]
+                    or 0
+                )
+                if existing_count:
+                    db.rollback()
+                    return recipient_link_json_error(
+                        "main_mailbox_data_exists",
+                        409,
+                        main_email=import_file["main_email"],
+                        error=f"导入失败，{import_file['main_email']} 数据已存在",
+                    )
 
             savepoint_name = f"recipient_import_{index}"
             db.execute(f"SAVEPOINT {savepoint_name}")
@@ -446,6 +545,16 @@ def api_import_recipient_verification_links():
                         "errors": file_errors,
                     }
                 )
+                if auto_export and parsed_request["mode"] == "batch":
+                    export_items.append(
+                        {
+                            "status": "failed",
+                            "source_file": import_file["source_file"],
+                            "main_email": import_file["main_email"],
+                            "error_code": "file_persistence_failed",
+                            "errors": file_errors,
+                        }
+                    )
                 continue
             except Exception:
                 _cleanup_recipient_import_savepoint(db, savepoint_name)
@@ -467,6 +576,14 @@ def api_import_recipient_verification_links():
                     "errors": file_errors,
                 }
             )
+            export_items.append(
+                {
+                    "status": "success",
+                    "source_file": import_file["source_file"],
+                    "main_email": import_file["main_email"],
+                    "records": records,
+                }
+            )
 
         summary = _recipient_import_summary(
             successful_files=len(groups),
@@ -475,7 +592,7 @@ def api_import_recipient_verification_links():
             reused_records=reused_total,
             invalid_lines=invalid_total,
         )
-        if not groups:
+        if not groups and not auto_export:
             db.rollback()
             return recipient_link_json_error(
                 "no_valid_records",
@@ -486,6 +603,11 @@ def api_import_recipient_verification_links():
             )
 
         db.commit()
+        if auto_export:
+            return _recipient_import_export_response(
+                export_items,
+                force_zip=parsed_request["mode"] == "batch",
+            )
         return recipient_link_json_response(
             {
                 "success": True,
@@ -703,10 +825,44 @@ def _recipient_link_group_rows(rows: list[Any]) -> list[dict[str, Any]]:
 
 
 def _recipient_link_txt_for_rows(rows: list[Any]) -> bytes:
-    lines = []
+    lines = [str(rows[0]["main_email_display"] or "").strip()] if rows else []
     for row in rows:
         token = decrypt_data(row["token_encrypted"] or "")
         lines.append(f"{row['recipient_email_display']}----{build_recipient_link_url(token)}")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _recipient_link_txt_for_import_records(main_email: str, records: list[dict[str, Any]]) -> bytes:
+    lines = [str(main_email or "").strip()]
+    for record in records:
+        lines.append(f"{record['recipient_email_display']}----{build_recipient_link_url(record['token'])}")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _recipient_link_import_failure_text(
+    *,
+    source_file: str,
+    main_email: str,
+    error_code: str,
+    errors: list[dict[str, Any]] | None = None,
+) -> bytes:
+    lines = [
+        "导入失败",
+        f"文件：{source_file}",
+    ]
+    if main_email:
+        lines.append(f"主邮箱：{main_email}")
+    lines.append(f"原因：{RECIPIENT_LINK_ERROR_MESSAGES.get(error_code, '请求处理失败')}")
+    for error in errors or []:
+        value = str(error.get("value") or "").strip()
+        line = error.get("line")
+        code = str(error.get("error_code") or "").strip()
+        detail = f"第{line}行" if line else "内容"
+        if value:
+            detail = f"{detail} {value}"
+        if code:
+            detail = f"{detail} ({code})"
+        lines.append(detail)
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
@@ -715,6 +871,26 @@ def _recipient_link_attachment_response(content: bytes, mimetype: str, filename:
     response.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(filename)}"
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+def _recipient_link_source_export_name(
+    source_file: Any,
+    *,
+    failed: bool = False,
+    used_names: set[str] | None = None,
+) -> str:
+    source_name = Path(str(source_file or "")).name
+    stem = source_name[:-4] if source_name.lower().endswith(".txt") else source_name
+    prefix = "失败-" if failed else "api-"
+    candidate = f"{prefix}{safe_export_stem(stem)}.txt"
+    if used_names is None:
+        return candidate
+    suffix = 2
+    while candidate in used_names:
+        candidate = f"{prefix}{safe_export_stem(stem)}-{suffix}.txt"
+        suffix += 1
+    used_names.add(candidate)
+    return candidate
 
 
 def _recipient_link_unique_export_name(base_name: str, used_names: set[str]) -> str:
@@ -758,6 +934,69 @@ def verification_links_management_page():
     return render_template("verification_links.html")
 
 
+@app.route("/verification-links/manage", methods=["GET"])
+@recipient_link_no_store
+@login_required
+def verification_links_imported_mailboxes_page():
+    if CLUSTER_CONFIG.is_replica:
+        return _cluster_read_only_error()
+    return render_template("verification_links_manage.html")
+
+
+@app.route("/api/verification-links/main-mailboxes", methods=["GET"])
+@recipient_link_no_store
+@login_required
+def api_search_recipient_link_main_mailboxes():
+    if CLUSTER_CONFIG.is_replica:
+        return _cluster_read_only_error()
+
+    try:
+        limit = _recipient_link_parse_positive_int(
+            request.args.get("limit", str(RECIPIENT_LINK_MAX_MAILBOX_OPTIONS)),
+            code="invalid_page_size",
+            minimum=1,
+            maximum=RECIPIENT_LINK_MAX_MAILBOX_OPTIONS,
+        )
+    except RecipientLinkInputError as exc:
+        return recipient_link_json_error(exc.code, 400)
+
+    query = _recipient_link_escape_like(str(request.args.get("q") or "").strip())
+    params: list[Any] = []
+    primary_filter = ""
+    alias_filter = ""
+    if query:
+        primary_filter = "WHERE email COLLATE NOCASE LIKE ? ESCAPE '\\'"
+        alias_filter = "WHERE alias_email COLLATE NOCASE LIKE ? ESCAPE '\\'"
+        params.extend([f"%{query}%", f"%{query}%"])
+
+    db = get_db()
+    rows = db.execute(
+        f"""
+        SELECT value
+        FROM (
+            SELECT email AS value, LOWER(email) AS sort_key, 0 AS source_order
+            FROM accounts
+            {primary_filter}
+            UNION
+            SELECT alias_email AS value, LOWER(alias_email) AS sort_key, 1 AS source_order
+            FROM account_aliases
+            {alias_filter}
+        )
+        WHERE value IS NOT NULL AND TRIM(value) != ''
+        ORDER BY source_order, sort_key
+        LIMIT ?
+        """,
+        tuple(params) + (limit,),
+    ).fetchall()
+    return recipient_link_json_response(
+        {
+            "success": True,
+            "items": [str(row["value"]).strip() for row in rows],
+            "limit": limit,
+        }
+    )
+
+
 @app.route("/api/verification-links", methods=["GET"])
 @recipient_link_no_store
 @login_required
@@ -783,9 +1022,17 @@ def api_list_recipient_verification_links():
         return recipient_link_json_error("invalid_status", 400)
 
     query = _recipient_link_escape_like(str(request.args.get("query") or "").strip())
+    main_email = str(request.args.get("main_email") or "").strip()
     now = recipient_link_timestamp()
     clauses = []
     params: list[Any] = []
+    if main_email:
+        account = resolve_account_by_address(main_email)
+        if account:
+            clauses.append("account_id = ?")
+            params.append(int(account["id"]))
+        else:
+            clauses.append("0 = 1")
     if query:
         clauses.append(
             "(main_email_display COLLATE NOCASE LIKE ? ESCAPE '\\' OR recipient_email_display COLLATE NOCASE LIKE ? ESCAPE '\\')"
@@ -897,6 +1144,47 @@ def _recipient_link_mutate_rows(ids: list[int], *, expires_at: str | None = None
                 )
         db.commit()
         return rows
+    except Exception:
+        db.rollback()
+        raise
+
+
+@app.route("/api/verification-links/main-mailbox", methods=["DELETE"])
+@recipient_link_no_store
+@csrf_exempt
+@login_required
+def api_delete_recipient_verification_links_by_main_mailbox():
+    if CLUSTER_CONFIG.is_replica:
+        return _cluster_read_only_error()
+
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict) or set(payload.keys()) != {"main_email"}:
+        return recipient_link_json_error("invalid_export_input", 400)
+
+    main_email = str(payload.get("main_email") or "").strip()
+    if not main_email:
+        return recipient_link_json_error("main_mailbox_required", 400)
+
+    account = resolve_account_by_address(main_email)
+    if account is None:
+        return recipient_link_json_error("main_mailbox_not_found", 404)
+
+    db = get_db()
+    db.execute("BEGIN")
+    try:
+        cursor = db.execute(
+            "DELETE FROM recipient_mail_links WHERE account_id = ?",
+            (int(account["id"]),),
+        )
+        db.commit()
+        return recipient_link_json_response(
+            {
+                "success": True,
+                "account_id": int(account["id"]),
+                "main_email": main_email,
+                "deleted_count": int(cursor.rowcount or 0),
+            }
+        )
     except Exception:
         db.rollback()
         raise

@@ -64,7 +64,10 @@ def normalize_recipient_email(value: Any) -> RecipientAddress:
         ):
             raise RecipientLinkInputError("invalid_email")
 
-    parsed = getaddresses([display], strict=True)
+    try:
+        parsed = getaddresses([display], strict=True)
+    except TypeError:
+        parsed = getaddresses([display])
     if len(parsed) != 1 or parsed[0][0] or parsed[0][1] != display:
         raise RecipientLinkInputError("invalid_email")
 
@@ -137,35 +140,37 @@ def normalize_public_base_url(value: Any) -> str:
     return SplitResult(*normalized).geturl()
 
 
-def decode_recipient_txt(content: bytes) -> ParsedRecipientFile:
-    try:
-        decoded = content.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise RecipientLinkInputError("invalid_utf8") from exc
+def _recipient_email_from_import_line(line: str) -> str:
+    if "----" in line:
+        return line.split("----", 1)[0].strip()
+    return line
 
+
+def _parse_recipient_txt_lines(lines: list[tuple[int, str]]) -> ParsedRecipientFile:
     recipients: list[RecipientAddress] = []
     errors: list[dict[str, object]] = []
     seen_normalized: set[str] = set()
 
-    for line_number, raw_line in enumerate(decoded.splitlines(), start=1):
+    for line_number, raw_line in lines:
         line = raw_line.strip()
         if not line:
             continue
-        if len(line) > MAX_RECIPIENT_LINE_LENGTH:
+        recipient_value = _recipient_email_from_import_line(line)
+        if len(recipient_value) > MAX_RECIPIENT_LINE_LENGTH:
             errors.append(
                 {
                     "line": line_number,
-                    "value": line[:MAX_RECIPIENT_LINE_LENGTH],
+                    "value": recipient_value[:MAX_RECIPIENT_LINE_LENGTH],
                     "error_code": "line_too_long",
                 }
             )
             continue
 
         try:
-            recipient = normalize_recipient_email(line)
+            recipient = normalize_recipient_email(recipient_value)
         except RecipientLinkInputError as exc:
             errors.append(
-                {"line": line_number, "value": line, "error_code": exc.code}
+                {"line": line_number, "value": recipient_value, "error_code": exc.code}
             )
             continue
 
@@ -176,6 +181,37 @@ def decode_recipient_txt(content: bytes) -> ParsedRecipientFile:
         recipients.append(recipient)
 
     return ParsedRecipientFile(recipients=recipients, errors=errors)
+
+
+def decode_recipient_txt(content: bytes) -> ParsedRecipientFile:
+    try:
+        decoded = content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise RecipientLinkInputError("invalid_utf8") from exc
+
+    return _parse_recipient_txt_lines(list(enumerate(decoded.splitlines(), start=1)))
+
+
+def decode_recipient_txt_with_main_email(content: bytes) -> tuple[str, ParsedRecipientFile]:
+    try:
+        decoded = content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise RecipientLinkInputError("invalid_utf8") from exc
+
+    main_email = ""
+    recipient_lines: list[tuple[int, str]] = []
+    found_main_email = False
+    for line_number, raw_line in enumerate(decoded.splitlines(), start=1):
+        line = raw_line.strip()
+        if not found_main_email:
+            if not line:
+                continue
+            main_email = _recipient_email_from_import_line(line)
+            found_main_email = True
+            continue
+        recipient_lines.append((line_number, raw_line))
+
+    return main_email, _parse_recipient_txt_lines(recipient_lines)
 
 
 def safe_export_stem(value: Any) -> str:

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>管理已导入邮箱</title><link rel="stylesheet" href="{{ url_for('static', filename='css/verification-links.css') }}">
+</head>
+<body>
+  <header class="site-nav" aria-label="主导航">
+    <div class="site-nav-inner">
+      <a class="site-nav-brand" href="/" aria-label="返回邮箱主页">
+        <span class="site-nav-mark" aria-hidden="true">✉</span>
+        <span>Outlook Mail</span>
+      </a>
+      <div class="site-nav-links">
+        <a class="site-nav-back" href="/verification-links">返回导入页面</a>
+        <a class="site-nav-back" href="/">返回邮箱主页</a>
+      </div>
+    </div>
+  </header>
+  <main class="page">
+    <header class="hero"><div><p class="eyebrow">OUTLOOK MAIL</p><h1>管理已导入邮箱</h1><p class="lead">按主邮箱筛选已生成的收件人验证链接，查看访问次数、修改期限或导出记录。</p></div><div class="metric"><span>记录总数</span><strong id="activeCount">0</strong></div></header>
+    <section class="panel management open" id="management">
+      <div class="table-head">
+        <div><h2>已导入邮箱</h2><span id="summary" class="muted"></span></div>
+        <div class="filters">
+          <label class="filter-field filter-field-wide">主邮箱
+            <div class="mailbox-combobox" data-mailbox-combobox>
+              <input id="mainEmailFilter" type="text" role="combobox" aria-autocomplete="list" aria-controls="mainEmailFilterOptions" aria-expanded="false" autocomplete="off" placeholder="选择主邮箱或别名">
+              <button class="combobox-clear" type="button" aria-label="清空主邮箱" title="清空" hidden>×</button>
+              <div class="combobox-options" id="mainEmailFilterOptions" role="listbox" hidden></div>
+            </div>
+          </label>
+          <label class="filter-field">收件人
+            <input id="query" type="search" placeholder="搜索收件人">
+          </label>
+          <label class="filter-field">状态
+            <select id="status"><option value="all">全部状态</option><option value="active">有效</option><option value="expired">已过期</option></select>
+          </label>
+          <button class="button" id="refresh">刷新</button>
+          <button class="button danger" id="deleteMainEmail">删除主邮箱</button>
+          <button class="button danger" id="delete">删除选中</button>
+          <button class="button" id="export">导出选中</button>
+        </div>
+      </div>
+      <div class="table-wrap"><table><thead><tr><th><input id="selectAll" type="checkbox"></th><th>主邮箱</th><th>收件人</th><th>状态</th><th>访问次数</th><th>导入时间</th><th>失效时间</th><th>操作</th></tr></thead><tbody id="rows"><tr><td colspan="8" class="empty">暂无记录</td></tr></tbody></table></div>
+      <footer class="pager"><button class="button ghost" id="prev">上一页</button><span id="pageInfo"></span><button class="button ghost" id="next">下一页</button></footer>
+    </section>
+  </main><div id="toast" class="toast" role="status"></div><script src="{{ url_for('static', filename='js/verification-links.js') }}"></script>
+</body></html>

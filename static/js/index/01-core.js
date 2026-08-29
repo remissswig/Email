@@ -20,8 +20,8 @@
         let groups = [];
         let accountsCache = {}; // 缓存各分组的邮箱列表
         let currentAccountListSource = []; // 当前账号列表的原始数据源（分组或搜索结果）
-        const ACCOUNT_LIST_DEFAULT_PAGE_SIZE = 200;
-        const ACCOUNT_LIST_MAX_PAGE_SIZE = 10000;
+        const ACCOUNT_LIST_DEFAULT_PAGE_SIZE = 20;
+        const ACCOUNT_LIST_MAX_PAGE_SIZE = 20;
         let accountListPageSize = ACCOUNT_LIST_DEFAULT_PAGE_SIZE;
         let accountPaginationState = {
             mode: '',

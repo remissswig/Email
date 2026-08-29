@@ -801,7 +801,7 @@ def api_generate_export_verify_token():
 # ==================== 邮箱账号 API ====================
 
 def get_account_list_request_args() -> Dict[str, Any]:
-    limit_arg = request.args.get('limit')
+    limit_arg = request.args.get('limit', 20)
     limit, offset = normalize_account_pagination(limit_arg, request.args.get('offset', 0))
     sort_by, sort_order = normalize_account_sort(
         request.args.get('sort_by', 'created_at'),
