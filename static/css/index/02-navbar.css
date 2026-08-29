@@ -1,0 +1,594 @@
+        /* 顶部导航栏 */
+        .navbar {
+            height: 56px;
+            background-color: var(--skin-surface);
+            border-bottom: 1px solid var(--skin-border);
+            display: flex;
+            align-items: center;
+            padding: 0 24px;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 100;
+        }
+
+        .navbar-brand {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--skin-text);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+        }
+
+        .navbar-brand svg {
+            width: 24px;
+            height: 24px;
+        }
+
+        .navbar-brand-title {
+            flex-shrink: 0;
+        }
+
+        .navbar-brand-meta {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-width: 0;
+        }
+
+        .app-version {
+            position: relative;
+            flex-shrink: 0;
+        }
+
+        .app-version-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            min-height: 24px;
+            padding: 0 10px;
+            border: 1px solid var(--skin-border-strong);
+            border-radius: 999px;
+            background-color: var(--skin-surface-soft);
+            color: var(--skin-text-soft);
+            font-size: 11px;
+            font-weight: 500;
+            transition: all 0.15s ease;
+        }
+
+        .app-version-chip:hover {
+            border-color: var(--skin-primary);
+            background-color: var(--skin-surface);
+            color: var(--skin-text);
+            box-shadow: 0 4px 12px var(--skin-shadow);
+        }
+
+        .app-version.is-open .app-version-chip {
+            border-color: var(--skin-primary);
+            background-color: var(--skin-surface);
+            color: var(--skin-text);
+        }
+
+        .app-version-chip__label {
+            color: var(--skin-text-muted);
+            font-weight: 500;
+        }
+
+        .app-version-chip__value {
+            color: var(--skin-text);
+            font-weight: 600;
+        }
+
+        .app-version-chip__upgrade-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 22px;
+            height: 22px;
+            border-radius: 999px;
+            flex-shrink: 0;
+            background: linear-gradient(180deg, #fef3c7 0%, #fde68a 100%);
+            border: 1px solid rgba(245, 158, 11, 0.32);
+            color: #92400e;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+        }
+
+        .app-version-chip__upgrade-badge[hidden] {
+            display: none;
+        }
+
+        .app-version-chip__upgrade-badge svg {
+            width: 12px;
+            height: 12px;
+        }
+
+        .app-version-popover {
+            position: absolute;
+            top: calc(100% + 10px);
+            left: 0;
+            width: 240px;
+            padding: 14px;
+            border: 1px solid #e5e7eb;
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.98);
+            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.14);
+            backdrop-filter: blur(14px);
+            opacity: 0;
+            visibility: hidden;
+            transform: translateY(-6px);
+            transition: opacity 0.18s ease, transform 0.18s ease, visibility 0.18s ease;
+            pointer-events: none;
+            z-index: 120;
+        }
+
+        .app-version.is-open .app-version-popover {
+            opacity: 1;
+            visibility: visible;
+            transform: translateY(0);
+            pointer-events: auto;
+        }
+
+        .app-version-popover__eyebrow {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            color: #64748b;
+        }
+
+        .app-version-popover__value {
+            margin-top: 4px;
+            font-size: 20px;
+            line-height: 1.2;
+            font-weight: 700;
+            color: #0f172a;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .app-version-popover__meta {
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .app-version-status {
+            display: inline-flex;
+            align-items: center;
+            min-height: 24px;
+            padding: 0 10px;
+            border-radius: 999px;
+            background: #eef2ff;
+            color: #3730a3;
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .app-version-status[data-state="checking"] {
+            background: #e2e8f0;
+            color: #475569;
+        }
+
+        .app-version-status[data-state="up_to_date"] {
+            background: #eef2ff;
+            color: #3730a3;
+        }
+
+        .app-version-status[data-state="update_available"] {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .app-version-status[data-state="ahead"] {
+            background: #dbeafe;
+            color: #1d4ed8;
+        }
+
+        .app-version-status[data-state="unknown"] {
+            background: #fee2e2;
+            color: #b91c1c;
+        }
+
+        .app-version-popover__hint {
+            font-size: 12px;
+            color: #64748b;
+        }
+
+        .app-version-popover__actions {
+            margin-top: 14px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .app-version-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 32px;
+            padding: 0 12px;
+            border: 1px solid #e5e7eb;
+            border-radius: 10px;
+            background: #f8fafc;
+            color: #334155;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: border-color 0.15s, background-color 0.15s, color 0.15s;
+        }
+
+        .app-version-link:hover {
+            border-color: #cbd5e1;
+            background: #f1f5f9;
+            color: #0f172a;
+        }
+
+        .app-version-link--primary {
+            border-color: #2563eb;
+            background: #2563eb;
+            color: #ffffff;
+        }
+
+        .app-version-link--primary:hover {
+            border-color: #1d4ed8;
+            background: #1d4ed8;
+            color: #ffffff;
+        }
+
+        .app-version-link:disabled {
+            cursor: not-allowed;
+            opacity: 0.62;
+        }
+
+        .navbar-center {
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            min-width: 0;
+        }
+
+        .current-account {
+            font-size: 14px;
+            color: var(--skin-text-muted);
+            background-color: var(--skin-surface-muted);
+            padding: 6px 16px;
+            border-radius: 20px;
+            display: none;
+            cursor: pointer;
+            transition: all 0.2s;
+            max-width: min(40vw, 520px);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .current-account:hover {
+            background-color: var(--skin-surface-hover);
+        }
+
+        .current-account.show {
+            display: block;
+        }
+
+        .current-account strong {
+            color: var(--skin-text);
+            font-weight: 500;
+        }
+
+        .navbar-actions {
+            display: flex;
+            gap: 12px;
+            flex-shrink: 0;
+            position: relative;
+            z-index: 101;
+        }
+
+        .navbar-actions-menu {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .navbar-btn {
+            background: none;
+            border: 1px solid var(--skin-border);
+            color: var(--skin-text-muted);
+            cursor: pointer;
+            font-size: 13px;
+            padding: 6px 12px;
+            border-radius: 6px;
+            transition: all 0.15s;
+            position: relative;
+            z-index: 102;
+        }
+
+        .mobile-nav-menu-btn {
+            display: none;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            min-height: 36px;
+            padding: 0 12px;
+            border: 1px solid var(--skin-border);
+            border-radius: 10px;
+            background: var(--skin-surface);
+            color: var(--skin-text);
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            transition: border-color 0.15s, background-color 0.15s, color 0.15s;
+        }
+
+        .mobile-nav-menu-btn:hover {
+            background-color: var(--skin-surface-soft);
+            border-color: #cbd5e1;
+            color: var(--skin-primary-hover);
+        }
+
+        .mobile-nav-menu-btn svg {
+            width: 16px;
+            height: 16px;
+        }
+
+        .navbar-btn:hover {
+            background-color: var(--skin-surface-muted);
+            border-color: var(--skin-border-strong);
+        }
+
+        /* GitHub Star 按钮 */
+        .github-star-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 32px;
+            padding: 0 10px 0 6px;
+            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+            border: 1px solid #dbe1e8;
+            color: #0f172a;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 700;
+            border-radius: 999px;
+            transition: border-color 0.15s, background-color 0.15s, color 0.15s, box-shadow 0.15s, transform 0.15s;
+            text-decoration: none;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 0 rgba(15, 23, 42, 0.04);
+        }
+
+        .github-star-btn:hover {
+            background: linear-gradient(180deg, #ffffff 0%, #f1f5f9 100%);
+            border-color: #c7d0db;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.92), 0 10px 22px rgba(15, 23, 42, 0.08);
+            transform: translateY(-1px);
+        }
+
+        .github-star-btn:active {
+            transform: translateY(0);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.92), 0 4px 10px rgba(15, 23, 42, 0.08);
+        }
+
+        .github-star-btn:focus-visible {
+            outline: none;
+            border-color: #93c5fd;
+            box-shadow: 0 0 0 3px rgba(147, 197, 253, 0.32);
+        }
+
+        .github-star-btn__badge {
+            width: 22px;
+            height: 22px;
+            border-radius: 999px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            background: linear-gradient(180deg, #fef3c7 0%, #fde68a 100%);
+            border: 1px solid rgba(245, 158, 11, 0.32);
+            color: #92400e;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+        }
+
+        .github-star-btn__badge svg {
+            width: 12px;
+            height: 12px;
+        }
+
+        .github-star-btn__text {
+            white-space: nowrap;
+            letter-spacing: 0.01em;
+        }
+
+        .github-star-btn__arrow {
+            width: 12px;
+            height: 12px;
+            color: #94a3b8;
+            flex-shrink: 0;
+            transition: transform 0.15s, color 0.15s;
+        }
+
+        .github-star-btn:hover .github-star-btn__arrow {
+            color: #475569;
+            transform: translate(1px, -1px);
+        }
+
+        /* 导航栏下拉菜单 */
+        .navbar-dropdown {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+        }
+
+        .navbar-dropdown-menu {
+            display: none;
+            position: absolute;
+            top: calc(100% + 6px);
+            right: 0;
+            background: var(--skin-surface);
+            border: 1px solid var(--skin-border-strong);
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+            min-width: 160px;
+            z-index: 200;
+            padding: 6px;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .navbar-dropdown-menu::before {
+            content: '';
+            position: absolute;
+            top: -10px;
+            left: 0;
+            right: 0;
+            height: 10px;
+            background: transparent;
+        }
+
+        .navbar-dropdown.is-open .navbar-dropdown-menu,
+        .navbar-dropdown:hover .navbar-dropdown-menu {
+            display: flex;
+        }
+
+        .dropdown-item {
+            display: block;
+            width: 100%;
+            padding: 8px 12px;
+            background: none;
+            border: none;
+            border-radius: 6px;
+            color: var(--skin-text-muted);
+            font-size: 13px;
+            text-align: left;
+            cursor: pointer;
+            transition: background-color 0.15s, color 0.15s;
+            white-space: nowrap;
+        }
+
+        .dropdown-item:hover {
+            background-color: var(--skin-surface-soft);
+            color: var(--skin-text);
+        }
+
+        .dropdown-item--danger {
+            color: var(--skin-danger);
+        }
+
+        .dropdown-item--danger:hover {
+            background-color: #fef2f2;
+            color: var(--skin-danger);
+        }
+
+        .dropdown-divider {
+            height: 1px;
+            background-color: var(--skin-border);
+            margin: 4px 6px;
+        }
+
+        .dropdown-arrow {
+            transition: transform 0.15s;
+        }
+
+        .navbar-dropdown.is-open .dropdown-arrow,
+        .navbar-dropdown:hover .dropdown-arrow {
+            transform: rotate(180deg);
+        }
+
+        /* 头像框按钮样式 */
+        .navbar-avatar-btn {
+            background: none;
+            border: none;
+            padding: 0;
+            cursor: pointer;
+            outline: none;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            transition: transform 0.15s, box-shadow 0.15s;
+        }
+
+        .navbar-avatar-btn:hover {
+            transform: scale(1.05);
+        }
+
+        .avatar-frame {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+            border: 2px solid #bfdbfe;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: #2563eb;
+            box-shadow: 0 2px 8px var(--skin-shadow);
+            transition: all 0.15s ease-in-out;
+        }
+
+        .navbar-avatar-btn:hover .avatar-frame {
+            border-color: #3b82f6;
+            color: #1d4ed8;
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.15);
+        }
+
+        .avatar-icon {
+            display: block;
+        }
+
+        /* PC端隐藏移动端专用按钮，移动端隐藏PC端下拉 */
+        .mobile-only-btn {
+            display: none !important;
+        }
+        .desktop-only-dropdown {
+            display: inline-block;
+        }
+        .desktop-only-btn {
+            display: inline-flex !important;
+            align-items: center;
+            gap: 6px;
+        }
+        .navbar-icon-btn {
+            background: none;
+            border: 1px solid var(--skin-border);
+            color: var(--skin-text-soft);
+            cursor: pointer;
+            width: 34px;
+            height: 34px;
+            border-radius: 8px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s;
+            position: relative;
+            z-index: 102;
+            padding: 0;
+        }
+        .navbar-icon-btn:hover {
+            background-color: var(--skin-surface-soft);
+            border-color: var(--skin-border-strong);
+            color: var(--skin-primary-hover);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px var(--skin-shadow);
+        }
+        .navbar-icon-btn svg {
+            width: 16px;
+            height: 16px;
+            display: block;
+        }
+
+        @media (max-width: 768px) {
+            .mobile-only-btn {
+                display: inline-flex !important;
+            }
+            .desktop-only-dropdown {
+                display: none !important;
+            }
+            .desktop-only-btn {
+                display: none !important;
+            }
+        }
+

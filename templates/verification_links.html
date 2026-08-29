@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>导入邮箱</title><link rel="stylesheet" href="{{ url_for('static', filename='css/verification-links.css') }}">
+  <style>
+    .mailbox-combobox{position:relative;margin-top:7px}.mailbox-combobox input{width:100%;padding-right:40px}.combobox-clear{position:absolute;z-index:3;top:50%;right:8px;width:28px;height:28px;padding:0;border:0;border-radius:4px;background:transparent;color:#6d7a89;font-size:20px;line-height:1;transform:translateY(-50%);cursor:pointer}.combobox-clear:hover{background:#eef4fb;color:#126ee8}.combobox-options{position:absolute;z-index:20;top:calc(100% + 5px);left:0;right:0;max-height:220px;overflow-y:auto;border:1px solid #ccd5dd;border-radius:6px;background:#fff;box-shadow:0 8px 22px #25384b24}.combobox-option{display:block;width:100%;padding:9px 11px;border:0;border-bottom:1px solid #edf0f2;background:#fff;color:#1b2733;text-align:left;cursor:pointer;overflow-wrap:anywhere}.combobox-option:last-child{border-bottom:0}.combobox-option:hover,.combobox-option:focus{outline:0;background:#eef5ff;color:#126ee8}.combobox-empty{display:block;padding:12px;color:#778490;font-size:13px;text-align:center}
+  </style>
+</head>
+<body>
+  <header class="site-nav" aria-label="主导航">
+    <div class="site-nav-inner">
+      <a class="site-nav-brand" href="/" aria-label="返回邮箱主页">
+        <span class="site-nav-mark" aria-hidden="true">✉</span>
+        <span>Outlook Mail</span>
+      </a>
+      <a class="site-nav-back" href="/">← 返回邮箱主页</a>
+    </div>
+  </header>
+  <main class="page">
+    <header class="hero"><div><p class="eyebrow">OUTLOOK MAIL</p><h1>导入邮箱</h1><p class="lead">上传 TXT 文件或粘贴邮箱列表，为每个收件人生成独立的最新邮件访问链接。</p></div><div class="metric"><span>有效链接</span><strong id="activeCount">0</strong></div></header>
+    <input id="files" type="file" accept=".txt,text/plain" multiple hidden>
+    <section class="cards">
+      <article class="card"><div class="card-title"><h2>TXT 文件导入</h2><span class="tag">单个主邮箱</span></div><button class="dropzone" type="button" onclick="window.verificationImportMode='single';document.getElementById('files').click()"><span class="drop-icon">⇥</span><b>选择 TXT 文件</b><small>文件内容按换行分割，每行一个收件人</small></button><label class="field-label">主邮箱 <span>（可选，清空后使用 TXT 文件名）</span></label><div class="mailbox-combobox" data-mailbox-combobox><input id="mainemail" type="text" role="combobox" aria-autocomplete="list" aria-controls="mainemailOptions" aria-expanded="false" autocomplete="off" placeholder="输入邮箱或别名筛选"><button class="combobox-clear" type="button" aria-label="清空主邮箱" title="清空" hidden>×</button><div class="combobox-options" id="mainemailOptions" role="listbox" hidden></div></div><label class="field-label">公开地址 <span>（选填，导出链接使用此地址）</span><input id="importBaseUrl" type="url" placeholder="例如：http://47.112.24.161:5001"></label><div class="card-actions"><select id="expiry"><option value="never">永久有效</option><option value="7d">7 天</option><option value="30d">30 天</option><option value="custom">自定义时间</option></select><input id="expiresAt" type="datetime-local" hidden><button class="button primary" id="import">导入并导出 TXT</button></div></article>
+      <article class="card"><div class="card-title"><h2>批量 TXT 导入</h2><span class="tag">按文件名识别主邮箱</span></div><button class="dropzone" type="button" onclick="document.getElementById('files').click()"><span class="drop-icon">▱</span><b>选择多个 TXT 文件</b><small>每个文件名必须是系统中的主邮箱或别名</small></button><p class="hint">每个 TXT 按单文件规则解析，导入完成后自动下载 ZIP。</p><button class="button primary wide" id="batchImport" type="button">批量导入并导出 ZIP</button></article>
+      <article class="card text-card"><div class="card-title"><h2>文本导入</h2><span class="tag">快速粘贴</span></div><label class="field-label">主邮箱 <span>（可选，清空后由导入规则处理）</span></label><div class="mailbox-combobox" data-mailbox-combobox><input id="textMainemail" type="text" role="combobox" aria-autocomplete="list" aria-controls="textMainemailOptions" aria-expanded="false" autocomplete="off" placeholder="输入邮箱或别名筛选"><button class="combobox-clear" type="button" aria-label="清空主邮箱" title="清空" hidden>×</button><div class="combobox-options" id="textMainemailOptions" role="listbox" hidden></div></div><textarea id="textRecipients" placeholder="recipient@example.com&#10;another@example.com"></textarea><p class="hint">每行一个邮箱，支持换行、空格和逗号分隔。</p><button class="button" id="textImport" type="button">使用文本导入</button></article>
+      <article class="card export-card"><div class="card-title"><h2>管理已导入邮箱</h2><span class="tag">查询与维护</span></div><p class="hint">查看访问次数、修改有效期、复制链接或删除记录。</p><button class="button" id="manage" type="button">查看已导入邮箱</button><div class="setting-row"><input id="baseUrl" type="url" placeholder="公开链接基址（可选）"><button class="button" id="saveSettings">保存</button></div><span id="effective" class="muted"></span></article>
+    </section>
+    <section class="panel management" id="management"><div class="table-head"><div><h2>已导入邮箱</h2><span id="summary" class="muted"></span></div><div class="filters"><input id="query" type="search" placeholder="搜索主邮箱或收件人"><select id="status"><option value="all">全部状态</option><option value="active">有效</option><option value="expired">已过期</option></select><button class="button" id="refresh">刷新</button><button class="button danger" id="delete">删除选中</button><button class="button" id="export">导出选中</button></div></div><div class="table-wrap"><table><thead><tr><th><input id="selectAll" type="checkbox"></th><th>主邮箱</th><th>收件人</th><th>状态</th><th>访问次数</th><th>导入时间</th><th>失效时间</th><th>操作</th></tr></thead><tbody id="rows"><tr><td colspan="8" class="empty">暂无记录</td></tr></tbody></table></div><footer class="pager"><button class="button ghost" id="prev">上一页</button><span id="pageInfo"></span><button class="button ghost" id="next">下一页</button></footer></section>
+  </main><div id="toast" class="toast" role="status"></div><script src="{{ url_for('static', filename='js/verification-links.js') }}"></script>
+</body></html>

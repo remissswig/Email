@@ -1,0 +1,260 @@
+name: Create GitHub Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 2.0.10，不带 v 前缀）'
+        required: true
+        type: string
+
+jobs:
+  resolve-release:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      ref: ${{ steps.resolve.outputs.ref }}
+
+    steps:
+      - name: Resolve release context
+        id: resolve
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Unable to resolve release version."
+            exit 1
+          fi
+
+          TAG="v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ref=refs/tags/$TAG" >> "$GITHUB_OUTPUT"
+
+  build-windows-exe:
+    needs: resolve-release
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build Windows executable
+        shell: bash
+        run: pyinstaller --noconfirm --clean outlookEmail.spec
+
+      - name: Package release asset
+        id: package
+        shell: pwsh
+        run: |
+          $version = "${{ needs.resolve-release.outputs.version }}"
+          $assetName = "OutlookEmail-windows-x64-$version.zip"
+          Compress-Archive -Path "dist/OutlookEmail.exe", "README.md" -DestinationPath $assetName -Force
+          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
+
+      - name: Upload packaged executable
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-exe
+          path: ${{ steps.package.outputs.asset_name }}
+
+  build-macos-dmg:
+    needs: resolve-release
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x64
+          - runner: macos-15
+            arch: arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build macOS DMG
+        shell: bash
+        env:
+          OUTLOOK_EMAIL_MACOS_ARCH: ${{ matrix.arch }}
+        run: bash scripts/build-macos-dmg.sh
+
+      - name: Verify macOS binary architecture
+        shell: bash
+        run: |
+          binary="dist/OutlookEmail.app/Contents/MacOS/OutlookEmail"
+          file_output="$(file "$binary")"
+          echo "$file_output"
+
+          case "${{ matrix.arch }}" in
+            x64)
+              echo "$file_output" | grep -q "x86_64"
+              ;;
+            arm64)
+              echo "$file_output" | grep -q "arm64"
+              ;;
+            *)
+              echo "::error::Unsupported macOS architecture: ${{ matrix.arch }}"
+              exit 1
+              ;;
+          esac
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-dmg-${{ matrix.arch }}
+          path: dist/OutlookEmail-macos-${{ matrix.arch }}-${{ needs.resolve-release.outputs.version }}.dmg
+
+  prepare-release:
+    needs:
+      - resolve-release
+      - build-windows-exe
+      - build-macos-dmg
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      body: ${{ steps.notes.outputs.body }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create and push tag
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          TAG="${{ needs.resolve-release.outputs.tag }}"
+          HEAD_SHA="$(git rev-parse HEAD)"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            TAG_SHA="$(git rev-list -n 1 "$TAG")"
+            if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
+              echo "::error::Tag $TAG already exists at $TAG_SHA, but the workflow is running at $HEAD_SHA."
+              exit 1
+            fi
+
+            echo "Tag $TAG already exists on the current commit. Skipping tag creation."
+          else
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Build release notes from changelog
+        id: notes
+        shell: bash
+        run: |
+          VERSION="${{ needs.resolve-release.outputs.version }}"
+          TAG="${{ needs.resolve-release.outputs.tag }}"
+          export VERSION TAG GITHUB_OUTPUT
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          version = os.environ['VERSION']
+          tag = os.environ['TAG']
+          out = Path(os.environ['GITHUB_OUTPUT'])
+          changelog = Path('CHANGELOG.md')
+          text = changelog.read_text(encoding='utf-8') if changelog.exists() else ''
+          pattern = re.compile(r'^## \[' + re.escape(version) + r'\].*?(?=^## \[|\Z)', re.M | re.S)
+          m = pattern.search(text)
+          if m:
+              body = m.group(0).strip() + '\n'
+          else:
+              body = f'## {tag}\n\nRelease {tag}.\n'
+          with out.open('a', encoding='utf-8') as f:
+              f.write('body<<EOF\n')
+              f.write(body)
+              if not body.endswith('\n'):
+                  f.write('\n')
+              f.write('EOF\n')
+          PY
+
+  docker-release:
+    needs:
+      - resolve-release
+      - prepare-release
+    uses: ./.github/workflows/docker-build-push.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      ref: ${{ needs.resolve-release.outputs.ref }}
+      version: ${{ needs.resolve-release.outputs.version }}
+    secrets: inherit
+
+  publish-release:
+    needs:
+      - resolve-release
+      - build-windows-exe
+      - build-macos-dmg
+      - prepare-release
+      - docker-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged executable
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: release-assets
+
+      - name: Download macOS DMG packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: macos-dmg-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve-release.outputs.tag }}
+          name: ${{ needs.resolve-release.outputs.tag }}
+          body: ${{ needs.prepare-release.outputs.body }}
+          draft: false
+          prerelease: false
+          files: release-assets/*

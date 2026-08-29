@@ -1,0 +1,3317 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    # These segmented files are executed into the shared `web_outlook_app`
+    # globals at runtime. Importing from the assembled module keeps IDE
+    # inspections from flagging the shared names as unresolved.
+    from web_outlook_app import *  # noqa: F403
+
+
+def get_cloudflare_admin_password() -> str:
+    """获取 Cloudflare Temp Email 管理密码"""
+    password = get_setting('cloudflare_admin_password')
+    return password if password is not None else CLOUDFLARE_ADMIN_PASSWORD
+
+
+# ==================== 分组操作 ====================
+
+MAX_GROUP_LEVEL = 3
+DEFAULT_GROUP_ID = 1
+TEMP_GROUP_NAME = '临时邮箱'
+_UNSET_PARENT = object()
+
+
+def normalize_group_parent_id(parent_id: Any) -> Optional[int]:
+    if parent_id in (None, ''):
+        return None
+    try:
+        value = int(parent_id)
+    except (TypeError, ValueError):
+        raise ValueError('父分组无效')
+    return value if value > 0 else None
+
+
+def is_temp_group_row(group: Optional[Dict]) -> bool:
+    return bool(group and (group.get('name') == TEMP_GROUP_NAME or int(group.get('is_system') or 0) == 1))
+
+
+def is_default_group_row(group: Optional[Dict]) -> bool:
+    return bool(group and int(group.get('id') or 0) == DEFAULT_GROUP_ID)
+
+
+def group_has_proxy_config(group_row: Optional[Dict[str, Any]]) -> bool:
+    if not group_row:
+        return False
+    return any([
+        str(group_row.get('proxy_url', '') or '').strip(),
+        str(group_row.get('fallback_proxy_url_1', '') or '').strip(),
+        str(group_row.get('fallback_proxy_url_2', '') or '').strip(),
+    ])
+
+
+def load_groups() -> List[Dict]:
+    """加载所有分组（临时邮箱分组排在最前面）。"""
+    db = get_db()
+    cursor = db.execute('''
+        SELECT * FROM groups
+        ORDER BY
+            CASE WHEN name = '临时邮箱' THEN 0 ELSE 1 END,
+            level,
+            CASE WHEN parent_id IS NULL THEN 0 ELSE parent_id END,
+            sort_order,
+            id
+    ''')
+    groups = [dict(row) for row in cursor.fetchall()]
+    for group in groups:
+        group['descendant_account_count'] = get_group_account_count(group['id'], recursive=True)
+    return groups
+
+
+def get_group_by_id(group_id: int) -> Optional[Dict]:
+    """根据 ID 获取分组"""
+    db = get_db()
+    cursor = db.execute('SELECT * FROM groups WHERE id = ?', (group_id,))
+    row = cursor.fetchone()
+    return dict(row) if row else None
+
+
+def get_child_groups(parent_id: Optional[int], db=None) -> List[Dict]:
+    """获取指定父分组下的直接子分组。"""
+    database = db or get_db()
+    if parent_id is None:
+        rows = database.execute('''
+            SELECT * FROM groups
+            WHERE parent_id IS NULL
+            ORDER BY
+                CASE WHEN name = '临时邮箱' THEN 0 ELSE 1 END,
+                sort_order,
+                id
+        ''').fetchall()
+    else:
+        rows = database.execute('''
+            SELECT * FROM groups
+            WHERE parent_id = ?
+            ORDER BY sort_order, id
+        ''', (parent_id,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_descendant_group_ids(group_id: int, db=None) -> List[int]:
+    """返回分组自身及所有后代分组 ID，顺序为深度优先。"""
+    database = db or get_db()
+    root = database.execute('SELECT id FROM groups WHERE id = ?', (group_id,)).fetchone()
+    if not root:
+        return []
+
+    descendant_ids: List[int] = []
+
+    def visit(current_group_id: int) -> None:
+        descendant_ids.append(current_group_id)
+        child_rows = database.execute('''
+            SELECT id FROM groups
+            WHERE parent_id = ?
+            ORDER BY sort_order, id
+        ''', (current_group_id,)).fetchall()
+        for child_row in child_rows:
+            visit(int(child_row['id']))
+
+    visit(int(group_id))
+    return descendant_ids
+
+
+def get_max_subtree_depth(group_id: int, db=None) -> int:
+    """计算从当前分组开始的最大子树深度；叶子分组为 1。"""
+    database = db or get_db()
+    if not database.execute('SELECT id FROM groups WHERE id = ?', (group_id,)).fetchone():
+        return 0
+
+    child_rows = database.execute('SELECT id FROM groups WHERE parent_id = ?', (group_id,)).fetchall()
+    if not child_rows:
+        return 1
+    return 1 + max(get_max_subtree_depth(int(row['id']), database) for row in child_rows)
+
+
+def validate_group_parent_for_create(parent_id: Optional[int], db=None) -> tuple[bool, str, int]:
+    """校验新分组父级并返回将要写入的 level。"""
+    database = db or get_db()
+    if parent_id is None:
+        return True, '', 1
+
+    parent = database.execute('SELECT * FROM groups WHERE id = ?', (parent_id,)).fetchone()
+    if not parent:
+        return False, '父分组不存在', 1
+    parent_dict = dict(parent)
+    if is_temp_group_row(parent_dict):
+        return False, '临时邮箱分组不可作为父分组', 1
+
+    parent_level = int(parent_dict.get('level') or 1)
+    if parent_level >= MAX_GROUP_LEVEL:
+        return False, '已达到最大层级深度', parent_level + 1
+    return True, '', parent_level + 1
+
+
+def validate_group_move(group_id: int, target_parent_id: Optional[int], db=None) -> tuple[bool, str]:
+    """校验移动后层级深度不超过 3，并避免循环引用。"""
+    database = db or get_db()
+    group = database.execute('SELECT * FROM groups WHERE id = ?', (group_id,)).fetchone()
+    if not group:
+        return False, '分组不存在'
+    group_dict = dict(group)
+    if is_default_group_row(group_dict):
+        return False, '默认分组不可移动'
+    if is_temp_group_row(group_dict):
+        return False, '临时邮箱分组不可移动'
+
+    if target_parent_id == group_id:
+        return False, '不能将分组移动到自身下'
+
+    descendant_ids = get_descendant_group_ids(group_id, database)
+    if target_parent_id is not None and target_parent_id in descendant_ids:
+        return False, '不能将分组移动到自身或子分组下'
+
+    valid_parent, parent_error, target_level = validate_group_parent_for_create(target_parent_id, database)
+    if not valid_parent:
+        return False, parent_error
+
+    subtree_depth = get_max_subtree_depth(group_id, database)
+    if target_level + subtree_depth - 1 > MAX_GROUP_LEVEL:
+        return False, '移动后层级深度将超过 3 级'
+    return True, ''
+
+
+def rebuild_group_levels(group_id: int, db=None) -> None:
+    """从指定分组开始，按 parent_id 级联修正子树 level。"""
+    database = db or get_db()
+    row = database.execute('SELECT id, parent_id, level FROM groups WHERE id = ?', (group_id,)).fetchone()
+    if not row:
+        return
+
+    if row['parent_id'] is None:
+        target_level = 1
+    else:
+        parent = database.execute('SELECT level FROM groups WHERE id = ?', (row['parent_id'],)).fetchone()
+        target_level = int(parent['level'] or 1) + 1 if parent else 1
+
+    target_level = max(1, min(MAX_GROUP_LEVEL, target_level))
+    if int(row['level'] or 1) != target_level:
+        database.execute('UPDATE groups SET level = ? WHERE id = ?', (target_level, group_id))
+
+    for child in database.execute('SELECT id FROM groups WHERE parent_id = ? ORDER BY sort_order, id', (group_id,)).fetchall():
+        rebuild_group_levels(int(child['id']), database)
+
+
+def get_movable_group_ids(db=None, exclude_group_id: Optional[int] = None,
+                          parent_id: Optional[int] = None) -> List[int]:
+    """获取同一父级下可排序分组 ID 列表（不含临时邮箱）。"""
+    database = db or get_db()
+    query = '''
+        SELECT id FROM groups
+        WHERE name != ?
+          AND COALESCE(is_system, 0) = 0
+          AND id != ?
+    '''
+    params: List[Any] = [TEMP_GROUP_NAME, DEFAULT_GROUP_ID]
+    if parent_id is None:
+        query += ' AND parent_id IS NULL'
+    else:
+        query += ' AND parent_id = ?'
+        params.append(parent_id)
+    if exclude_group_id is not None:
+        query += ' AND id != ?'
+        params.append(exclude_group_id)
+    query += ' ORDER BY sort_order, id'
+    cursor = database.execute(query, tuple(params))
+    return [row['id'] for row in cursor.fetchall()]
+
+
+def apply_group_order(group_ids: List[int], db=None, parent_id: Optional[int] = None) -> None:
+    """按给定顺序写入同一父级下的分组排序。"""
+    database = db or get_db()
+    for index, group_id in enumerate(group_ids, start=1):
+        database.execute('UPDATE groups SET sort_order = ? WHERE id = ?', (index, group_id))
+
+    if parent_id is None:
+        temp_group = database.execute(
+            "SELECT id FROM groups WHERE name = ? LIMIT 1",
+            (TEMP_GROUP_NAME,)
+        ).fetchone()
+        if temp_group:
+            database.execute('UPDATE groups SET sort_order = 0, parent_id = NULL, level = 1 WHERE id = ?', (temp_group['id'],))
+
+
+def normalize_group_order(db=None) -> None:
+    """归一化所有父级下的分组顺序。"""
+    database = db or get_db()
+    parent_rows = database.execute('SELECT DISTINCT parent_id FROM groups').fetchall()
+    for row in parent_rows:
+        parent_id = row['parent_id']
+        apply_group_order(get_movable_group_ids(database, parent_id=parent_id), database, parent_id)
+
+
+def clamp_group_position(sort_position: Optional[int], max_position: int) -> int:
+    """限制分组位置范围，位置从 1 开始"""
+    if max_position <= 0:
+        return 1
+    if sort_position is None:
+        return max_position
+    return max(1, min(sort_position, max_position))
+
+
+def get_group_sort_position(group_id: int, db=None) -> Optional[int]:
+    """获取分组在同父级可排序列表中的位置（从 1 开始）。"""
+    database = db or get_db()
+    group = database.execute('SELECT parent_id FROM groups WHERE id = ?', (group_id,)).fetchone()
+    if not group:
+        return None
+    group_ids = get_movable_group_ids(database, parent_id=group['parent_id'])
+    try:
+        return group_ids.index(group_id) + 1
+    except ValueError:
+        return None
+
+
+def set_group_position(group_id: int, sort_position: Optional[int], db=None,
+                       parent_id: Any = _UNSET_PARENT) -> bool:
+    """设置分组在同父级可排序列表中的位置。"""
+    database = db or get_db()
+    group = database.execute('SELECT id, name, is_system, parent_id FROM groups WHERE id = ?', (group_id,)).fetchone()
+    if not group:
+        return False
+    if is_default_group_row(dict(group)):
+        return True
+    if is_temp_group_row(dict(group)):
+        return False
+
+    target_parent_id = group['parent_id'] if parent_id is _UNSET_PARENT else parent_id
+    group_ids = get_movable_group_ids(database, exclude_group_id=group_id, parent_id=target_parent_id)
+    target_position = clamp_group_position(sort_position, len(group_ids) + 1)
+    group_ids.insert(target_position - 1, group_id)
+    apply_group_order(group_ids, database, target_parent_id)
+    return True
+
+
+def add_group(name: str, description: str = '', color: str = '#1a1a1a',
+              proxy_url: str = '', fallback_proxy_url_1: str = '',
+              fallback_proxy_url_2: str = '', sort_position: Optional[int] = None,
+              parent_id: Optional[int] = None) -> Optional[int]:
+    """添加分组"""
+    db = get_db()
+    try:
+        normalized_parent_id = normalize_group_parent_id(parent_id)
+        valid_parent, _, level = validate_group_parent_for_create(normalized_parent_id, db)
+        if not valid_parent:
+            return None
+        cursor = db.execute(
+            '''
+            INSERT INTO groups (
+                name, description, color, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2,
+                sort_order, parent_id, level
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                name, description, color, proxy_url or '', fallback_proxy_url_1 or '',
+                fallback_proxy_url_2 or '', 999999, normalized_parent_id, level
+            )
+        )
+        group_id = cursor.lastrowid
+        set_group_position(group_id, sort_position, db, normalized_parent_id)
+        db.commit()
+        return group_id
+    except sqlite3.IntegrityError:
+        return None
+    except Exception:
+        return None
+
+
+def update_group(group_id: int, name: str, description: str, color: str,
+                 proxy_url: str = '', fallback_proxy_url_1: str = '',
+                 fallback_proxy_url_2: str = '', sort_position: Optional[int] = None,
+                 parent_id: Any = _UNSET_PARENT) -> bool:
+    """更新分组"""
+    db = get_db()
+    try:
+        current = db.execute('SELECT * FROM groups WHERE id = ?', (group_id,)).fetchone()
+        if not current:
+            return False
+        current_dict = dict(current)
+        target_parent_id = current_dict.get('parent_id') if parent_id is _UNSET_PARENT else normalize_group_parent_id(parent_id)
+        target_level = int(current_dict.get('level') or 1)
+        if parent_id is not _UNSET_PARENT and target_parent_id != current_dict.get('parent_id'):
+            valid_move, _ = validate_group_move(group_id, target_parent_id, db)
+            if not valid_move:
+                return False
+            _, _, target_level = validate_group_parent_for_create(target_parent_id, db)
+
+        db.execute('''
+            UPDATE groups
+            SET name = ?, description = ?, color = ?, proxy_url = ?, fallback_proxy_url_1 = ?,
+                fallback_proxy_url_2 = ?, parent_id = ?, level = ?
+            WHERE id = ?
+        ''', (
+            name, description, color, proxy_url or '', fallback_proxy_url_1 or '',
+            fallback_proxy_url_2 or '', target_parent_id, target_level, group_id
+        ))
+        rebuild_group_levels(group_id, db)
+        if not set_group_position(group_id, sort_position, db, target_parent_id):
+            return False
+        db.commit()
+        return True
+    except Exception:
+        return False
+
+
+def delete_group(group_id: int) -> bool:
+    """删除分组（将该分组下的邮箱移到默认分组）"""
+    return delete_group_tree(group_id).get('success', False)
+
+
+def delete_group_tree(group_id: int) -> Dict[str, Any]:
+    """级联删除分组及后代，并将相关账号移回默认分组。"""
+    db = get_db()
+    try:
+        group = db.execute('SELECT * FROM groups WHERE id = ?', (group_id,)).fetchone()
+        if not group:
+            return {'success': False, 'error': '分组不存在', 'deleted_child_count': 0}
+        group_dict = dict(group)
+        if group_id == DEFAULT_GROUP_ID:
+            return {'success': False, 'error': '默认分组不能删除', 'deleted_child_count': 0}
+        if is_temp_group_row(group_dict):
+            return {'success': False, 'error': '临时邮箱分组不能删除', 'deleted_child_count': 0}
+
+        descendant_ids = get_descendant_group_ids(group_id, db)
+        if not descendant_ids:
+            return {'success': False, 'error': '分组不存在', 'deleted_child_count': 0}
+        if DEFAULT_GROUP_ID in descendant_ids:
+            return {'success': False, 'error': '默认分组不能删除', 'deleted_child_count': 0}
+
+        placeholders = ','.join('?' * len(descendant_ids))
+        db.execute(f'UPDATE accounts SET group_id = ? WHERE group_id IN ({placeholders})', [DEFAULT_GROUP_ID] + descendant_ids)
+        delete_rows = db.execute(
+            f'SELECT id FROM groups WHERE id IN ({placeholders}) ORDER BY level DESC, id DESC',
+            descendant_ids
+        ).fetchall()
+        for row in delete_rows:
+            db.execute('DELETE FROM groups WHERE id = ?', (row['id'],))
+        normalize_group_order(db)
+        db.commit()
+        return {'success': True, 'deleted_child_count': max(0, len(descendant_ids) - 1)}
+    except Exception as exc:
+        return {'success': False, 'error': str(exc), 'deleted_child_count': 0}
+
+
+def get_group_account_count(group_id: int, recursive: bool = False) -> int:
+    """获取分组下的邮箱数量；recursive=True 时包含所有后代分组。"""
+    db = get_db()
+    group_ids = get_descendant_group_ids(group_id, db) if recursive else [group_id]
+    if not group_ids:
+        return 0
+    placeholders = ','.join('?' * len(group_ids))
+    cursor = db.execute(f'SELECT COUNT(*) as count FROM accounts WHERE group_id IN ({placeholders})', group_ids)
+    row = cursor.fetchone()
+    return row['count'] if row else 0
+
+
+def reorder_groups(group_ids: List[int], parent_id: Optional[int] = None) -> bool:
+    """重新排序同一父级下的分组，临时邮箱分组固定在根列表最前面。"""
+    db = get_db()
+    try:
+        normalized_parent_id = normalize_group_parent_id(parent_id)
+        movable_ids = get_movable_group_ids(db, parent_id=normalized_parent_id)
+
+        if set(group_ids) != set(movable_ids):
+            return False
+
+        apply_group_order(group_ids, db, normalized_parent_id)
+        db.commit()
+        return True
+    except Exception:
+        return False
+
+
+# ==================== 邮箱账号操作 ====================
+
+def normalize_account_pagination(limit: Any = None, offset: Any = 0) -> tuple[Optional[int], int]:
+    normalized_limit = None
+    if limit not in (None, ''):
+        try:
+            normalized_limit = int(limit)
+        except (TypeError, ValueError):
+            normalized_limit = 100
+        normalized_limit = max(1, min(normalized_limit, 10000))
+
+    try:
+        normalized_offset = int(offset or 0)
+    except (TypeError, ValueError):
+        normalized_offset = 0
+
+    return normalized_limit, max(0, normalized_offset)
+
+
+def normalize_account_sort(sort_by: Any = 'created_at', sort_order: Any = 'desc') -> tuple[str, str]:
+    normalized_sort_by = str(sort_by or '').strip().lower()
+    if normalized_sort_by not in {'sort_order', 'created_at', 'email'}:
+        normalized_sort_by = 'created_at'
+
+    normalized_sort_order = str(sort_order or '').strip().lower()
+    if normalized_sort_order not in {'asc', 'desc'}:
+        normalized_sort_order = 'desc' if normalized_sort_by == 'created_at' else 'asc'
+
+    return normalized_sort_by, normalized_sort_order
+
+
+def build_account_order_clause(sort_by: Any = 'created_at', sort_order: Any = 'desc') -> str:
+    normalized_sort_by, normalized_sort_order = normalize_account_sort(sort_by, sort_order)
+    direction = 'DESC' if normalized_sort_order == 'desc' else 'ASC'
+
+    if normalized_sort_by == 'sort_order':
+        return f'''
+            ORDER BY
+                CASE WHEN COALESCE(a.sort_order, 0) > 0 THEN 0 ELSE 1 END ASC,
+                a.sort_order {direction},
+                a.created_at DESC,
+                a.email COLLATE NOCASE ASC,
+                a.id DESC
+        '''
+    if normalized_sort_by == 'email':
+        return f'ORDER BY a.email COLLATE NOCASE {direction}, a.created_at DESC, a.id DESC'
+    return f'ORDER BY a.created_at {direction}, a.email COLLATE NOCASE ASC, a.id DESC'
+
+
+def normalize_tag_filter_values(tag_ids: Any = None) -> List[int]:
+    if tag_ids in (None, ''):
+        return []
+    values = tag_ids if isinstance(tag_ids, (list, tuple, set)) else str(tag_ids).split(',')
+    normalized: List[int] = []
+    seen = set()
+    for raw_value in values:
+        try:
+            tag_id = int(str(raw_value).strip())
+        except (TypeError, ValueError):
+            continue
+        if tag_id <= 0 or tag_id in seen:
+            continue
+        seen.add(tag_id)
+        normalized.append(tag_id)
+    return normalized
+
+
+def build_account_tag_filter_clause(tag_ids: Any = None, include_untagged: bool = False) -> tuple[str, List[Any]]:
+    normalized_tag_ids = normalize_tag_filter_values(tag_ids)
+    clauses = []
+    params: List[Any] = []
+
+    if normalized_tag_ids:
+        placeholders = ','.join('?' * len(normalized_tag_ids))
+        clauses.append(f'''
+            EXISTS (
+                SELECT 1
+                FROM account_tags at_filter
+                WHERE at_filter.account_id = a.id
+                  AND at_filter.tag_id IN ({placeholders})
+            )
+        ''')
+        params.extend(normalized_tag_ids)
+
+    if include_untagged:
+        clauses.append('''
+            NOT EXISTS (
+                SELECT 1
+                FROM account_tags at_filter
+                WHERE at_filter.account_id = a.id
+            )
+        ''')
+
+    if not clauses:
+        return '', []
+
+    return '(' + ' OR '.join(clauses) + ')', params
+
+
+ACCOUNT_SEARCH_MAX_TERMS = 200
+
+
+def normalize_account_search_terms(query: Any) -> List[str]:
+    normalized_query = str(query or '').strip()
+    if not normalized_query:
+        return []
+
+    raw_terms = [term.strip() for term in re.split(r'\s+', normalized_query) if term.strip()]
+    terms: List[str] = []
+    seen = set()
+    for raw_term in raw_terms:
+        normalized = raw_term.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        terms.append(raw_term)
+    return terms
+
+
+def build_account_where_clause(group_id: int = None, query: str = '',
+                               tag_ids: Any = None, include_untagged: bool = False,
+                               include_descendants: bool = True) -> tuple[str, List[Any]]:
+    clauses = []
+    params: List[Any] = []
+
+    if group_id and include_descendants:
+        group_ids = get_descendant_group_ids(group_id)
+        if group_ids:
+            placeholders = ','.join('?' * len(group_ids))
+            clauses.append(f'a.group_id IN ({placeholders})')
+            params.extend(group_ids)
+        else:
+            clauses.append('a.group_id = ?')
+            params.append(group_id)
+    elif group_id:
+        clauses.append('a.group_id = ?')
+        params.append(group_id)
+
+    normalized_query = str(query or '').strip()
+    if normalized_query:
+        search_term_clauses = []
+        for term in normalize_account_search_terms(normalized_query):
+            like_query = f'%{term}%'
+            search_term_clauses.append('(a.email LIKE ? OR a.remark LIKE ? OR t.name LIKE ? OR aa.alias_email LIKE ?)')
+            params.extend([like_query, like_query, like_query, like_query])
+        if search_term_clauses:
+            clauses.append('(' + ' OR '.join(search_term_clauses) + ')')
+
+    tag_clause, tag_params = build_account_tag_filter_clause(tag_ids, include_untagged)
+    if tag_clause:
+        clauses.append(tag_clause)
+        params.extend(tag_params)
+
+    if not clauses:
+        return '', []
+
+    return 'WHERE ' + ' AND '.join(clauses), params
+
+
+def chunk_account_ids(account_ids: List[int], chunk_size: int = 500) -> List[List[int]]:
+    return [account_ids[index:index + chunk_size] for index in range(0, len(account_ids), chunk_size)]
+
+
+def get_account_aliases_map(account_ids: List[int], db=None) -> Dict[int, List[str]]:
+    if not account_ids:
+        return {}
+
+    database = db or get_db()
+    aliases_by_account: Dict[int, List[str]] = {account_id: [] for account_id in account_ids}
+    for chunk_ids in chunk_account_ids(account_ids):
+        placeholders = ','.join('?' * len(chunk_ids))
+        rows = database.execute(f'''
+            SELECT account_id, alias_email
+            FROM account_aliases
+            WHERE account_id IN ({placeholders})
+            ORDER BY account_id, created_at ASC, id ASC
+        ''', chunk_ids).fetchall()
+
+        for row in rows:
+            alias_email = str(row['alias_email'] or '').strip()
+            if alias_email:
+                aliases_by_account.setdefault(row['account_id'], []).append(alias_email)
+    return aliases_by_account
+
+
+def get_account_tags_map(account_ids: List[int], db=None) -> Dict[int, List[Dict]]:
+    if not account_ids:
+        return {}
+
+    database = db or get_db()
+    tags_by_account: Dict[int, List[Dict]] = {account_id: [] for account_id in account_ids}
+    for chunk_ids in chunk_account_ids(account_ids):
+        placeholders = ','.join('?' * len(chunk_ids))
+        rows = database.execute(f'''
+            SELECT at.account_id, t.*
+            FROM account_tags at
+            JOIN tags t ON at.tag_id = t.id
+            WHERE at.account_id IN ({placeholders})
+            ORDER BY at.account_id, t.created_at DESC
+        ''', chunk_ids).fetchall()
+
+        for row in rows:
+            tag = dict(row)
+            account_id = tag.pop('account_id')
+            tags_by_account.setdefault(account_id, []).append(tag)
+    return tags_by_account
+
+
+def serialize_account_rows(rows: List[sqlite3.Row], db=None) -> List[Dict]:
+    account_ids = [int(row['id']) for row in rows]
+    aliases_by_account = get_account_aliases_map(account_ids, db)
+    tags_by_account = get_account_tags_map(account_ids, db)
+
+    accounts = []
+    for row in rows:
+        account_id = int(row['id'])
+        account = resolve_account_record(row, aliases=aliases_by_account.get(account_id, []))
+        account['tags'] = tags_by_account.get(account_id, [])
+        accounts.append(account)
+    return accounts
+
+
+def load_accounts(group_id: int = None, limit: Any = None, offset: Any = 0,
+                  sort_by: Any = 'created_at', sort_order: Any = 'desc',
+                  tag_ids: Any = None, include_untagged: bool = False,
+                  include_descendants: bool = True) -> List[Dict]:
+    """从数据库加载邮箱账号"""
+    db = get_db()
+    normalized_limit, normalized_offset = normalize_account_pagination(limit, offset)
+    where_clause, params = build_account_where_clause(
+        group_id,
+        tag_ids=tag_ids,
+        include_untagged=include_untagged,
+        include_descendants=include_descendants,
+    )
+    order_clause = build_account_order_clause(sort_by, sort_order)
+    pagination_clause = ''
+    if normalized_limit is not None:
+        pagination_clause = 'LIMIT ? OFFSET ?'
+        params.extend([normalized_limit, normalized_offset])
+
+    cursor = db.execute(f'''
+        SELECT a.*, g.name as group_name, g.color as group_color
+        FROM accounts a
+        LEFT JOIN groups g ON a.group_id = g.id
+        {where_clause}
+        {order_clause}
+        {pagination_clause}
+    ''', params)
+    rows = cursor.fetchall()
+    return serialize_account_rows(rows, db)
+
+
+def count_accounts(group_id: int = None, query: str = '',
+                   tag_ids: Any = None, include_untagged: bool = False,
+                   include_descendants: bool = True) -> int:
+    db = get_db()
+    normalized_query = str(query or '').strip()
+    joins = '''
+        LEFT JOIN groups g ON a.group_id = g.id
+    '''
+    if normalized_query:
+        joins += '''
+            LEFT JOIN account_aliases aa ON a.id = aa.account_id
+            LEFT JOIN account_tags at ON a.id = at.account_id
+            LEFT JOIN tags t ON at.tag_id = t.id
+        '''
+    where_clause, params = build_account_where_clause(
+        group_id,
+        normalized_query,
+        tag_ids,
+        include_untagged,
+        include_descendants,
+    )
+    count_expr = 'COUNT(DISTINCT a.id)' if normalized_query else 'COUNT(*)'
+    row = db.execute(f'''
+        SELECT {count_expr} AS count
+        FROM accounts a
+        {joins}
+        {where_clause}
+    ''', params).fetchone()
+    return int(row['count']) if row else 0
+
+
+def search_account_records(query: str, limit: Any = None, offset: Any = 0,
+                           sort_by: Any = 'created_at', sort_order: Any = 'desc',
+                           tag_ids: Any = None, include_untagged: bool = False,
+                           group_id: int = None, include_descendants: bool = True) -> List[Dict]:
+    db = get_db()
+    normalized_limit, normalized_offset = normalize_account_pagination(limit, offset)
+    where_clause, params = build_account_where_clause(
+        group_id=group_id,
+        query=query,
+        tag_ids=tag_ids,
+        include_untagged=include_untagged,
+        include_descendants=include_descendants,
+    )
+    order_clause = build_account_order_clause(sort_by, sort_order)
+    pagination_clause = ''
+    if normalized_limit is not None:
+        pagination_clause = 'LIMIT ? OFFSET ?'
+        params.extend([normalized_limit, normalized_offset])
+
+    rows = db.execute(f'''
+        SELECT DISTINCT a.*, g.name as group_name, g.color as group_color
+        FROM accounts a
+        LEFT JOIN groups g ON a.group_id = g.id
+        LEFT JOIN account_aliases aa ON a.id = aa.account_id
+        LEFT JOIN account_tags at ON a.id = at.account_id
+        LEFT JOIN tags t ON at.tag_id = t.id
+        {where_clause}
+        {order_clause}
+        {pagination_clause}
+    ''', params).fetchall()
+    return serialize_account_rows(rows, db)
+
+
+def normalize_account_sort_order(sort_order: Any, default: int = 0) -> int:
+    try:
+        value = int(sort_order)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def parse_account_sort_order_input(sort_order: Any) -> Optional[int]:
+    if sort_order in (None, ''):
+        return None
+    try:
+        value = int(sort_order)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def normalize_account_refresh_status(status: Any) -> str:
+    normalized = str(status or '').strip().lower()
+    if normalized in {'success', 'failed', 'never'}:
+        return normalized
+    return 'never'
+
+
+def normalize_account_status(status: Any) -> str:
+    normalized = str(status or '').strip().lower()
+    if normalized == 'inactive':
+        return 'inactive'
+    return 'active'
+
+
+# ==================== 标签管理 ====================
+
+def get_tags() -> List[Dict]:
+    """获取所有标签"""
+    db = get_db()
+    cursor = db.execute('SELECT * FROM tags ORDER BY created_at DESC')
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def normalize_tag_ids_input(tag_ids: Any) -> List[int]:
+    values = tag_ids if isinstance(tag_ids, (list, tuple, set)) else str(tag_ids or '').split(',')
+    normalized: List[int] = []
+    seen = set()
+    for raw_value in values:
+        try:
+            tag_id = int(str(raw_value).strip())
+        except (TypeError, ValueError):
+            continue
+        if tag_id <= 0 or tag_id in seen:
+            continue
+        seen.add(tag_id)
+        normalized.append(tag_id)
+    return normalized
+
+
+def add_tag(name: str, color: str) -> Optional[int]:
+    """添加标签"""
+    db = get_db()
+    try:
+        cursor = db.execute(
+            'INSERT INTO tags (name, color) VALUES (?, ?)',
+            (name, color)
+        )
+        db.commit()
+        return cursor.lastrowid
+    except sqlite3.IntegrityError:
+        return None
+
+
+def delete_tag(tag_id: int) -> bool:
+    """删除标签"""
+    db = get_db()
+    cursor = db.execute('DELETE FROM tags WHERE id = ?', (tag_id,))
+    db.commit()
+    return cursor.rowcount > 0
+
+
+def get_account_tags(account_id: int) -> List[Dict]:
+    """获取账号的标签"""
+    db = get_db()
+    cursor = db.execute('''
+        SELECT t.*
+        FROM tags t
+        JOIN account_tags at ON t.id = at.tag_id
+        WHERE at.account_id = ?
+        ORDER BY t.created_at DESC
+    ''', (account_id,))
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def add_account_tag(account_id: int, tag_id: int) -> bool:
+    """给账号添加标签"""
+    db = get_db()
+    try:
+        db.execute(
+            'INSERT OR IGNORE INTO account_tags (account_id, tag_id) VALUES (?, ?)',
+            (account_id, tag_id)
+        )
+        db.commit()
+        return True
+    except Exception:
+        return False
+
+
+def remove_account_tag(account_id: int, tag_id: int) -> bool:
+    """移除账号标签"""
+    db = get_db()
+    db.execute(
+        'DELETE FROM account_tags WHERE account_id = ? AND tag_id = ?',
+        (account_id, tag_id)
+    )
+    db.commit()
+    return True
+
+
+def normalize_email_address(email_addr: str) -> str:
+    return str(email_addr or '').strip().lower()
+
+
+def email_header_matches_address(header_value: Any, target_email: str) -> bool:
+    target = normalize_email_address(target_email)
+    if not target:
+        return False
+
+    if isinstance(header_value, (list, tuple, set)):
+        headers = [str(value or '') for value in header_value]
+    else:
+        headers = [str(header_value or '')]
+
+    return any(
+        normalize_email_address(address) == target
+        for _display_name, address in email.utils.getaddresses(headers)
+        if address
+    )
+
+
+def get_account_aliases(account_id: int) -> List[str]:
+    db = get_db()
+    rows = db.execute(
+        'SELECT alias_email FROM account_aliases WHERE account_id = ? ORDER BY created_at ASC, id ASC',
+        (account_id,)
+    ).fetchall()
+    return [str(row['alias_email']).strip() for row in rows if row['alias_email']]
+
+
+def email_exists_as_primary(email_addr: str, exclude_account_id: Optional[int] = None) -> bool:
+    normalized = normalize_email_address(email_addr)
+    if not normalized:
+        return False
+    db = get_db()
+    if exclude_account_id is None:
+        row = db.execute('SELECT id FROM accounts WHERE LOWER(email) = ? LIMIT 1', (normalized,)).fetchone()
+    else:
+        row = db.execute(
+            'SELECT id FROM accounts WHERE LOWER(email) = ? AND id != ? LIMIT 1',
+            (normalized, exclude_account_id)
+        ).fetchone()
+    return row is not None
+
+
+def email_exists_as_alias(email_addr: str, exclude_account_id: Optional[int] = None) -> bool:
+    normalized = normalize_email_address(email_addr)
+    if not normalized:
+        return False
+    db = get_db()
+    if exclude_account_id is None:
+        row = db.execute(
+            'SELECT account_id FROM account_aliases WHERE LOWER(alias_email) = ? LIMIT 1',
+            (normalized,)
+        ).fetchone()
+    else:
+        row = db.execute(
+            'SELECT account_id FROM account_aliases WHERE LOWER(alias_email) = ? AND account_id != ? LIMIT 1',
+            (normalized, exclude_account_id)
+        ).fetchone()
+    return row is not None
+
+
+def email_exists_as_temp(email_addr: str) -> bool:
+    normalized = normalize_email_address(email_addr)
+    if not normalized:
+        return False
+    db = get_db()
+    row = db.execute('SELECT id FROM temp_emails WHERE LOWER(email) = ? LIMIT 1', (normalized,)).fetchone()
+    return row is not None
+
+
+def validate_account_aliases(account_id: int, primary_email: str, aliases: List[str]) -> tuple[List[str], List[str]]:
+    cleaned = []
+    errors = []
+    seen = set()
+    primary_normalized = normalize_email_address(primary_email)
+
+    for raw_alias in aliases:
+        normalized = normalize_email_address(raw_alias)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+
+        if normalized == primary_normalized:
+            errors.append(f'别名 {normalized} 不能与主邮箱相同')
+            continue
+        if email_exists_as_primary(normalized, exclude_account_id=account_id):
+            errors.append(f'别名 {normalized} 已被其他主邮箱占用')
+            continue
+        if email_exists_as_alias(normalized, exclude_account_id=account_id):
+            errors.append(f'别名 {normalized} 已被其他账号使用')
+            continue
+        if email_exists_as_temp(normalized):
+            errors.append(f'别名 {normalized} 与临时邮箱地址冲突')
+            continue
+
+        cleaned.append(normalized)
+
+    return cleaned, errors
+
+
+def replace_account_aliases(account_id: int, primary_email: str, aliases: List[str], db=None) -> tuple[bool, List[str], List[str]]:
+    database = db or get_db()
+    cleaned_aliases, errors = validate_account_aliases(account_id, primary_email, aliases)
+    if errors:
+        return False, cleaned_aliases, errors
+
+    try:
+        database.execute('DELETE FROM account_aliases WHERE account_id = ?', (account_id,))
+        for alias_email in cleaned_aliases:
+            database.execute(
+                '''
+                INSERT INTO account_aliases (account_id, alias_email, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ''',
+                (account_id, alias_email)
+            )
+        return True, cleaned_aliases, []
+    except sqlite3.IntegrityError:
+        return False, cleaned_aliases, ['别名保存失败，可能存在重复或冲突']
+
+
+def resolve_account_record(row: sqlite3.Row, matched_alias: str = '',
+                           aliases: Optional[List[str]] = None) -> Dict[str, Any]:
+    account = dict(row)
+    if account.get('password'):
+        try:
+            account['password'] = decrypt_data(account['password'])
+        except Exception:
+            pass
+    if account.get('refresh_token'):
+        try:
+            account['refresh_token'] = decrypt_data(account['refresh_token'])
+        except Exception:
+            pass
+    if account.get('imap_password'):
+        try:
+            account['imap_password'] = decrypt_data(account['imap_password'])
+        except Exception:
+            pass
+    account['provider'] = normalize_provider(account.get('provider'), account.get('email', ''))
+    account['account_type'] = account.get('account_type') or get_provider_meta(
+        account['provider'], account.get('email', '')
+    ).get('account_type', 'outlook')
+    account['aliases'] = list(aliases) if aliases is not None else get_account_aliases(account['id'])
+    account['alias_count'] = len(account['aliases'])
+    account['requested_email'] = matched_alias or account.get('email', '')
+    account['matched_alias'] = matched_alias if matched_alias else ''
+    return account
+
+
+def resolve_account_by_address(email_addr: str) -> Optional[Dict]:
+    normalized = normalize_email_address(email_addr)
+    if not normalized:
+        return None
+
+    db = get_db()
+    row = db.execute('SELECT * FROM accounts WHERE LOWER(email) = ? LIMIT 1', (normalized,)).fetchone()
+    if row:
+        return resolve_account_record(row)
+
+    alias_row = db.execute(
+        '''
+        SELECT a.*, aa.alias_email AS matched_alias
+        FROM account_aliases aa
+        JOIN accounts a ON a.id = aa.account_id
+        WHERE LOWER(aa.alias_email) = ?
+        LIMIT 1
+        ''',
+        (normalized,)
+    ).fetchone()
+    if not alias_row:
+        return None
+    return resolve_account_record(alias_row, matched_alias=alias_row['matched_alias'])
+
+
+def build_plus_fallback_emails(email_addr: str) -> List[str]:
+    normalized = normalize_email_address(email_addr)
+    if not normalized or '@' not in normalized:
+        return []
+
+    local_part, domain = normalized.split('@', 1)
+    segments = [segment for segment in local_part.split('+') if segment]
+    if len(segments) <= 1:
+        return []
+
+    # 从右往左逐级回退，优先保留更长的别名形式。
+    fallbacks = []
+    for size in range(len(segments) - 1, 0, -1):
+        candidate = f"{'+'.join(segments[:size])}@{domain}"
+        if candidate != normalized and candidate not in fallbacks:
+            fallbacks.append(candidate)
+    return fallbacks
+
+
+def build_email_query_candidates(email_addr: str, include_gmail_suffix: bool = True) -> List[str]:
+    """构建邮箱查询候选：完整地址、plus 回退、Gmail/Googlemail 后缀回退。"""
+    normalized = normalize_email_address(email_addr)
+    if not normalized or '@' not in normalized:
+        return []
+
+    _local_part, domain = normalized.split('@', 1)
+    original_candidates = [normalized] + build_plus_fallback_emails(normalized)
+    candidates: List[str] = []
+
+    for candidate in original_candidates:
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    if include_gmail_suffix and domain in {'gmail.com', 'googlemail.com'}:
+        alternate_domain = 'googlemail.com' if domain == 'gmail.com' else 'gmail.com'
+        for candidate in original_candidates:
+            candidate_local = candidate.rsplit('@', 1)[0]
+            alternate_candidate = f"{candidate_local}@{alternate_domain}"
+            if alternate_candidate not in candidates:
+                candidates.append(alternate_candidate)
+
+    return candidates
+
+
+def resolve_account_for_email_api(email_addr: str) -> Optional[Dict]:
+    requested = normalize_email_address(email_addr)
+    for candidate in build_email_query_candidates(email_addr):
+        account = resolve_account_by_address(candidate)
+        if account:
+            fallback_used = bool(requested and candidate != requested)
+            account['requested_query_email'] = requested
+            account['resolved_query_email'] = candidate
+            account['fallback_used'] = fallback_used
+            account['fallback_email'] = candidate if fallback_used else ''
+            return account
+    return None
+
+
+def get_account_proxy_url(account: Optional[Dict[str, Any]]) -> str:
+    proxy_config = get_account_proxy_config(account)
+    return proxy_config.get('proxy_url', '') or ''
+
+
+def get_empty_proxy_config() -> Dict[str, str]:
+    return {
+        'proxy_url': '',
+        'fallback_proxy_url_1': '',
+        'fallback_proxy_url_2': '',
+    }
+
+
+def get_account_override_proxy_config(account: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if not account:
+        return get_empty_proxy_config()
+    return {
+        'proxy_url': str(account.get('proxy_url', '') or '').strip(),
+        'fallback_proxy_url_1': str(account.get('fallback_proxy_url_1', '') or '').strip(),
+        'fallback_proxy_url_2': str(account.get('fallback_proxy_url_2', '') or '').strip(),
+    }
+
+
+def account_has_proxy_override(account: Optional[Dict[str, Any]]) -> bool:
+    account_proxy_config = get_account_override_proxy_config(account)
+    return any(account_proxy_config.values())
+
+
+def get_account_proxy_config(account: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if account_has_proxy_override(account):
+        return get_account_override_proxy_config(account)
+    if not account or not account.get('group_id'):
+        return get_empty_proxy_config()
+    group = get_group_by_id(account['group_id'])
+    if not group:
+        return get_empty_proxy_config()
+    return get_group_inherited_proxy_config(group)
+
+
+def get_group_inherited_proxy_config(group_row: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    current_group = group_row
+    visited_group_ids = set()
+    while current_group:
+        current_group_id = current_group.get('id')
+        if current_group_id in visited_group_ids:
+            break
+        visited_group_ids.add(current_group_id)
+        if group_has_proxy_config(current_group):
+            return {
+                'proxy_url': current_group.get('proxy_url', '') or '',
+                'fallback_proxy_url_1': current_group.get('fallback_proxy_url_1', '') or '',
+                'fallback_proxy_url_2': current_group.get('fallback_proxy_url_2', '') or '',
+            }
+        parent_id = current_group.get('parent_id')
+        if not parent_id:
+            break
+        current_group = get_group_by_id(parent_id)
+    return get_empty_proxy_config()
+
+
+def get_group_direct_proxy_config(group_row: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if not group_row:
+        return get_empty_proxy_config()
+    return {
+        'proxy_url': group_row.get('proxy_url', '') or '',
+        'fallback_proxy_url_1': group_row.get('fallback_proxy_url_1', '') or '',
+        'fallback_proxy_url_2': group_row.get('fallback_proxy_url_2', '') or '',
+    }
+
+
+def get_account_proxy_failover_urls(account: Optional[Dict[str, Any]]) -> List[str]:
+    proxy_config = get_account_proxy_config(account)
+    return [
+        proxy_config.get('fallback_proxy_url_1', '') or '',
+        proxy_config.get('fallback_proxy_url_2', '') or '',
+    ]
+
+
+def get_group_proxy_failover_urls(group_row: Optional[Dict[str, Any]]) -> List[str]:
+    if not group_row:
+        return ['', '']
+    return [
+        group_row.get('fallback_proxy_url_1', '') or '',
+        group_row.get('fallback_proxy_url_2', '') or '',
+    ]
+
+
+def get_group_proxy_url(group_row: Optional[Dict[str, Any]]) -> str:
+    if not group_row:
+        return ''
+    return group_row.get('proxy_url', '') or ''
+
+
+
+def get_account_by_email(email_addr: str) -> Optional[Dict]:
+    """根据邮箱地址获取账号"""
+    return resolve_account_by_address(email_addr)
+
+
+def get_account_by_id(account_id: int) -> Optional[Dict]:
+    """根据 ID 获取账号"""
+    db = get_db()
+    cursor = db.execute('''
+        SELECT a.*, g.name as group_name, g.color as group_color
+        FROM accounts a
+        LEFT JOIN groups g ON a.group_id = g.id
+        WHERE a.id = ?
+    ''', (account_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return resolve_account_record(row)
+
+
+def get_latest_account_refresh_log(account_id: int, db=None) -> Optional[Dict[str, Any]]:
+    """获取账号最近一次刷新结果"""
+    database = db or get_db()
+    row = database.execute(
+        '''
+        SELECT status, error_message, created_at
+        FROM account_refresh_logs
+        WHERE account_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        ''',
+        (account_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def resolve_account_refresh_state(account: Dict[str, Any],
+                                  last_refresh_log: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    status = normalize_account_refresh_status(account.get('last_refresh_status'))
+    refresh_error = account.get('last_refresh_error')
+    refresh_at = account.get('last_refresh_at', '')
+
+    if last_refresh_log is None and account.get('id') and (
+        status == 'never' or not refresh_at or (status == 'failed' and not refresh_error)
+    ):
+        try:
+            last_refresh_log = get_latest_account_refresh_log(account['id'])
+        except Exception:
+            last_refresh_log = None
+
+    if last_refresh_log and status == 'never':
+        status = normalize_account_refresh_status(last_refresh_log.get('status'))
+    if last_refresh_log and not refresh_at:
+        refresh_at = last_refresh_log.get('created_at', '')
+    if status == 'failed':
+        refresh_error = refresh_error or (last_refresh_log.get('error_message') if last_refresh_log else None)
+    else:
+        refresh_error = None
+
+    return {
+        'last_refresh_at': refresh_at or '',
+        'last_refresh_status': status,
+        'last_refresh_error': refresh_error or None,
+    }
+
+
+def serialize_account_summary(account: Dict[str, Any], last_refresh_log: Optional[Dict[str, Any]] = None,
+                              include_client_meta: bool = True,
+                              include_imap_meta: bool = True) -> Dict[str, Any]:
+    """序列化账号摘要，默认隐藏敏感字段"""
+    client_id = account.get('client_id') or ''
+    refresh_state = resolve_account_refresh_state(account, last_refresh_log)
+    payload = {
+        'id': account['id'],
+        'email': account['email'],
+        'aliases': account.get('aliases', []),
+        'alias_count': account.get('alias_count', 0),
+        'group_id': account.get('group_id'),
+        'group_name': account.get('group_name', '默认分组'),
+        'group_color': account.get('group_color', '#666666'),
+        'sort_order': normalize_account_sort_order(account.get('sort_order', 0)),
+        'remark': account.get('remark', ''),
+        'status': account.get('status', 'active'),
+        'account_type': account.get('account_type', 'outlook'),
+        'provider': account.get('provider', 'outlook'),
+        'forward_enabled': bool(account.get('forward_enabled')),
+        'proxy_override_enabled': account_has_proxy_override(account),
+        'last_refresh_at': refresh_state['last_refresh_at'],
+        'last_refresh_status': refresh_state['last_refresh_status'],
+        'last_refresh_error': refresh_state['last_refresh_error'],
+        'created_at': account.get('created_at', ''),
+        'updated_at': account.get('updated_at', ''),
+        'tags': account.get('tags', [])
+    }
+    if include_client_meta:
+        payload['client_id'] = (
+            client_id[:8] + '...' if client_id and len(client_id) > 8 else client_id
+        )
+    if include_imap_meta:
+        payload['imap_host'] = account.get('imap_host', '')
+        payload['imap_port'] = account.get('imap_port', 993)
+    return payload
+
+
+ACCOUNT_INSERT_SQL = '''
+    INSERT OR IGNORE INTO accounts (
+        email, password, client_id, refresh_token, group_id, sort_order, remark,
+        status, account_type, provider, imap_host, imap_port, imap_password, forward_enabled,
+        forward_last_checked_at, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+'''
+
+
+def build_account_insert_values(email_addr: str, password: str, client_id: str = '', refresh_token: str = '',
+                                group_id: int = 1, remark: str = '', account_type: str = 'outlook',
+                                provider: str = 'outlook', imap_host: str = '', imap_port: int = 993,
+                                imap_password: str = '', forward_enabled: bool = False,
+                                sort_order: Optional[int] = None, status: str = 'active',
+                                proxy_url: str = '', fallback_proxy_url_1: str = '',
+                                fallback_proxy_url_2: str = '') -> tuple:
+    encrypted_password = encrypt_data(password) if password else password
+    encrypted_refresh_token = encrypt_data(refresh_token) if refresh_token else refresh_token
+    encrypted_imap_password = encrypt_data(imap_password) if imap_password else imap_password
+    provider_meta = get_provider_meta(provider, email_addr)
+    normalized_provider = provider_meta['key']
+    normalized_account_type = account_type or provider_meta.get('account_type', 'outlook')
+    normalized_imap_host = imap_host or provider_meta.get('imap_host', '')
+    normalized_imap_port = int(imap_port or provider_meta.get('imap_port', 993) or 993)
+    normalized_sort_order = parse_account_sort_order_input(sort_order)
+    normalized_status = normalize_account_status(status)
+
+    return (
+        email_addr,
+        encrypted_password,
+        client_id,
+        encrypted_refresh_token,
+        group_id,
+        normalized_sort_order,
+        remark,
+        normalized_status,
+        normalized_account_type,
+        normalized_provider,
+        normalized_imap_host,
+        normalized_imap_port,
+        encrypted_imap_password,
+        1 if forward_enabled else 0,
+        datetime.now(timezone.utc).isoformat() if forward_enabled else None,
+        str(proxy_url or '').strip(),
+        str(fallback_proxy_url_1 or '').strip(),
+        str(fallback_proxy_url_2 or '').strip(),
+    )
+
+
+def add_account(email_addr: str, password: str, client_id: str = '', refresh_token: str = '',
+                group_id: int = 1, remark: str = '', account_type: str = 'outlook',
+                provider: str = 'outlook', imap_host: str = '', imap_port: int = 993,
+                imap_password: str = '', forward_enabled: bool = False,
+                sort_order: Optional[int] = None, status: str = 'active',
+                proxy_url: str = '', fallback_proxy_url_1: str = '',
+                fallback_proxy_url_2: str = '') -> bool:
+    """添加邮箱账号"""
+    db = get_db()
+    try:
+        before_changes = db.total_changes
+        db.execute(ACCOUNT_INSERT_SQL, build_account_insert_values(
+            email_addr, password, client_id, refresh_token, group_id, remark,
+            account_type, provider, imap_host, imap_port, imap_password,
+            forward_enabled, sort_order, status,
+            proxy_url, fallback_proxy_url_1, fallback_proxy_url_2
+        ))
+        db.commit()
+        return db.total_changes > before_changes
+    except sqlite3.IntegrityError:
+        return False
+
+
+def add_accounts_bulk(parsed_accounts: List[Dict[str, Any]], group_id: int = 1,
+                      forward_enabled: bool = False,
+                      sort_order: Optional[int] = None, remark: str = '',
+                      status: str = 'active', tag_ids: Optional[List[int]] = None,
+                      proxy_url: str = '', fallback_proxy_url_1: str = '',
+                      fallback_proxy_url_2: str = '') -> Dict[str, int]:
+    """批量添加邮箱账号，单事务写入，重复邮箱自动跳过。"""
+    if not parsed_accounts:
+        return {'added_count': 0, 'skipped_count': 0}
+
+    db = get_db()
+    normalized_status = normalize_account_status(status)
+    normalized_tag_ids = normalize_tag_ids_input(tag_ids)
+    if normalized_tag_ids:
+        placeholders = ','.join('?' * len(normalized_tag_ids))
+        rows = db.execute(
+            f'SELECT id FROM tags WHERE id IN ({placeholders})',
+            normalized_tag_ids
+        ).fetchall()
+        normalized_tag_ids = [int(row['id']) for row in rows]
+
+    rows = [
+        build_account_insert_values(
+            parsed['email'],
+            parsed.get('password', ''),
+            parsed.get('client_id', ''),
+            parsed.get('refresh_token', ''),
+            group_id,
+            remark,
+            parsed.get('account_type', 'outlook'),
+            parsed.get('provider', 'outlook'),
+            parsed.get('imap_host', ''),
+            parsed.get('imap_port', 993),
+            parsed.get('imap_password', ''),
+            forward_enabled,
+            sort_order,
+            normalized_status,
+            proxy_url,
+            fallback_proxy_url_1,
+            fallback_proxy_url_2
+        )
+        for parsed in parsed_accounts
+    ]
+
+    added_account_ids: List[int] = []
+    for row in rows:
+        before_row_changes = db.total_changes
+        cursor = db.execute(ACCOUNT_INSERT_SQL, row)
+        if db.total_changes > before_row_changes:
+            added_account_ids.append(int(cursor.lastrowid))
+
+    if normalized_tag_ids and added_account_ids:
+        db.executemany(
+            'INSERT OR IGNORE INTO account_tags (account_id, tag_id) VALUES (?, ?)',
+            [
+                (account_id, tag_id)
+                for account_id in added_account_ids
+                for tag_id in normalized_tag_ids
+            ]
+        )
+    db.commit()
+    return {
+        'added_count': len(added_account_ids),
+        'skipped_count': max(0, len(rows) - len(added_account_ids)),
+        'tagged_count': len(added_account_ids) if normalized_tag_ids else 0,
+    }
+
+
+def normalize_upload_email(email: str) -> str:
+    return (email or '').strip().lower()
+
+
+def add_upload_account(email: str, password: str, remark: str = '') -> Dict[str, Any]:
+    """插入一条外部上传的 Outlook 账号到 outlook_upload_accounts。
+
+    密码加密存储。不在本函数内 commit，由调用方统一提交。
+    返回 {'email', 'status': 'added'|'duplicate'|'invalid', 'id'?}
+    """
+    normalized_email = normalize_upload_email(email)
+    raw_password = password if password is not None else ''
+    if '@' not in normalized_email or not raw_password:
+        return {'email': normalized_email or (email or ''), 'status': 'invalid'}
+
+    db = get_db()
+    cursor = db.execute(
+        '''
+        INSERT OR IGNORE INTO outlook_upload_accounts (email, password, remark, source)
+        VALUES (?, ?, ?, 'external_api')
+        ''',
+        (normalized_email, encrypt_data(raw_password), remark or ''),
+    )
+    if cursor.rowcount == 1:
+        return {'email': normalized_email, 'status': 'added', 'id': cursor.lastrowid}
+    return {'email': normalized_email, 'status': 'duplicate'}
+
+
+def get_upload_account_plain_password(row: Any, *, tolerate_decrypt_error: bool = False) -> str:
+    data = dict(row) if hasattr(row, 'keys') else {'password': row}
+    try:
+        return decrypt_data(str(data.get('password') or ''))
+    except RuntimeError:
+        if tolerate_decrypt_error:
+            return ''
+        raise
+
+
+def serialize_upload_account_row(row: Any) -> Dict[str, Any]:
+    """将 outlook_upload_accounts 行转为前端展示用字典，不返回明文密码。"""
+    data = dict(row)
+    plain_password = get_upload_account_plain_password(
+        data.get('password') or '',
+        tolerate_decrypt_error=True,
+    )
+    return {
+        'id': data.get('id'),
+        'email': data.get('email') or '',
+        'has_password': bool(plain_password),
+        'password_length': len(plain_password),
+        'is_authorized': bool(data.get('is_authorized')),
+        'status': data.get('status') or '',
+        'remark': data.get('remark') or '',
+        'source': data.get('source') or '',
+        'created_at': data.get('created_at'),
+        'updated_at': data.get('updated_at'),
+    }
+
+
+def delete_upload_account(account_id: int) -> bool:
+    """删除指定 ID 的外部上传账号。
+
+    返回 True 表示删除成功，False 表示账号不存在。
+    不在本函数内 commit，由调用方统一提交。
+    """
+    db = get_db()
+    cursor = db.execute(
+        'DELETE FROM outlook_upload_accounts WHERE id = ?',
+        (account_id,)
+    )
+    return cursor.rowcount > 0
+
+
+def query_upload_accounts_page(page: int = 1, page_size: int = 20,
+                               keyword: str = '') -> Dict[str, Any]:
+    """分页查询外部上传的 Outlook 账号。
+
+    返回 {'items', 'total', 'page', 'page_size', 'total_pages'}。
+    keyword 命中 email/remark（模糊匹配）。
+    """
+    safe_page = max(1, int(page or 1))
+    safe_page_size = min(max(1, int(page_size or 20)), 200)
+    normalized_keyword = (keyword or '').strip()
+
+    where_sql = ''
+    params: List[Any] = []
+    if normalized_keyword:
+        where_sql = 'WHERE email LIKE ? OR remark LIKE ?'
+        like = f'%{normalized_keyword}%'
+        params.extend([like, like])
+
+    db = get_db()
+    total = db.execute(
+        f'SELECT COUNT(*) AS cnt FROM outlook_upload_accounts {where_sql}',
+        tuple(params),
+    ).fetchone()['cnt']
+    total = int(total or 0)
+
+    total_pages = max(1, (total + safe_page_size - 1) // safe_page_size)
+    if safe_page > total_pages:
+        safe_page = total_pages
+    offset = (safe_page - 1) * safe_page_size
+
+    rows = db.execute(
+        f'''
+        SELECT id, email, password, is_authorized, status, remark, source,
+               created_at, updated_at
+        FROM outlook_upload_accounts
+        {where_sql}
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+        ''',
+        tuple(params) + (safe_page_size, offset),
+    ).fetchall()
+
+    return {
+        'items': [serialize_upload_account_row(row) for row in rows],
+        'total': total,
+        'page': safe_page,
+        'page_size': safe_page_size,
+        'total_pages': total_pages,
+    }
+
+
+def add_upload_accounts_bulk(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """单事务批量插入外部上传账号。items: [{'email','password','remark'?}, ...]"""
+    results: List[Dict[str, Any]] = []
+    added = duplicate = invalid = 0
+    db = get_db()
+    for item in items:
+        outcome = add_upload_account(
+            item.get('email', ''),
+            item.get('password', ''),
+            item.get('remark', ''),
+        )
+        if outcome['status'] == 'added':
+            added += 1
+        elif outcome['status'] == 'duplicate':
+            duplicate += 1
+        else:
+            invalid += 1
+        results.append(outcome)
+    db.commit()
+    return {
+        'total': len(items),
+        'added': added,
+        'duplicate': duplicate,
+        'invalid': invalid,
+        'results': results,
+    }
+
+
+def update_account(account_id: int, email_addr: str, password: str, client_id: str,
+                   refresh_token: str, group_id: int, sort_order: Optional[int], remark: str, status: str,
+                   account_type: str = 'outlook', provider: str = 'outlook',
+                   imap_host: str = '', imap_port: int = 993, imap_password: str = '',
+                   forward_enabled: bool = False, proxy_url: str = '',
+                   fallback_proxy_url_1: str = '', fallback_proxy_url_2: str = '') -> bool:
+    """更新邮箱账号"""
+    db = get_db()
+    try:
+        # 加密敏感字段
+        encrypted_password = encrypt_data(password) if password else password
+        encrypted_refresh_token = encrypt_data(refresh_token) if refresh_token else refresh_token
+        encrypted_imap_password = encrypt_data(imap_password) if imap_password else imap_password
+        normalized_sort_order = parse_account_sort_order_input(sort_order)
+        normalized_proxy_url = str(proxy_url or '').strip()
+        normalized_fallback_proxy_url_1 = str(fallback_proxy_url_1 or '').strip()
+        normalized_fallback_proxy_url_2 = str(fallback_proxy_url_2 or '').strip()
+
+        current_account = db.execute(
+            'SELECT forward_enabled, forward_last_checked_at FROM accounts WHERE id = ?',
+            (account_id,)
+        ).fetchone()
+        should_init_forward_cursor = bool(
+            forward_enabled and current_account and not current_account['forward_enabled']
+        )
+
+        if should_init_forward_cursor:
+            db.execute('''
+                UPDATE accounts
+                SET email = ?, password = ?, client_id = ?, refresh_token = ?,
+                    group_id = ?, sort_order = ?, remark = ?, status = ?, account_type = ?, provider = ?,
+                    imap_host = ?, imap_port = ?, imap_password = ?, forward_enabled = ?,
+                    forward_last_checked_at = ?, proxy_url = ?, fallback_proxy_url_1 = ?,
+                    fallback_proxy_url_2 = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', (
+                email_addr, encrypted_password, client_id, encrypted_refresh_token, group_id, normalized_sort_order,
+                remark, status,
+                account_type, provider, imap_host, imap_port, encrypted_imap_password, 1,
+                datetime.now(timezone.utc).isoformat(), normalized_proxy_url,
+                normalized_fallback_proxy_url_1, normalized_fallback_proxy_url_2, account_id
+            ))
+        else:
+            db.execute('''
+                UPDATE accounts
+                SET email = ?, password = ?, client_id = ?, refresh_token = ?,
+                    group_id = ?, sort_order = ?, remark = ?, status = ?, account_type = ?, provider = ?,
+                    imap_host = ?, imap_port = ?, imap_password = ?, forward_enabled = ?,
+                    proxy_url = ?, fallback_proxy_url_1 = ?, fallback_proxy_url_2 = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', (
+                email_addr, encrypted_password, client_id, encrypted_refresh_token, group_id, normalized_sort_order,
+                remark, status,
+                account_type, provider, imap_host, imap_port, encrypted_imap_password, 1 if forward_enabled else 0,
+                normalized_proxy_url, normalized_fallback_proxy_url_1, normalized_fallback_proxy_url_2, account_id
+            ))
+        db.commit()
+        return True
+    except Exception:
+        return False
+
+
+PROJECT_ACCOUNT_STATUSES = {'toClaim', 'claiming', 'done', 'failed', 'removed', 'deleted'}
+PROJECT_RESTORABLE_STATUSES = {'toClaim', 'done', 'failed', 'removed'}
+
+
+def project_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_project_key(project_key: str) -> str:
+    return str(project_key or '').strip().lower()
+
+
+def normalize_project_group_ids(group_ids: Optional[List[int]]) -> List[int]:
+    return normalize_account_ids(group_ids or [])
+
+
+def expand_group_ids_with_descendants(group_ids: List[int], db=None) -> List[int]:
+    database = db or get_db()
+    expanded_group_ids: List[int] = []
+    seen_group_ids = set()
+    for group_id in normalize_account_ids(group_ids):
+        for descendant_id in get_descendant_group_ids(group_id, database):
+            if descendant_id in seen_group_ids:
+                continue
+            seen_group_ids.add(descendant_id)
+            expanded_group_ids.append(descendant_id)
+    return expanded_group_ids
+
+
+def parse_bool_flag(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {'1', 'true', 'yes', 'on'}:
+            return True
+        if normalized in {'0', 'false', 'no', 'off', ''}:
+            return False
+    return bool(value)
+
+
+def serialize_project_event_detail(detail: Any) -> str:
+    if detail in (None, ''):
+        return ''
+    if isinstance(detail, str):
+        return detail
+    try:
+        return json.dumps(detail, ensure_ascii=False)
+    except Exception:
+        return str(detail)
+
+
+def add_project_event(
+    project_id: int,
+    normalized_email: str,
+    action: str,
+    *,
+    account_id: Optional[int] = None,
+    project_account_id: Optional[int] = None,
+    from_status: Optional[str] = None,
+    to_status: Optional[str] = None,
+    caller_id: str = '',
+    task_id: str = '',
+    claim_token: str = '',
+    detail: Any = None,
+    db=None,
+) -> None:
+    database = db or get_db()
+    database.execute(
+        '''
+        INSERT INTO project_account_events (
+            project_id, account_id, normalized_email, project_account_id,
+            action, from_status, to_status, caller_id, task_id, claim_token, detail, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        (
+            project_id,
+            account_id,
+            normalized_email,
+            project_account_id,
+            action,
+            from_status,
+            to_status,
+            caller_id or '',
+            task_id or '',
+            claim_token or '',
+            serialize_project_event_detail(detail),
+            project_now_iso(),
+        ),
+    )
+
+
+def load_project_group_ids(project_id: int, db=None) -> List[int]:
+    database = db or get_db()
+    rows = database.execute(
+        '''
+        SELECT group_id FROM project_group_scopes
+        WHERE project_id = ?
+        ORDER BY group_id ASC
+        ''',
+        (project_id,)
+    ).fetchall()
+    return [int(row['group_id']) for row in rows]
+
+
+def serialize_project_row(project_row: sqlite3.Row, db=None) -> Dict[str, Any]:
+    project = dict(project_row)
+    project['group_ids'] = load_project_group_ids(project['id'], db=db)
+    project['use_alias_email'] = bool(project.get('use_alias_email', 0))
+    project['total_count'] = int(project.get('total_count') or 0)
+    project['to_claim_count'] = int(project.get('to_claim_count') or 0)
+    project['claiming_count'] = int(project.get('claiming_count') or 0)
+    project['done_count'] = int(project.get('done_count') or 0)
+    project['failed_count'] = int(project.get('failed_count') or 0)
+    project['removed_count'] = int(project.get('removed_count') or 0)
+    project['deleted_count'] = int(project.get('deleted_count') or 0)
+    return project
+
+
+def get_project_by_key(project_key: str, db=None) -> Optional[Dict[str, Any]]:
+    database = db or get_db()
+    normalized_key = normalize_project_key(project_key)
+    if not normalized_key:
+        return None
+
+    row = database.execute(
+        '''
+        SELECT
+            p.*,
+            COUNT(pa.id) AS total_count,
+            SUM(CASE WHEN pa.status = 'toClaim' THEN 1 ELSE 0 END) AS to_claim_count,
+            SUM(CASE WHEN pa.status = 'claiming' THEN 1 ELSE 0 END) AS claiming_count,
+            SUM(CASE WHEN pa.status = 'done' THEN 1 ELSE 0 END) AS done_count,
+            SUM(CASE WHEN pa.status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+            SUM(CASE WHEN pa.status = 'removed' THEN 1 ELSE 0 END) AS removed_count,
+            SUM(CASE WHEN pa.status = 'deleted' THEN 1 ELSE 0 END) AS deleted_count
+        FROM projects p
+        LEFT JOIN project_accounts pa ON pa.project_id = p.id
+        WHERE p.project_key = ?
+        GROUP BY p.id
+        ''',
+        (normalized_key,)
+    ).fetchone()
+    return serialize_project_row(row, db=database) if row else None
+
+
+def load_projects() -> List[Dict[str, Any]]:
+    db = get_db()
+    rows = db.execute(
+        '''
+        SELECT
+            p.*,
+            COUNT(pa.id) AS total_count,
+            SUM(CASE WHEN pa.status = 'toClaim' THEN 1 ELSE 0 END) AS to_claim_count,
+            SUM(CASE WHEN pa.status = 'claiming' THEN 1 ELSE 0 END) AS claiming_count,
+            SUM(CASE WHEN pa.status = 'done' THEN 1 ELSE 0 END) AS done_count,
+            SUM(CASE WHEN pa.status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+            SUM(CASE WHEN pa.status = 'removed' THEN 1 ELSE 0 END) AS removed_count,
+            SUM(CASE WHEN pa.status = 'deleted' THEN 1 ELSE 0 END) AS deleted_count
+        FROM projects p
+        LEFT JOIN project_accounts pa ON pa.project_id = p.id
+        GROUP BY p.id
+        ORDER BY p.updated_at DESC, p.id DESC
+        '''
+    ).fetchall()
+    return [serialize_project_row(row, db=db) for row in rows]
+
+
+def get_project_scope_accounts(project_id: int, db=None) -> List[sqlite3.Row]:
+    database = db or get_db()
+    project_row = database.execute(
+        'SELECT id, scope_mode, use_alias_email FROM projects WHERE id = ?',
+        (project_id,)
+    ).fetchone()
+    if not project_row:
+        return []
+
+    if project_row['scope_mode'] == 'groups':
+        scope_group_ids = expand_group_ids_with_descendants(load_project_group_ids(project_id, database), database)
+        if not scope_group_ids:
+            account_rows = []
+        else:
+            placeholders = ','.join('?' * len(scope_group_ids))
+            account_rows = database.execute(
+                f'''
+                SELECT DISTINCT a.id, a.email, a.group_id
+                FROM accounts a
+                WHERE a.group_id IN ({placeholders})
+                ORDER BY a.id ASC
+                ''',
+                scope_group_ids
+            ).fetchall()
+    else:
+        account_rows = database.execute(
+            '''
+            SELECT DISTINCT a.id, a.email, a.group_id
+            FROM accounts a
+            ORDER BY a.id ASC
+            ''',
+        ).fetchall()
+
+    if not parse_bool_flag(project_row['use_alias_email'], False):
+        return [dict(row) for row in account_rows]
+
+    scope_accounts: List[Dict[str, Any]] = []
+    for row in account_rows:
+        aliases = get_account_aliases(int(row['id']))
+        if aliases:
+            for alias_email in aliases:
+                normalized_alias = normalize_email_address(alias_email)
+                if not normalized_alias:
+                    continue
+                scope_accounts.append({
+                    'id': row['id'],
+                    'email': normalized_alias,
+                    'group_id': row['group_id'],
+                })
+            continue
+        scope_accounts.append({
+            'id': row['id'],
+            'email': row['email'],
+            'group_id': row['group_id'],
+        })
+
+    return scope_accounts
+
+
+def update_project_group_scopes(project_id: int, group_ids: List[int], db=None) -> None:
+    database = db or get_db()
+    database.execute('DELETE FROM project_group_scopes WHERE project_id = ?', (project_id,))
+    now_str = project_now_iso()
+    for group_id in group_ids:
+        database.execute(
+            '''
+            INSERT INTO project_group_scopes (project_id, group_id, created_at)
+            VALUES (?, ?, ?)
+            ''',
+            (project_id, group_id, now_str)
+        )
+
+
+def reconcile_deleted_project_accounts(project_id: int, db=None) -> int:
+    database = db or get_db()
+    rows = database.execute(
+        '''
+        SELECT pa.id, pa.account_id, pa.normalized_email, pa.status
+        FROM project_accounts pa
+        LEFT JOIN accounts a ON a.id = pa.account_id
+        WHERE pa.project_id = ?
+          AND pa.account_id IS NOT NULL
+          AND a.id IS NULL
+          AND pa.status != 'deleted'
+        ''',
+        (project_id,)
+    ).fetchall()
+    if not rows:
+        return 0
+
+    now_str = project_now_iso()
+    for row in rows:
+        from_status = row['status'] or 'toClaim'
+        database.execute(
+            '''
+            UPDATE project_accounts
+            SET account_id = NULL,
+                status = 'deleted',
+                deleted_from_status = ?,
+                claim_token = NULL,
+                claimed_at = NULL,
+                lease_expires_at = NULL,
+                caller_id = '',
+                task_id = '',
+                updated_at = ?
+            WHERE id = ?
+            ''',
+            (from_status, now_str, row['id'])
+        )
+        add_project_event(
+            project_id,
+            row['normalized_email'],
+            'mark_deleted',
+            account_id=row['account_id'],
+            project_account_id=row['id'],
+            from_status=from_status,
+            to_status='deleted',
+            detail='account_missing_from_accounts',
+            db=database,
+        )
+    return len(rows)
+
+
+def sync_project_scope(project_id: int, db=None) -> int:
+    database = db or get_db()
+    existing_rows = database.execute(
+        '''
+        SELECT *
+        FROM project_accounts
+        WHERE project_id = ?
+        ORDER BY id ASC
+        ''',
+        (project_id,)
+    ).fetchall()
+    existing_by_email = {str(row['normalized_email'] or ''): row for row in existing_rows}
+
+    now_str = project_now_iso()
+    added_count = 0
+
+    for account_row in get_project_scope_accounts(project_id, db=database):
+        normalized_email = normalize_email_address(account_row['email'])
+        if not normalized_email:
+            continue
+
+        existing = existing_by_email.get(normalized_email)
+        if existing is None:
+            cursor = database.execute(
+                '''
+                INSERT INTO project_accounts (
+                    project_id, account_id, normalized_email, email_snapshot,
+                    status, source_group_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, 'toClaim', ?, ?, ?)
+                ''',
+                (
+                    project_id,
+                    account_row['id'],
+                    normalized_email,
+                    account_row['email'],
+                    account_row['group_id'],
+                    now_str,
+                    now_str,
+                )
+            )
+            add_project_event(
+                project_id,
+                normalized_email,
+                'sync_add',
+                account_id=account_row['id'],
+                project_account_id=cursor.lastrowid,
+                to_status='toClaim',
+                detail={'source_group_id': account_row['group_id']},
+                db=database,
+            )
+            added_count += 1
+            continue
+
+        new_status = existing['status']
+        if existing['status'] == 'deleted':
+            previous_status = str(existing['deleted_from_status'] or '').strip()
+            new_status = previous_status if previous_status in PROJECT_RESTORABLE_STATUSES else 'toClaim'
+            add_project_event(
+                project_id,
+                normalized_email,
+                'sync_restore',
+                account_id=account_row['id'],
+                project_account_id=existing['id'],
+                from_status='deleted',
+                to_status=new_status,
+                detail='restored_by_normalized_email_match',
+                db=database,
+            )
+
+        database.execute(
+            '''
+            UPDATE project_accounts
+            SET account_id = ?,
+                email_snapshot = ?,
+                source_group_id = ?,
+                status = ?,
+                deleted_from_status = '',
+                updated_at = ?
+            WHERE id = ?
+            ''',
+            (
+                account_row['id'],
+                account_row['email'],
+                account_row['group_id'],
+                new_status,
+                now_str,
+                existing['id'],
+            )
+        )
+
+    return added_count
+
+
+def start_project(
+    project_key: str,
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    group_ids: Optional[List[int]] = None,
+    group_ids_provided: bool = False,
+    use_alias_email: Optional[bool] = None,
+    use_alias_email_provided: bool = False,
+) -> Dict[str, Any]:
+    db = get_db()
+    normalized_key = normalize_project_key(project_key)
+    if not normalized_key:
+        raise ValueError('project_key 不能为空')
+
+    clean_name = sanitize_input((name or '').strip(), max_length=100) if name is not None else ''
+    clean_description = sanitize_input(description or '', max_length=500) if description is not None else ''
+    normalized_group_ids = normalize_project_group_ids(group_ids)
+    normalized_use_alias_email = parse_bool_flag(use_alias_email, False)
+
+    now_str = project_now_iso()
+    created = False
+
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        existing = db.execute(
+            'SELECT * FROM projects WHERE project_key = ? LIMIT 1',
+            (normalized_key,)
+        ).fetchone()
+
+        if existing is None:
+            if not clean_name:
+                clean_name = normalized_key
+            scope_mode = 'groups' if normalized_group_ids else 'all'
+            cursor = db.execute(
+                '''
+                INSERT INTO projects (
+                    name, project_key, description, scope_mode, use_alias_email, status,
+                    last_scope_synced_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                ''',
+                (clean_name, normalized_key, clean_description, scope_mode, int(normalized_use_alias_email), now_str, now_str, now_str)
+            )
+            project_id = cursor.lastrowid
+            created = True
+            if normalized_group_ids:
+                update_project_group_scopes(project_id, normalized_group_ids, db=db)
+        else:
+            project_id = existing['id']
+            scope_mode = existing['scope_mode']
+            effective_use_alias_email = parse_bool_flag(existing['use_alias_email'], False)
+            if group_ids_provided:
+                scope_mode = 'groups' if normalized_group_ids else 'all'
+                update_project_group_scopes(project_id, normalized_group_ids, db=db)
+            if use_alias_email_provided:
+                effective_use_alias_email = normalized_use_alias_email
+
+            db.execute(
+                '''
+                UPDATE projects
+                SET name = ?,
+                    description = ?,
+                    scope_mode = ?,
+                    use_alias_email = ?,
+                    status = 'active',
+                    last_scope_synced_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                ''',
+                (
+                    clean_name or existing['name'],
+                    clean_description if description is not None else (existing['description'] or ''),
+                    scope_mode,
+                    int(effective_use_alias_email),
+                    now_str,
+                    now_str,
+                    project_id,
+                )
+            )
+
+        deleted_count = reconcile_deleted_project_accounts(project_id, db=db)
+        added_count = sync_project_scope(project_id, db=db)
+        total_count = int(
+            db.execute(
+                'SELECT COUNT(*) AS count FROM project_accounts WHERE project_id = ?',
+                (project_id,)
+            ).fetchone()['count']
+        )
+        db.commit()
+
+        project = get_project_by_key(normalized_key, db=db) or {}
+        project['created'] = created
+        project['added_count'] = added_count
+        project['deleted_count'] = deleted_count
+        project['total_count'] = total_count
+        return project
+    except Exception:
+        db.rollback()
+        raise
+
+
+def recycle_expired_project_claims(db=None) -> int:
+    database = db or get_db()
+    now_str = project_now_iso()
+    rows = database.execute(
+        '''
+        SELECT id, project_id, account_id, normalized_email, claim_token
+        FROM project_accounts
+        WHERE status = 'claiming'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at < ?
+        ''',
+        (now_str,)
+    ).fetchall()
+    recycled = 0
+    for row in rows:
+        database.execute(
+            '''
+            UPDATE project_accounts
+            SET status = 'toClaim',
+                claim_token = NULL,
+                claimed_at = NULL,
+                lease_expires_at = NULL,
+                caller_id = '',
+                task_id = '',
+                updated_at = ?
+            WHERE id = ?
+            ''',
+            (now_str, row['id'])
+        )
+        add_project_event(
+            row['project_id'],
+            row['normalized_email'],
+            'expire_recycle',
+            account_id=row['account_id'],
+            project_account_id=row['id'],
+            from_status='claiming',
+            to_status='toClaim',
+            claim_token=row['claim_token'] or '',
+            db=database,
+        )
+        recycled += 1
+    return recycled
+
+
+def claim_project_account(project_key: str, caller_id: str, task_id: str, lease_seconds: int = 600) -> Optional[Dict[str, Any]]:
+    normalized_key = normalize_project_key(project_key)
+    if not normalized_key:
+        raise ValueError('project_key 不能为空')
+    if not str(caller_id or '').strip():
+        raise ValueError('caller_id 不能为空')
+    if not str(task_id or '').strip():
+        raise ValueError('task_id 不能为空')
+
+    try:
+        lease_seconds = int(lease_seconds or 600)
+    except (TypeError, ValueError):
+        lease_seconds = 600
+    lease_seconds = max(1, min(lease_seconds, 3600))
+
+    db = get_db()
+    now = datetime.now(timezone.utc)
+    now_str = now.isoformat()
+    lease_expires_at = (now + timedelta(seconds=lease_seconds)).isoformat()
+    claim_token = 'pclm_' + secrets.token_urlsafe(9)
+
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        recycle_expired_project_claims(db=db)
+        project = db.execute(
+            'SELECT * FROM projects WHERE project_key = ? LIMIT 1',
+            (normalized_key,)
+        ).fetchone()
+        if not project or project['status'] != 'active':
+            db.rollback()
+            return None
+
+        row = db.execute(
+            '''
+            SELECT
+                pa.id AS project_account_id,
+                pa.project_id,
+                pa.account_id,
+                pa.normalized_email,
+                pa.email_snapshot,
+                pa.source_group_id,
+                p.use_alias_email,
+                a.email,
+                a.group_id,
+                a.remark,
+                a.status AS account_status,
+                a.provider,
+                a.account_type
+            FROM project_accounts pa
+            JOIN projects p ON p.id = pa.project_id
+            JOIN accounts a ON a.id = pa.account_id
+            WHERE pa.project_id = ?
+              AND pa.status = 'toClaim'
+              AND a.status = 'active'
+              AND NOT EXISTS (
+                    SELECT 1 FROM project_accounts pa2
+                    WHERE pa2.account_id = pa.account_id
+                      AND pa2.status = 'claiming'
+                      AND pa2.id != pa.id
+              )
+            ORDER BY pa.updated_at ASC, pa.id ASC
+            LIMIT 1
+            ''',
+            (project['id'],)
+        ).fetchone()
+
+        if not row:
+            db.rollback()
+            return None
+
+        db.execute(
+            '''
+            UPDATE project_accounts
+            SET status = 'claiming',
+                caller_id = ?,
+                task_id = ?,
+                claim_token = ?,
+                claimed_at = ?,
+                lease_expires_at = ?,
+                claim_count = claim_count + 1,
+                first_claimed_at = COALESCE(first_claimed_at, ?),
+                last_claimed_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            ''',
+            (
+                caller_id.strip(),
+                task_id.strip(),
+                claim_token,
+                now_str,
+                lease_expires_at,
+                now_str,
+                now_str,
+                now_str,
+                row['project_account_id'],
+            )
+        )
+        add_project_event(
+            row['project_id'],
+            row['normalized_email'],
+            'claim',
+            account_id=row['account_id'],
+            project_account_id=row['project_account_id'],
+            from_status='toClaim',
+            to_status='claiming',
+            caller_id=caller_id,
+            task_id=task_id,
+            claim_token=claim_token,
+            detail={'lease_seconds': lease_seconds},
+            db=db,
+        )
+        db.commit()
+        use_alias_email = parse_bool_flag(row['use_alias_email'], False)
+        return {
+            'project_key': normalized_key,
+            'project_account_id': row['project_account_id'],
+            'account_id': row['account_id'],
+            'email': row['email_snapshot'] if use_alias_email else (row['email'] or row['email_snapshot']),
+            'primary_email': row['email'] or '',
+            'group_id': row['group_id'] if row['group_id'] is not None else row['source_group_id'],
+            'provider': row['provider'] or '',
+            'account_type': row['account_type'] or '',
+            'remark': row['remark'] or '',
+            'claim_token': claim_token,
+            'claimed_at': now_str,
+            'lease_expires_at': lease_expires_at,
+        }
+    except Exception:
+        db.rollback()
+        raise
+
+
+def get_project_account_claim(project_key: str, account_id: int, claim_token: str, db=None) -> Optional[sqlite3.Row]:
+    database = db or get_db()
+    normalized_key = normalize_project_key(project_key)
+    return database.execute(
+        '''
+        SELECT pa.*, p.project_key
+        FROM project_accounts pa
+        JOIN projects p ON p.id = pa.project_id
+        WHERE p.project_key = ?
+          AND pa.account_id = ?
+          AND pa.claim_token = ?
+        LIMIT 1
+        ''',
+        (normalized_key, account_id, claim_token)
+    ).fetchone()
+
+
+def complete_project_account_success(project_key: str, account_id: int, claim_token: str,
+                                     caller_id: str = '', task_id: str = '', detail: str = '') -> bool:
+    db = get_db()
+    now_str = project_now_iso()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        row = get_project_account_claim(project_key, account_id, claim_token, db=db)
+        if not row or row['status'] != 'claiming':
+            db.rollback()
+            return False
+        db.execute(
+            '''
+            UPDATE project_accounts
+            SET status = 'done',
+                claim_token = NULL,
+                claimed_at = NULL,
+                lease_expires_at = NULL,
+                caller_id = '',
+                task_id = '',
+                last_result = 'success',
+                last_result_detail = ?,
+                done_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            ''',
+            (detail or '', now_str, now_str, row['id'])
+        )
+        add_project_event(
+            row['project_id'],
+            row['normalized_email'],
+            'complete_success',
+            account_id=account_id,
+            project_account_id=row['id'],
+            from_status='claiming',
+            to_status='done',
+            caller_id=caller_id,
+            task_id=task_id,
+            claim_token=claim_token,
+            detail=detail,
+            db=db,
+        )
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+
+
+def complete_project_account_failed(project_key: str, account_id: int, claim_token: str,
+                                    caller_id: str = '', task_id: str = '', detail: str = '') -> bool:
+    db = get_db()
+    now_str = project_now_iso()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        row = get_project_account_claim(project_key, account_id, claim_token, db=db)
+        if not row or row['status'] != 'claiming':
+            db.rollback()
+            return False
+        db.execute(
+            '''
+            UPDATE project_accounts
+            SET status = 'failed',
+                claim_token = NULL,
+                claimed_at = NULL,
+                lease_expires_at = NULL,
+                caller_id = '',
+                task_id = '',
+                last_result = 'failed',
+                last_result_detail = ?,
+                updated_at = ?
+            WHERE id = ?
+            ''',
+            (detail or '', now_str, row['id'])
+        )
+        add_project_event(
+            row['project_id'],
+            row['normalized_email'],
+            'complete_failed',
+            account_id=account_id,
+            project_account_id=row['id'],
+            from_status='claiming',
+            to_status='failed',
+            caller_id=caller_id,
+            task_id=task_id,
+            claim_token=claim_token,
+            detail=detail,
+            db=db,
+        )
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+
+
+def release_project_account(project_key: str, account_id: int, claim_token: str,
+                            caller_id: str = '', task_id: str = '', detail: str = '') -> bool:
+    db = get_db()
+    now_str = project_now_iso()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        row = get_project_account_claim(project_key, account_id, claim_token, db=db)
+        if not row or row['status'] != 'claiming':
+            db.rollback()
+            return False
+        db.execute(
+            '''
+            UPDATE project_accounts
+            SET status = 'toClaim',
+                claim_token = NULL,
+                claimed_at = NULL,
+                lease_expires_at = NULL,
+                caller_id = '',
+                task_id = '',
+                updated_at = ?
+            WHERE id = ?
+            ''',
+            (now_str, row['id'])
+        )
+        add_project_event(
+            row['project_id'],
+            row['normalized_email'],
+            'release',
+            account_id=account_id,
+            project_account_id=row['id'],
+            from_status='claiming',
+            to_status='toClaim',
+            caller_id=caller_id,
+            task_id=task_id,
+            claim_token=claim_token,
+            detail=detail,
+            db=db,
+        )
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+
+
+def update_project_account_status(project_key: str, account_id: int, from_status: str, to_status: str,
+                                  action: str, detail: str = '') -> bool:
+    if to_status not in PROJECT_ACCOUNT_STATUSES:
+        return False
+    db = get_db()
+    now_str = project_now_iso()
+    normalized_key = normalize_project_key(project_key)
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute(
+            '''
+            SELECT pa.*
+            FROM project_accounts pa
+            JOIN projects p ON p.id = pa.project_id
+            WHERE p.project_key = ? AND pa.account_id = ?
+            LIMIT 1
+            ''',
+            (normalized_key, account_id)
+        ).fetchone()
+        if not row or row['status'] != from_status:
+            db.rollback()
+            return False
+        db.execute(
+            '''
+            UPDATE project_accounts
+            SET status = ?,
+                updated_at = ?,
+                deleted_from_status = CASE WHEN ? != 'deleted' THEN deleted_from_status ELSE deleted_from_status END
+            WHERE id = ?
+            ''',
+            (to_status, now_str, to_status, row['id'])
+        )
+        add_project_event(
+            row['project_id'],
+            row['normalized_email'],
+            action,
+            account_id=account_id,
+            project_account_id=row['id'],
+            from_status=from_status,
+            to_status=to_status,
+            detail=detail,
+            db=db,
+        )
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+
+
+def reset_project_account_failed(project_key: str, account_id: int, detail: str = '') -> bool:
+    return update_project_account_status(project_key, account_id, 'failed', 'toClaim', 'reset_failed', detail)
+
+
+def remove_project_account(project_key: str, account_id: int, detail: str = '') -> bool:
+    normalized_key = normalize_project_key(project_key)
+    db = get_db()
+    now_str = project_now_iso()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute(
+            '''
+            SELECT pa.*
+            FROM project_accounts pa
+            JOIN projects p ON p.id = pa.project_id
+            WHERE p.project_key = ? AND pa.account_id = ?
+            LIMIT 1
+            ''',
+            (normalized_key, account_id)
+        ).fetchone()
+        if not row or row['status'] == 'claiming':
+            db.rollback()
+            return False
+        db.execute(
+            '''
+            UPDATE project_accounts
+            SET status = 'removed',
+                claim_token = NULL,
+                claimed_at = NULL,
+                lease_expires_at = NULL,
+                caller_id = '',
+                task_id = '',
+                updated_at = ?
+            WHERE id = ?
+            ''',
+            (now_str, row['id'])
+        )
+        add_project_event(
+            row['project_id'],
+            row['normalized_email'],
+            'remove',
+            account_id=account_id,
+            project_account_id=row['id'],
+            from_status=row['status'],
+            to_status='removed',
+            detail=detail,
+            db=db,
+        )
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+
+
+def restore_project_account(project_key: str, account_id: int, detail: str = '') -> bool:
+    return update_project_account_status(project_key, account_id, 'removed', 'toClaim', 'restore', detail)
+
+
+def load_project_accounts(project_key: str, status: str = '', group_id: Optional[int] = None,
+                          provider: str = '', keyword: str = '') -> Optional[Dict[str, Any]]:
+    db = get_db()
+    project = get_project_by_key(project_key, db=db)
+    if not project:
+        return None
+
+    sql = '''
+        SELECT
+            pa.id AS project_account_id,
+            pa.project_id,
+            pa.account_id,
+            pa.normalized_email,
+            pa.email_snapshot,
+            pa.status AS project_status,
+            pa.source_group_id,
+            pa.caller_id,
+            pa.task_id,
+            pa.claim_token,
+            pa.claimed_at,
+            pa.lease_expires_at,
+            pa.last_result,
+            pa.last_result_detail,
+            pa.claim_count,
+            pa.first_claimed_at,
+            pa.last_claimed_at,
+            pa.done_at,
+            pa.created_at,
+            pa.updated_at,
+            a.email AS current_email,
+            a.group_id AS current_group_id,
+            a.provider,
+            a.account_type,
+            a.status AS account_status,
+            a.remark,
+            g_current.name AS current_group_name,
+            g_source.name AS source_group_name
+        FROM project_accounts pa
+        LEFT JOIN accounts a ON a.id = pa.account_id
+        LEFT JOIN groups g_current ON g_current.id = a.group_id
+        LEFT JOIN groups g_source ON g_source.id = pa.source_group_id
+        WHERE pa.project_id = ?
+    '''
+    params: List[Any] = [project['id']]
+
+    if status:
+        sql += ' AND pa.status = ?'
+        params.append(status)
+    if group_id is not None:
+        descendant_group_ids = get_descendant_group_ids(group_id, db)
+        if descendant_group_ids:
+            placeholders = ','.join('?' * len(descendant_group_ids))
+            sql += f' AND COALESCE(a.group_id, pa.source_group_id) IN ({placeholders})'
+            params.extend(descendant_group_ids)
+        else:
+            sql += ' AND COALESCE(a.group_id, pa.source_group_id) = ?'
+            params.append(group_id)
+    if provider:
+        sql += ' AND COALESCE(a.provider, \'\') = ?'
+        params.append(provider)
+    if keyword:
+        sql += ' AND (COALESCE(a.email, \'\') LIKE ? OR pa.email_snapshot LIKE ? OR COALESCE(a.remark, \'\') LIKE ?)'
+        like = f'%{keyword}%'
+        params.extend([like, like, like])
+
+    sql += ' ORDER BY pa.updated_at DESC, pa.id DESC'
+
+    rows = db.execute(sql, params).fetchall()
+    accounts = []
+    use_alias_email = parse_bool_flag(project.get('use_alias_email'), False)
+    for row in rows:
+        accounts.append({
+            'project_account_id': row['project_account_id'],
+            'account_id': row['account_id'],
+            'email': row['email_snapshot'] if use_alias_email else (row['current_email'] or row['email_snapshot']),
+            'primary_email': row['current_email'] or '',
+            'normalized_email': row['normalized_email'],
+            'provider': row['provider'] or '',
+            'account_type': row['account_type'] or '',
+            'group_id': row['current_group_id'] if row['current_group_id'] is not None else row['source_group_id'],
+            'group_name': row['current_group_name'] or row['source_group_name'] or '',
+            'remark': row['remark'] or '',
+            'project_status': row['project_status'],
+            'account_status': row['account_status'] or '',
+            'caller_id': row['caller_id'] or '',
+            'task_id': row['task_id'] or '',
+            'claim_token': row['claim_token'] or '',
+            'claimed_at': row['claimed_at'] or '',
+            'lease_expires_at': row['lease_expires_at'] or '',
+            'last_result': row['last_result'] or '',
+            'last_result_detail': row['last_result_detail'] or '',
+            'claim_count': int(row['claim_count'] or 0),
+            'first_claimed_at': row['first_claimed_at'] or '',
+            'last_claimed_at': row['last_claimed_at'] or '',
+            'done_at': row['done_at'] or '',
+            'created_at': row['created_at'] or '',
+            'updated_at': row['updated_at'] or '',
+        })
+
+    return {
+        'project': project,
+        'accounts': accounts,
+    }
+
+
+def mark_project_accounts_deleted_for_account_ids(account_ids: List[int], db=None) -> int:
+    database = db or get_db()
+    normalized_ids = normalize_account_ids(account_ids)
+    if not normalized_ids:
+        return 0
+
+    placeholders = ','.join('?' * len(normalized_ids))
+    rows = database.execute(
+        f'''
+        SELECT id, project_id, account_id, normalized_email, status
+        FROM project_accounts
+        WHERE account_id IN ({placeholders})
+          AND status != 'deleted'
+        ''',
+        normalized_ids
+    ).fetchall()
+    if not rows:
+        return 0
+
+    now_str = project_now_iso()
+    for row in rows:
+        database.execute(
+            '''
+            UPDATE project_accounts
+            SET account_id = NULL,
+                status = 'deleted',
+                deleted_from_status = ?,
+                claim_token = NULL,
+                claimed_at = NULL,
+                lease_expires_at = NULL,
+                caller_id = '',
+                task_id = '',
+                updated_at = ?
+            WHERE id = ?
+            ''',
+            (row['status'] or 'toClaim', now_str, row['id'])
+        )
+        add_project_event(
+            row['project_id'],
+            row['normalized_email'],
+            'mark_deleted',
+            account_id=row['account_id'],
+            project_account_id=row['id'],
+            from_status=row['status'] or 'toClaim',
+            to_status='deleted',
+            detail='account_deleted_from_system',
+            db=database,
+        )
+    return len(rows)
+
+
+def delete_account_by_id(account_id: int) -> bool:
+    """删除邮箱账号"""
+    db = get_db()
+    try:
+        mark_project_accounts_deleted_for_account_ids([account_id], db=db)
+        db.execute('DELETE FROM accounts WHERE id = ?', (account_id,))
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        return False
+
+
+def delete_account_by_email(email_addr: str) -> bool:
+    """根据邮箱地址删除账号"""
+    db = get_db()
+    try:
+        row = db.execute('SELECT id FROM accounts WHERE email = ? LIMIT 1', (email_addr,)).fetchone()
+        if row:
+            mark_project_accounts_deleted_for_account_ids([row['id']], db=db)
+        db.execute('DELETE FROM accounts WHERE email = ?', (email_addr,))
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        return False
+
+
+def normalize_account_ids(account_ids: List[int]) -> List[int]:
+    """归一化账号 ID 列表，过滤非法值并去重。"""
+    normalized_ids = []
+    seen_ids = set()
+    for account_id in account_ids or []:
+        try:
+            normalized_id = int(account_id)
+        except (TypeError, ValueError):
+            continue
+        if normalized_id <= 0 or normalized_id in seen_ids:
+            continue
+        seen_ids.add(normalized_id)
+        normalized_ids.append(normalized_id)
+    return normalized_ids
+
+
+def delete_accounts_by_ids(account_ids: List[int]) -> Dict[str, Any]:
+    """批量删除邮箱账号。"""
+    db = get_db()
+    normalized_ids = normalize_account_ids(account_ids)
+
+    if not normalized_ids:
+        return {'success': False, 'error': '请选择要删除的账号'}
+
+    placeholders = ','.join('?' * len(normalized_ids))
+    rows = db.execute(f'''
+        SELECT id, email
+        FROM accounts
+        WHERE id IN ({placeholders})
+        ORDER BY email COLLATE NOCASE ASC
+    ''', normalized_ids).fetchall()
+
+    if not rows:
+        return {'success': False, 'error': '未找到可删除的账号'}
+
+    existing_ids = [row['id'] for row in rows]
+    deleted_accounts = [{'id': row['id'], 'email': row['email']} for row in rows]
+    missing_ids = [account_id for account_id in normalized_ids if account_id not in set(existing_ids)]
+
+    try:
+        delete_placeholders = ','.join('?' * len(existing_ids))
+        mark_project_accounts_deleted_for_account_ids(existing_ids, db=db)
+        db.execute(f'DELETE FROM accounts WHERE id IN ({delete_placeholders})', existing_ids)
+        db.commit()
+        return {
+            'success': True,
+            'deleted_count': len(existing_ids),
+            'deleted_accounts': deleted_accounts,
+            'missing_ids': missing_ids,
+        }
+    except Exception as e:
+        db.rollback()
+        return {'success': False, 'error': str(e)}
+
+
+def update_accounts_forwarding_by_ids(account_ids: List[int], forward_enabled: bool) -> Dict[str, Any]:
+    """批量更新账号转发开关。"""
+    db = get_db()
+    normalized_ids = normalize_account_ids(account_ids)
+
+    if not normalized_ids:
+        return {'success': False, 'error': '请选择要修改的账号'}
+
+    placeholders = ','.join('?' * len(normalized_ids))
+    rows = db.execute(
+        f'''
+        SELECT id, email, COALESCE(forward_enabled, 0) AS forward_enabled
+        FROM accounts
+        WHERE id IN ({placeholders})
+        ORDER BY email COLLATE NOCASE ASC
+        ''',
+        normalized_ids
+    ).fetchall()
+
+    if not rows:
+        return {'success': False, 'error': '未找到可修改的账号'}
+
+    target_value = 1 if forward_enabled else 0
+    existing_ids = [row['id'] for row in rows]
+    existing_id_set = set(existing_ids)
+    missing_ids = [account_id for account_id in normalized_ids if account_id not in existing_id_set]
+    updated_rows = [row for row in rows if int(row['forward_enabled'] or 0) != target_value]
+    updated_ids = [row['id'] for row in updated_rows]
+    updated_accounts = [{'id': row['id'], 'email': row['email']} for row in updated_rows]
+    unchanged_count = len(rows) - len(updated_rows)
+
+    try:
+        if updated_ids:
+            update_placeholders = ','.join('?' * len(updated_ids))
+            if forward_enabled:
+                db.execute(
+                    f'''
+                    UPDATE accounts
+                    SET forward_enabled = 1,
+                        forward_last_checked_at = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id IN ({update_placeholders})
+                    ''',
+                    [datetime.now(timezone.utc).isoformat()] + updated_ids
+                )
+            else:
+                db.execute(
+                    f'''
+                    UPDATE accounts
+                    SET forward_enabled = 0,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id IN ({update_placeholders})
+                    ''',
+                    updated_ids
+                )
+            db.commit()
+
+        return {
+            'success': True,
+            'updated_count': len(updated_ids),
+            'updated_accounts': updated_accounts,
+            'unchanged_count': unchanged_count,
+            'missing_ids': missing_ids,
+        }
+    except Exception as e:
+        db.rollback()
+        return {'success': False, 'error': str(e)}
+
+
+def update_accounts_proxy_by_ids(account_ids: List[int], proxy_url: str = '',
+                                 fallback_proxy_url_1: str = '',
+                                 fallback_proxy_url_2: str = '') -> Dict[str, Any]:
+    """批量更新账号级代理配置，三项全空表示清空账号覆盖并继承分组。"""
+    db = get_db()
+    normalized_ids = normalize_account_ids(account_ids)
+
+    if not normalized_ids:
+        return {'success': False, 'error': '请选择要修改的账号'}
+
+    placeholders = ','.join('?' * len(normalized_ids))
+    rows = db.execute(
+        f'''
+        SELECT id, email, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2
+        FROM accounts
+        WHERE id IN ({placeholders})
+        ORDER BY email COLLATE NOCASE ASC
+        ''',
+        normalized_ids
+    ).fetchall()
+
+    if not rows:
+        return {'success': False, 'error': '未找到可修改的账号'}
+
+    target_proxy_url = str(proxy_url or '').strip()
+    target_fallback_proxy_url_1 = str(fallback_proxy_url_1 or '').strip()
+    target_fallback_proxy_url_2 = str(fallback_proxy_url_2 or '').strip()
+    existing_ids = [row['id'] for row in rows]
+    existing_id_set = set(existing_ids)
+    missing_ids = [account_id for account_id in normalized_ids if account_id not in existing_id_set]
+
+    updated_rows = [
+        row for row in rows
+        if (
+            str(row['proxy_url'] or '') != target_proxy_url
+            or str(row['fallback_proxy_url_1'] or '') != target_fallback_proxy_url_1
+            or str(row['fallback_proxy_url_2'] or '') != target_fallback_proxy_url_2
+        )
+    ]
+    updated_ids = [row['id'] for row in updated_rows]
+    updated_accounts = [{'id': row['id'], 'email': row['email']} for row in updated_rows]
+    unchanged_count = len(rows) - len(updated_rows)
+
+    try:
+        if updated_ids:
+            update_placeholders = ','.join('?' * len(updated_ids))
+            db.execute(
+                f'''
+                UPDATE accounts
+                SET proxy_url = ?,
+                    fallback_proxy_url_1 = ?,
+                    fallback_proxy_url_2 = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id IN ({update_placeholders})
+                ''',
+                [
+                    target_proxy_url,
+                    target_fallback_proxy_url_1,
+                    target_fallback_proxy_url_2,
+                ] + updated_ids
+            )
+            db.commit()
+
+        return {
+            'success': True,
+            'updated_count': len(updated_ids),
+            'updated_accounts': updated_accounts,
+            'unchanged_count': unchanged_count,
+            'missing_ids': missing_ids,
+        }
+    except Exception as e:
+        db.rollback()
+        return {'success': False, 'error': str(e)}
+
+
+def set_account_forward_cursor(account_id: int, cursor_value: Optional[str]) -> bool:
+    """设置账号转发游标。"""
+    db = get_db()
+    try:
+        db.execute(
+            '''
+            UPDATE accounts
+            SET forward_last_checked_at = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            ''',
+            (cursor_value, account_id)
+        )
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        return False
+
+
+# ==================== 工具函数 ====================
+
+def sanitize_input(text: str, max_length: int = 500) -> str:
+    """
+    净化用户输入，防止XSS攻击
+    - 转义HTML特殊字符
+    - 限制长度
+    - 移除控制字符
+    """
+    if not text:
+        return ""
+
+    # 限制长度
+    text = text[:max_length]
+
+    # 移除控制字符（保留换行和制表符）
+    text = ''.join(char for char in text if char.isprintable() or char in '\n\t')
+
+    # 转义HTML特殊字符
+    text = html.escape(text, quote=True)
+
+    return text
+
+
+def log_audit(action: str, resource_type: str, resource_id: str = None, details: str = None):
+    """
+    记录审计日志
+    :param action: 操作类型（如 'export', 'delete', 'update'）
+    :param resource_type: 资源类型（如 'account', 'group'）
+    :param resource_id: 资源ID
+    :param details: 详细信息
+    """
+    try:
+        db = get_db()
+        user_ip = request.remote_addr if request else 'unknown'
+        db.execute('''
+            INSERT INTO audit_logs (action, resource_type, resource_id, user_ip, details)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (action, resource_type, resource_id, user_ip, details))
+        db.commit()
+    except Exception:
+        # 审计日志失败不应影响主流程
+        pass
+
+
+def decode_header_value(header_value: str) -> str:
+    """解码邮件头字段"""
+    if not header_value:
+        return ""
+    try:
+        decoded_parts = decode_header(str(header_value))
+        decoded_string = ""
+        for part, charset in decoded_parts:
+            if isinstance(part, bytes):
+                try:
+                    decoded_string += part.decode(charset if charset else 'utf-8', 'replace')
+                except (LookupError, UnicodeDecodeError):
+                    decoded_string += part.decode('utf-8', 'replace')
+            else:
+                decoded_string += str(part)
+        return decoded_string
+    except Exception:
+        return str(header_value) if header_value else ""
+
+
+def get_email_body(msg) -> str:
+    """提取邮件正文"""
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            content_disposition = str(part.get("Content-Disposition", ""))
+            
+            if content_type == "text/plain" and "attachment" not in content_disposition:
+                try:
+                    payload = part.get_payload(decode=True)
+                    charset = part.get_content_charset() or 'utf-8'
+                    body = payload.decode(charset, errors='replace')
+                    break
+                except Exception:
+                    continue
+            elif content_type == "text/html" and "attachment" not in content_disposition and not body:
+                try:
+                    payload = part.get_payload(decode=True)
+                    charset = part.get_content_charset() or 'utf-8'
+                    body = payload.decode(charset, errors='replace')
+                except Exception:
+                    continue
+    else:
+        try:
+            payload = msg.get_payload(decode=True)
+            charset = msg.get_content_charset() or 'utf-8'
+            body = payload.decode(charset, errors='replace')
+        except Exception:
+            body = str(msg.get_payload())
+    
+    return body
+
+
+def get_email_html_body(msg) -> str:
+    """提取邮件 HTML 正文"""
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            content_disposition = str(part.get("Content-Disposition", ""))
+
+            if content_type == "text/html" and "attachment" not in content_disposition:
+                try:
+                    payload = part.get_payload(decode=True)
+                    charset = part.get_content_charset() or 'utf-8'
+                    return payload.decode(charset, errors='replace')
+                except Exception:
+                    continue
+    elif msg.get_content_type() == "text/html":
+        try:
+            payload = msg.get_payload(decode=True)
+            charset = msg.get_content_charset() or 'utf-8'
+            return payload.decode(charset, errors='replace')
+        except Exception:
+            return ""
+
+    return ""
+
+
+def generate_random_temp_name() -> str:
+    """生成临时邮箱用户名"""
+    return f"{secrets.token_hex(3)}{secrets.randbelow(1000)}"
+
+
+def build_cloudflare_domain_candidates(domain: str) -> List[str]:
+    """为 Cloudflare 创建邮箱生成可回退的域名候选列表"""
+    normalized = domain.strip().lower().lstrip('@').rstrip('.')
+    if not normalized:
+        return []
+
+    candidates: List[str] = [normalized]
+    labels = [label for label in normalized.split('.') if label]
+    if len(labels) < 3:
+        return candidates
+
+    common_second_level_suffixes = {
+        'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn',
+        'co.uk', 'org.uk', 'ac.uk',
+        'com.hk', 'com.sg',
+        'com.au', 'net.au', 'org.au',
+        'co.jp'
+    }
+
+    last_two = '.'.join(labels[-2:])
+    last_three = '.'.join(labels[-3:]) if len(labels) >= 3 else ''
+
+    if last_three and last_two in common_second_level_suffixes:
+        if last_three not in candidates:
+            candidates.append(last_three)
+    elif last_two not in candidates:
+        candidates.append(last_two)
+
+    if last_three and last_three not in candidates:
+        candidates.append(last_three)
+
+    return candidates
+
+
+def parse_raw_email_to_temp_message(email_addr: str, raw_email: str, fallback_id: str = None,
+                                    fallback_timestamp: int = 0) -> Dict[str, Any]:
+    """将原始邮件解析为统一的临时邮箱消息格式"""
+    if isinstance(raw_email, str):
+        msg = email.message_from_string(raw_email)
+    else:
+        msg = email.message_from_bytes(raw_email)
+
+    text_content = get_email_body(msg)
+    html_content = get_email_html_body(msg)
+    message_id = decode_header_value(msg.get('Message-ID', '')).strip()
+    date_header = decode_header_value(msg.get('Date', '')).strip()
+    timestamp = fallback_timestamp
+
+    if date_header:
+        try:
+            parsed_date = email.utils.parsedate_to_datetime(date_header)
+            timestamp = int(parsed_date.timestamp())
+        except Exception:
+            pass
+
+    final_message_id = (
+        fallback_id
+        or message_id
+        or hashlib.sha256(f"{email_addr}\n{raw_email}".encode('utf-8', 'replace')).hexdigest()
+    )
+
+    return {
+        'id': final_message_id,
+        'from_address': decode_header_value(msg.get('From', '未知发件人')),
+        'subject': decode_header_value(msg.get('Subject', '无主题')),
+        'content': text_content,
+        'html_content': html_content,
+        'has_html': bool(html_content),
+        'timestamp': timestamp,
+        'raw_content': raw_email if isinstance(raw_email, str) else raw_email.decode('utf-8', 'replace')
+    }
+
+
+# 重写导入解析函数，支持多种账号字段顺序
+def is_probable_client_id(value: str) -> bool:
+    candidate = str(value or '').strip()
+    if not candidate:
+        return False
+    try:
+        uuid.UUID(candidate)
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def resolve_outlook_token_order(third: str, fourth: str,
+                                account_format: str = 'client_id_refresh_token') -> tuple[str, str]:
+    third = str(third or '').strip()
+    fourth = str(fourth or '').strip()
+
+    # Azure / Microsoft public client_id is normally a UUID. If one side clearly
+    # looks like client_id and the other does not, auto-detect the order so that
+    # pasted import lines keep working even when the UI format selector is wrong.
+    third_is_client_id = is_probable_client_id(third)
+    fourth_is_client_id = is_probable_client_id(fourth)
+    if third_is_client_id and not fourth_is_client_id:
+        return third, fourth
+    if fourth_is_client_id and not third_is_client_id:
+        return fourth, third
+
+    if account_format == 'refresh_token_client_id':
+        return fourth, third
+    return third, fourth
+
+
+def parse_account_string(account_str: str, account_format: str = 'client_id_refresh_token') -> Optional[Dict]:
+    parts = [part.strip() for part in account_str.strip().split('----')]
+    if len(parts) < 4 or not parts[0]:
+        return None
+
+    email_addr, password, third, fourth = parts[:4]
+    client_id, refresh_token = resolve_outlook_token_order(third, fourth, account_format)
+
+    if not client_id or not refresh_token:
+        return None
+
+    return {
+        'email': email_addr,
+        'password': password,
+        'client_id': client_id,
+        'refresh_token': refresh_token
+    }
+
+
+# ==================== Graph API 方式 ====================
+
+
+def parse_outlook_account_string(account_str: str, account_format: str = 'client_id_refresh_token') -> Optional[Dict]:
+    parts = [part.strip() for part in account_str.strip().split('----')]
+    if len(parts) < 4 or not parts[0]:
+        return None
+
+    email_addr, password, third, fourth = parts[:4]
+    client_id, refresh_token = resolve_outlook_token_order(third, fourth, account_format)
+
+    if not client_id or not refresh_token:
+        return None
+
+    return {
+        'email': email_addr,
+        'password': password,
+        'client_id': client_id,
+        'refresh_token': refresh_token,
+        'provider': 'outlook',
+        'account_type': 'outlook',
+        'imap_host': IMAP_SERVER_NEW,
+        'imap_port': IMAP_PORT,
+        'imap_password': '',
+    }
+
+
+def parse_imap_account_string(account_str: str, provider: str = 'custom', imap_host: str = '', imap_port: int = 993) -> Optional[Dict]:
+    parts = [part.strip() for part in account_str.strip().split('----')]
+    if len(parts) < 2 or not parts[0]:
+        return None
+
+    email_addr = parts[0]
+    password = parts[1]
+    provider_meta = get_provider_meta(provider, email_addr)
+    provider_key = provider_meta['key']
+
+    if provider_key == 'custom':
+        if len(parts) >= 4:
+            imap_host = parts[2].strip() or imap_host
+            try:
+                imap_port = int(parts[3].strip() or imap_port or 993)
+            except ValueError:
+                return None
+        if not imap_host:
+            return None
+    else:
+        imap_host = provider_meta.get('imap_host', '')
+        imap_port = int(provider_meta.get('imap_port', 993) or 993)
+
+    if not password or not imap_host:
+        return None
+
+    return {
+        'email': email_addr,
+        'password': '',
+        'client_id': '',
+        'refresh_token': '',
+        'provider': provider_key,
+        'account_type': 'imap',
+        'imap_host': imap_host,
+        'imap_port': int(imap_port or 993),
+        'imap_password': password,
+    }
+
+
+def parse_account_import(account_str: str, account_format: str = 'client_id_refresh_token',
+                         provider: str = 'outlook', imap_host: str = '', imap_port: int = 993) -> Optional[Dict]:
+    provider_key = normalize_provider(provider, account_str.split('----', 1)[0].strip() if account_str else '')
+    if provider_key == 'outlook':
+        return parse_outlook_account_string(account_str, account_format)
+    return parse_imap_account_string(account_str, provider_key, imap_host, imap_port)

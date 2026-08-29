@@ -1,0 +1,1910 @@
+from __future__ import annotations
+
+import sys
+import time
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+from werkzeug.exceptions import HTTPException
+
+if TYPE_CHECKING:
+    # These segmented files are executed into the shared `web_outlook_app`
+    # globals at runtime. Importing from the assembled module keeps IDE
+    # inspections from flagging the shared names as unresolved.
+    from web_outlook_app import *  # noqa: F403
+
+
+# ==================== 定时任务调度器 ====================
+
+CONSOLE_SYMBOL_REPLACEMENTS = str.maketrans({
+    '✓': '[OK] ',
+    '⚠': '[WARN] ',
+})
+FORWARD_CHECK_INTERVAL_SECONDS_MIN = 20
+FORWARD_CHECK_INTERVAL_SECONDS_MAX = 3600
+FORWARD_EXECUTION_MODES = {'serial', 'parallel'}
+FORWARD_PARALLEL_WORKERS_MIN = 1
+FORWARD_PARALLEL_WORKERS_MAX = 10
+FORWARD_PARALLEL_WORKERS_DEFAULT = 4
+
+
+def safe_console_print(*args: Any, sep: str = ' ', end: str = '\n',
+                       file: Any = None, flush: bool = False) -> None:
+    stream = sys.stdout if file is None else file
+    text = sep.join(str(arg) for arg in args).translate(CONSOLE_SYMBOL_REPLACEMENTS)
+    try:
+        print(text, sep=sep, end=end, file=stream, flush=flush)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, 'encoding', None) or 'utf-8'
+        fallback = text.encode(encoding, errors='backslashreplace').decode(encoding)
+        print(fallback, sep=sep, end=end, file=stream, flush=flush)
+
+
+def get_bool_setting(key: str, default: bool = False) -> bool:
+    value = str(get_setting(key, 'true' if default else 'false')).strip().lower()
+    return value in ('1', 'true', 'yes', 'on')
+
+
+def normalize_forward_channel_settings(raw_channels: Any) -> list[str]:
+    if isinstance(raw_channels, str):
+        values = raw_channels.split(',')
+    elif isinstance(raw_channels, (list, tuple, set)):
+        values = list(raw_channels)
+    else:
+        values = []
+
+    normalized = []
+    channel_aliases = {
+        'email': FORWARD_CHANNEL_SMTP_SETTING,
+        'smtp': FORWARD_CHANNEL_SMTP_SETTING,
+        'tg': FORWARD_CHANNEL_TG_SETTING,
+        'telegram': FORWARD_CHANNEL_TG_SETTING,
+        'wecom': FORWARD_CHANNEL_WECOM_SETTING,
+        'wechatwork': FORWARD_CHANNEL_WECOM_SETTING,
+        'qywx': FORWARD_CHANNEL_WECOM_SETTING,
+    }
+
+    for item in values:
+        channel = channel_aliases.get(str(item).strip().lower())
+        if channel and channel not in normalized:
+            normalized.append(channel)
+    return normalized
+
+
+def normalize_smtp_forward_provider(value: str) -> str:
+    provider = str(value or '').strip().lower()
+    if provider not in SMTP_FORWARD_PROVIDERS:
+        return 'custom'
+    return provider
+
+
+def get_configured_forward_channels() -> list[str]:
+    channels = []
+    if get_setting('email_forward_recipient', '').strip() and get_setting('smtp_host', '').strip():
+        channels.append(FORWARD_CHANNEL_SMTP_SETTING)
+    if get_setting_decrypted('telegram_bot_token', '').strip() and get_setting('telegram_chat_id', '').strip():
+        channels.append(FORWARD_CHANNEL_TG_SETTING)
+    if get_setting_decrypted('wecom_webhook_url', '').strip():
+        channels.append(FORWARD_CHANNEL_WECOM_SETTING)
+    return channels
+
+
+def get_forward_channels() -> list[str]:
+    raw_channels = get_setting('forward_channels', 'auto').strip().lower()
+    if raw_channels in ('', 'auto'):
+        return get_configured_forward_channels()
+    if raw_channels == 'none':
+        return []
+    return normalize_forward_channel_settings(raw_channels)
+
+
+def get_forward_account_delay_seconds() -> int:
+    try:
+        return max(0, min(60, int(get_setting('forward_account_delay_seconds', '0') or '0')))
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_forward_check_interval_seconds(value: Any = None, legacy_minutes: Any = None) -> int:
+    raw_value = get_setting('forward_check_interval_seconds', '') if value is None else value
+    try:
+        seconds = int(raw_value)
+    except (TypeError, ValueError):
+        seconds = 0
+    if FORWARD_CHECK_INTERVAL_SECONDS_MIN <= seconds <= FORWARD_CHECK_INTERVAL_SECONDS_MAX:
+        return seconds
+
+    raw_minutes = get_setting('forward_check_interval_minutes', '5') if legacy_minutes is None else legacy_minutes
+    try:
+        minutes = max(1, min(60, int(raw_minutes or 5)))
+    except (TypeError, ValueError):
+        minutes = 5
+    derived_seconds = minutes * 60
+    return max(
+        FORWARD_CHECK_INTERVAL_SECONDS_MIN,
+        min(FORWARD_CHECK_INTERVAL_SECONDS_MAX, derived_seconds),
+    )
+
+
+def parse_forward_check_interval_seconds_input(value: Any) -> int:
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        raise ValueError('转发轮询间隔必须是数字')
+    if seconds < FORWARD_CHECK_INTERVAL_SECONDS_MIN or seconds > FORWARD_CHECK_INTERVAL_SECONDS_MAX:
+        raise ValueError(
+            f'转发轮询间隔必须在 {FORWARD_CHECK_INTERVAL_SECONDS_MIN}-{FORWARD_CHECK_INTERVAL_SECONDS_MAX} 秒之间'
+        )
+    return seconds
+
+
+def normalize_forward_execution_mode(value: Any = None) -> str:
+    mode = str(get_setting('forward_execution_mode', 'serial') if value is None else value).strip().lower()
+    if mode in FORWARD_EXECUTION_MODES:
+        return mode
+    return 'serial'
+
+
+def parse_forward_execution_mode_input(value: Any) -> str:
+    mode = str(value or '').strip().lower()
+    if mode not in FORWARD_EXECUTION_MODES:
+        raise ValueError('转发执行模式必须是 serial 或 parallel')
+    return mode
+
+
+def normalize_forward_parallel_workers(value: Any = None) -> int:
+    raw_value = get_setting('forward_parallel_workers', str(FORWARD_PARALLEL_WORKERS_DEFAULT)) if value is None else value
+    try:
+        workers = int(raw_value)
+    except (TypeError, ValueError):
+        workers = FORWARD_PARALLEL_WORKERS_DEFAULT
+    return max(FORWARD_PARALLEL_WORKERS_MIN, min(FORWARD_PARALLEL_WORKERS_MAX, workers))
+
+
+def parse_forward_parallel_workers_input(value: Any) -> int:
+    try:
+        workers = int(value)
+    except (TypeError, ValueError):
+        raise ValueError('转发并行 worker 数必须是数字')
+    if workers < FORWARD_PARALLEL_WORKERS_MIN or workers > FORWARD_PARALLEL_WORKERS_MAX:
+        raise ValueError(
+            f'转发并行 worker 数必须在 {FORWARD_PARALLEL_WORKERS_MIN}-{FORWARD_PARALLEL_WORKERS_MAX} 之间'
+        )
+    return workers
+
+
+def has_forward_log(conn, account_id: int, message_id: str, channel: str) -> bool:
+    row = conn.execute(
+        'SELECT 1 FROM forward_logs WHERE account_id = ? AND message_id = ? AND channel = ? LIMIT 1',
+        (account_id, str(message_id), channel)
+    ).fetchone()
+    return row is not None
+
+
+def record_forward_log(conn, account_id: int, message_id: str, channel: str):
+    conn.execute(
+        'INSERT OR IGNORE INTO forward_logs (account_id, message_id, channel) VALUES (?, ?, ?)',
+        (account_id, str(message_id), channel)
+    )
+
+
+def stringify_forward_error(error: Any) -> str:
+    if error is None:
+        return ''
+    if isinstance(error, str):
+        return sanitize_error_details(error)[:500]
+    if isinstance(error, dict):
+        parts = []
+        message = str(error.get('message') or error.get('error') or '').strip()
+        code = str(error.get('code') or '').strip()
+        err_type = str(error.get('type') or '').strip()
+        details = error.get('details')
+        if message:
+            parts.append(message)
+        if code:
+            parts.append(f'code={code}')
+        if err_type:
+            parts.append(f'type={err_type}')
+        if details:
+            details_text = details if isinstance(details, str) else json.dumps(details, ensure_ascii=True)
+            if details_text and details_text not in parts:
+                parts.append(str(details_text))
+        return sanitize_error_details(' | '.join(parts) or str(error))[:500]
+    return sanitize_error_details(str(error))[:500]
+
+
+def send_forward_email(subject: str, body_text: str, body_html: str = '') -> bool:
+    recipient = get_setting('email_forward_recipient', '').strip()
+    host = get_setting('smtp_host', '').strip()
+    if not recipient or not host:
+        return False
+
+    port = int(get_setting('smtp_port', '465') or 465)
+    username = get_setting('smtp_username', '').strip()
+    password = get_setting_decrypted('smtp_password', '').strip()
+    smtp_from_email = get_setting('smtp_from_email', '').strip()
+    from_email = smtp_from_email or username
+    if not from_email:
+        return False
+    use_tls = get_bool_setting('smtp_use_tls', False)
+    use_ssl = get_bool_setting('smtp_use_ssl', True)
+
+    message = EmailMessage()
+    message['From'] = from_email
+    message['To'] = recipient
+    message['Subject'] = subject
+    message.set_content(body_text)
+    if body_html:
+        message.add_alternative(body_html, subtype='html')
+
+    smtp_cls = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+    with smtp_cls(host, port, timeout=20) as client:
+        if not use_ssl:
+            client.ehlo()
+            if use_tls:
+                client.starttls()
+                client.ehlo()
+        if username:
+            client.login(username, password)
+        client.send_message(message)
+    return True
+
+
+def send_forward_email_with_config(config: Dict[str, Any], subject: str, body_text: str, body_html: str = '') -> bool:
+    recipient = str(config.get('recipient', '') or '').strip()
+    host = str(config.get('host', '') or '').strip()
+    if not recipient or not host:
+        return False
+
+    port = int(config.get('port') or 465)
+    username = str(config.get('username', '') or '').strip()
+    password = str(config.get('password', '') or '')
+    from_email = str(config.get('from_email', '') or '').strip() or username
+    if not from_email:
+        return False
+    use_tls = str(config.get('use_tls', '')).lower() in ('1', 'true', 'yes', 'on')
+    use_ssl = str(config.get('use_ssl', '')).lower() in ('1', 'true', 'yes', 'on')
+
+    message = EmailMessage()
+    message['From'] = from_email
+    message['To'] = recipient
+    message['Subject'] = subject
+    message.set_content(body_text)
+    if body_html:
+        message.add_alternative(body_html, subtype='html')
+
+    smtp_cls = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+    with smtp_cls(host, port, timeout=20) as client:
+        if not use_ssl:
+            client.ehlo()
+            if use_tls:
+                client.starttls()
+                client.ehlo()
+        if username:
+            client.login(username, password)
+        client.send_message(message)
+    return True
+
+
+def send_forward_telegram(text: str) -> bool:
+    bot_token = get_setting_decrypted('telegram_bot_token', '').strip()
+    chat_id = get_setting('telegram_chat_id', '').strip()
+    proxy_url = get_setting('telegram_proxy_url', '').strip()
+    if not bot_token or not chat_id:
+        return False
+    response = post_with_proxy_fallback(
+        f'https://api.telegram.org/bot{bot_token}/sendMessage',
+        json={
+            'chat_id': chat_id,
+            'text': text[:4000],
+            'disable_web_page_preview': True,
+        },
+        timeout=15,
+        proxy_url=proxy_url,
+    )
+    return response.ok
+
+
+def send_forward_telegram_with_config(config: Dict[str, Any], text: str) -> bool:
+    bot_token = str(config.get('bot_token', '') or '').strip()
+    chat_id = str(config.get('chat_id', '') or '').strip()
+    proxy_url = str(config.get('proxy_url', '') or '').strip()
+    if not bot_token or not chat_id:
+        return False
+    response = post_with_proxy_fallback(
+        f'https://api.telegram.org/bot{bot_token}/sendMessage',
+        json={
+            'chat_id': chat_id,
+            'text': text[:4000],
+            'disable_web_page_preview': True,
+        },
+        timeout=15,
+        proxy_url=proxy_url,
+    )
+    return response.ok
+
+
+def send_forward_wecom(text: str) -> bool:
+    webhook_url = get_setting_decrypted('wecom_webhook_url', '').strip()
+    if not webhook_url:
+        return False
+    response = post_with_proxy_fallback(
+        webhook_url,
+        json={
+            'msgtype': 'text',
+            'text': {
+                'content': text[:1800],
+            },
+        },
+        timeout=15,
+    )
+    return response.ok
+
+
+def send_forward_wecom_with_config(config: Dict[str, Any], text: str) -> bool:
+    webhook_url = str(config.get('webhook_url', '') or '').strip()
+    if not webhook_url:
+        return False
+    response = post_with_proxy_fallback(
+        webhook_url,
+        json={
+            'msgtype': 'text',
+            'text': {
+                'content': text[:1800],
+            },
+        },
+        timeout=15,
+    )
+    return response.ok
+
+
+def build_forward_payload(account: Dict[str, Any], email_detail: Dict[str, Any]) -> tuple[str, str, str, str]:
+    subject = email_detail.get('subject') or '无主题'
+    sender = email_detail.get('from') or '未知'
+    received_at = email_detail.get('date') or ''
+    body = email_detail.get('body') or ''
+    body_text = strip_html_content(body) if email_detail.get('body_type') == 'html' else strip_html_content(body.replace('<br>', '\n'))
+    body_text = body_text[:2000]
+
+    title = f"[邮件转发] {subject}"
+    plain = f"账号: {account.get('email','')}\n发件人: {sender}\n时间: {received_at}\n主题: {subject}\n\n{body_text}"
+    html_body = (
+        f"<p><strong>账号:</strong> {html.escape(account.get('email', ''))}</p>"
+        f"<p><strong>发件人:</strong> {html.escape(sender)}</p>"
+        f"<p><strong>时间:</strong> {html.escape(received_at)}</p>"
+        f"<p><strong>主题:</strong> {html.escape(subject)}</p><hr>{body}"
+    )
+    telegram_text = f"新邮件转发\n账号: {account.get('email','')}\n发件人: {sender}\n主题: {subject}\n时间: {received_at}\n\n{body_text[:1200]}"
+    return title, plain, html_body, telegram_text
+
+
+def fetch_forward_candidates(account: Dict[str, Any], top: int = 20, folder: str = 'inbox') -> Dict[str, Any]:
+    proxy_url = get_account_proxy_url(account)
+    fallback_proxy_urls = get_account_proxy_failover_urls(account)
+    result = fetch_account_folder_emails(account, folder, 0, top, proxy_url, fallback_proxy_urls)
+    if not result.get('success'):
+        return {
+            'success': False,
+            'emails': [],
+            'error': stringify_forward_error(result.get('error') or result.get('details') or '获取邮件失败'),
+        }
+    return {
+        'success': True,
+        'emails': result.get('emails', []),
+        'error': '',
+    }
+
+
+def build_forward_cursor_reset(account: Dict[str, Any], mode: str = 'window', lookback_minutes: Optional[int] = None) -> tuple[Optional[str], str, int]:
+    normalized_mode = str(mode or 'window').strip().lower()
+
+    if lookback_minutes is None:
+        try:
+            lookback_minutes = max(0, min(10080, int(get_setting('forward_email_window_minutes', '0') or '0')))
+        except (TypeError, ValueError):
+            lookback_minutes = 0
+    else:
+        lookback_minutes = max(0, min(10080, int(lookback_minutes or 0)))
+
+    if normalized_mode == 'clear':
+        return None, '已清空转发游标，下次会从当前可拉取到的最近邮件重新扫描', lookback_minutes
+
+    if lookback_minutes > 0:
+        cursor_value = (datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)).isoformat()
+        return cursor_value, f'已回退转发游标，接下来会重扫最近 {lookback_minutes} 分钟内的邮件', lookback_minutes
+
+    return None, '当前未限制转发时间范围，已清空转发游标并准备重扫最近邮件', lookback_minutes
+
+
+def fetch_forward_detail(account: Dict[str, Any], message_id: str, folder: str = 'inbox') -> Optional[Dict[str, Any]]:
+    proxy_url = get_account_proxy_url(account)
+    fallback_proxy_urls = get_account_proxy_failover_urls(account)
+    if account.get('account_type') == 'imap':
+        result = get_email_detail_imap_generic_result(
+            account['email'],
+            account.get('imap_password', ''),
+            account.get('imap_host', ''),
+            account.get('imap_port', 993),
+            message_id,
+            folder,
+            account.get('provider', 'custom'),
+            proxy_url
+        )
+        return result.get('email') if result.get('success') else None
+
+    detail = get_email_detail_graph(
+        account.get('client_id', ''),
+        account.get('refresh_token', ''),
+        message_id,
+        proxy_url,
+        fallback_proxy_urls,
+    )
+    if not detail:
+        return None
+    return {
+        'id': detail.get('id'),
+        'subject': detail.get('subject', '无主题'),
+        'from': detail.get('from', {}).get('emailAddress', {}).get('address', '未知'),
+        'to': ', '.join([r.get('emailAddress', {}).get('address', '') for r in detail.get('toRecipients', [])]),
+        'cc': ', '.join([r.get('emailAddress', {}).get('address', '') for r in detail.get('ccRecipients', [])]),
+        'date': detail.get('receivedDateTime', ''),
+        'body': detail.get('body', {}).get('content', ''),
+        'body_type': detail.get('body', {}).get('contentType', 'text').lower()
+    }
+
+
+def open_forwarding_db_connection():
+    conn = sqlite3.connect(DATABASE, timeout=30)
+    conn.execute('PRAGMA foreign_keys = ON')
+    conn.execute('PRAGMA busy_timeout = 5000')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def decrypt_forwarding_account_secrets(account: Dict[str, Any]) -> Dict[str, Any]:
+    for field_name in ('password', 'refresh_token', 'imap_password'):
+        if not account.get(field_name):
+            continue
+        try:
+            account[field_name] = decrypt_data(account[field_name])
+        except Exception:
+            pass
+    return account
+
+
+def build_forwarding_job_config() -> Dict[str, Any]:
+    forward_channels = set(get_forward_channels())
+    execution_mode = normalize_forward_execution_mode()
+    try:
+        forward_window_minutes = max(0, min(10080, int(get_setting('forward_email_window_minutes', '0') or '0')))
+    except (TypeError, ValueError):
+        forward_window_minutes = 0
+    account_delay_seconds = 0 if execution_mode == 'parallel' else get_forward_account_delay_seconds()
+
+    return {
+        'email_enabled': FORWARD_CHANNEL_SMTP_SETTING in forward_channels and bool(
+            get_setting('email_forward_recipient', '').strip() and get_setting('smtp_host', '').strip()
+        ),
+        'telegram_enabled': FORWARD_CHANNEL_TG_SETTING in forward_channels and bool(
+            get_setting_decrypted('telegram_bot_token', '').strip() and get_setting('telegram_chat_id', '').strip()
+        ),
+        'wecom_enabled': FORWARD_CHANNEL_WECOM_SETTING in forward_channels and bool(
+            get_setting_decrypted('wecom_webhook_url', '').strip()
+        ),
+        'include_junkemail': get_bool_setting('forward_include_junkemail', False),
+        'account_delay_seconds': account_delay_seconds,
+        'forward_window_start': (
+            datetime.now() - timedelta(minutes=forward_window_minutes)
+            if forward_window_minutes > 0 else None
+        ),
+        'execution_mode': execution_mode,
+        'parallel_workers': normalize_forward_parallel_workers(),
+    }
+
+
+def get_forwarding_enabled_accounts() -> list[Dict[str, Any]]:
+    conn = open_forwarding_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM accounts WHERE status = 'active' AND forward_enabled = 1"
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def build_forwarding_account_result(account: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        'account_id': account.get('id'),
+        'account_email': account.get('email', ''),
+        'fetched_count': 0,
+        'pending_count': 0,
+        'email_success_count': 0,
+        'telegram_success_count': 0,
+        'wecom_success_count': 0,
+        'cursor_updated': False,
+        'cursor': account.get('forward_last_checked_at', ''),
+        'had_processing_failure': False,
+        'error': '',
+        'candidate_fetch_ms': 0.0,
+        'detail_fetch_ms': 0.0,
+        'channel_send_ms': 0.0,
+        'account_total_ms': 0.0,
+    }
+
+
+def elapsed_ms(start_time: float) -> float:
+    return round((time.monotonic() - start_time) * 1000, 2)
+
+
+def send_forward_channel(conn, account: Dict[str, Any], detail: Dict[str, Any],
+                         channel: str, send_func, *send_args) -> tuple[bool, bool, float, bool]:
+    if has_forward_log(conn, account['id'], detail['id'], channel):
+        app.logger.info(
+            '[forward] skip already forwarded email: account=%s message_id=%s channel=%s',
+            account.get('email', ''),
+            detail.get('id', ''),
+            channel,
+        )
+        return True, False, 0.0, False
+
+    send_started = time.monotonic()
+    try:
+        if send_func(*send_args):
+            record_forward_log(conn, account['id'], detail['id'], channel)
+            log_forwarding_result(
+                account['id'],
+                account.get('email', ''),
+                detail.get('id', ''),
+                channel,
+                'success',
+                db_conn=conn,
+            )
+            return True, False, elapsed_ms(send_started), True
+
+        failure_messages = {
+            FORWARD_CHANNEL_EMAIL: 'SMTP 转发返回失败',
+            FORWARD_CHANNEL_TELEGRAM: 'Telegram 转发返回失败',
+            FORWARD_CHANNEL_WECOM: '企业微信转发返回失败',
+        }
+        log_forwarding_result(
+            account['id'],
+            account.get('email', ''),
+            detail.get('id', ''),
+            channel,
+            'failed',
+            failure_messages.get(channel, f'{channel} 转发返回失败'),
+            db_conn=conn,
+        )
+        app.logger.warning(
+            '[forward] send channel returned false: account=%s message_id=%s channel=%s',
+            account.get('email', ''),
+            detail.get('id', ''),
+            channel,
+        )
+        return False, True, elapsed_ms(send_started), False
+    except Exception as exc:
+        log_forwarding_result(
+            account['id'],
+            account.get('email', ''),
+            detail.get('id', ''),
+            channel,
+            'failed',
+            str(exc),
+            db_conn=conn,
+        )
+        app.logger.warning(
+            '[forward] send channel failed: account=%s message_id=%s channel=%s error=%s',
+            account.get('email', ''),
+            detail.get('id', ''),
+            channel,
+            str(exc),
+        )
+        return False, True, elapsed_ms(send_started), False
+
+
+def process_forwarding_account(account_row: Dict[str, Any], job_config: Dict[str, Any]) -> Dict[str, Any]:
+    with app.app_context():
+        account = decrypt_forwarding_account_secrets(dict(account_row))
+        result = build_forwarding_account_result(account)
+        account_started = time.monotonic()
+        conn = open_forwarding_db_connection()
+        try:
+            cursor_time = parse_email_datetime(account.get('forward_last_checked_at', ''))
+            folders_to_scan = ['inbox']
+            if job_config.get('include_junkemail'):
+                folders_to_scan.append('junkemail')
+
+            emails = []
+            for folder_name in folders_to_scan:
+                folder_started = time.monotonic()
+                folder_result = fetch_forward_candidates(account, 20, folder_name)
+                folder_duration_ms = elapsed_ms(folder_started)
+                result['candidate_fetch_ms'] += folder_duration_ms
+                if not folder_result.get('success'):
+                    result['had_processing_failure'] = True
+                    error_message = f'{folder_name} 候选邮件拉取失败: {folder_result.get("error") or "未知错误"}'
+                    log_forwarding_result(
+                        account['id'],
+                        account.get('email', ''),
+                        f'folder:{folder_name}',
+                        'fetch_candidates',
+                        'failed',
+                        error_message,
+                        db_conn=conn,
+                    )
+                    app.logger.warning(
+                        '[forward] fetch candidates failed: account=%s folder=%s duration_ms=%s error=%s',
+                        account.get('email', ''),
+                        folder_name,
+                        folder_duration_ms,
+                        folder_result.get('error') or 'unknown',
+                    )
+                    continue
+                emails.extend(folder_result.get('emails', []))
+
+            recent_emails = []
+            skipped_before_cursor = 0
+            latest_success_time = cursor_time
+            forward_window_start = job_config.get('forward_window_start')
+            for item in emails:
+                dt = parse_email_datetime(item.get('date', ''))
+                if forward_window_start and dt and dt < forward_window_start:
+                    app.logger.info(
+                        '[forward] skip email older than window: account=%s message_id=%s email_time=%s window_start=%s',
+                        account.get('email', ''),
+                        item.get('id', ''),
+                        item.get('date', ''),
+                        forward_window_start.isoformat(),
+                    )
+                    continue
+                if cursor_time and dt and dt <= cursor_time:
+                    skipped_before_cursor += 1
+                    app.logger.info(
+                        '[forward] skip email before cursor: account=%s message_id=%s email_time=%s cursor=%s',
+                        account.get('email', ''),
+                        item.get('id', ''),
+                        item.get('date', ''),
+                        account.get('forward_last_checked_at', ''),
+                    )
+                    continue
+                recent_emails.append((dt, item))
+
+            result['fetched_count'] = len(emails)
+            result['pending_count'] = len(recent_emails)
+            app.logger.info(
+                '[forward] account candidates: account=%s fetched=%s pending=%s skipped_before_cursor=%s cursor=%s',
+                account.get('email', ''),
+                len(emails),
+                len(recent_emails),
+                skipped_before_cursor,
+                account.get('forward_last_checked_at', ''),
+            )
+
+            recent_emails.sort(key=lambda pair: pair[0] or datetime.min)
+
+            for item_time, item in recent_emails:
+                detail_started = time.monotonic()
+                detail = fetch_forward_detail(account, item.get('id'), item.get('folder', 'inbox'))
+                result['detail_fetch_ms'] += elapsed_ms(detail_started)
+                if not detail:
+                    result['had_processing_failure'] = True
+                    log_forwarding_result(
+                        account['id'],
+                        account.get('email', ''),
+                        item.get('id', ''),
+                        'detail',
+                        'failed',
+                        '获取邮件详情失败',
+                        db_conn=conn,
+                    )
+                    app.logger.warning(
+                        '[forward] skip email detail fetch failed: account=%s message_id=%s',
+                        account.get('email', ''),
+                        item.get('id', ''),
+                    )
+                    continue
+
+                title, plain, html_body, telegram_text = build_forward_payload(account, detail)
+                message_processed = False
+                message_failed = False
+
+                if job_config.get('email_enabled'):
+                    processed, failed, duration_ms, sent = send_forward_channel(
+                        conn,
+                        account,
+                        detail,
+                        FORWARD_CHANNEL_EMAIL,
+                        send_forward_email,
+                        title,
+                        plain,
+                        html_body,
+                    )
+                    result['channel_send_ms'] += duration_ms
+                    if sent:
+                        result['email_success_count'] += 1
+                    if processed:
+                        message_processed = True
+                    message_failed = message_failed or failed
+
+                if job_config.get('telegram_enabled'):
+                    processed, failed, duration_ms, sent = send_forward_channel(
+                        conn,
+                        account,
+                        detail,
+                        FORWARD_CHANNEL_TELEGRAM,
+                        send_forward_telegram,
+                        telegram_text,
+                    )
+                    result['channel_send_ms'] += duration_ms
+                    if sent:
+                        result['telegram_success_count'] += 1
+                    if processed:
+                        message_processed = True
+                    message_failed = message_failed or failed
+
+                if job_config.get('wecom_enabled'):
+                    processed, failed, duration_ms, sent = send_forward_channel(
+                        conn,
+                        account,
+                        detail,
+                        FORWARD_CHANNEL_WECOM,
+                        send_forward_wecom,
+                        telegram_text,
+                    )
+                    result['channel_send_ms'] += duration_ms
+                    if sent:
+                        result['wecom_success_count'] += 1
+                    if processed:
+                        message_processed = True
+                    message_failed = message_failed or failed
+
+                if message_failed:
+                    result['had_processing_failure'] = True
+                    continue
+                if message_processed and item_time and (latest_success_time is None or item_time > latest_success_time):
+                    latest_success_time = item_time
+
+            cursor_value = account.get('forward_last_checked_at', '')
+            if latest_success_time and (cursor_time is None or latest_success_time > cursor_time):
+                cursor_value = latest_success_time.isoformat()
+                conn.execute(
+                    'UPDATE accounts SET forward_last_checked_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                    (cursor_value, account['id'])
+                )
+                result['cursor_updated'] = True
+            else:
+                conn.execute(
+                    'UPDATE accounts SET updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                    (account['id'],)
+                )
+            result['cursor'] = cursor_value
+            conn.commit()
+            return result
+        except Exception as exc:
+            conn.rollback()
+            result['had_processing_failure'] = True
+            result['error'] = stringify_forward_error(exc)
+            app.logger.exception(
+                '[forward] account processing failed: account=%s error=%s',
+                account.get('email', ''),
+                result['error'],
+            )
+            return result
+        finally:
+            result['candidate_fetch_ms'] = round(result['candidate_fetch_ms'], 2)
+            result['detail_fetch_ms'] = round(result['detail_fetch_ms'], 2)
+            result['channel_send_ms'] = round(result['channel_send_ms'], 2)
+            result['account_total_ms'] = elapsed_ms(account_started)
+            safe_console_print(
+                "[forward] account done: "
+                f"account={account.get('email', '')} "
+                f"account_id={account.get('id')} "
+                f"fetched={result['fetched_count']} "
+                f"pending={result['pending_count']} "
+                f"email_success={result['email_success_count']} "
+                f"telegram_success={result['telegram_success_count']} "
+                f"wecom_success={result['wecom_success_count']} "
+                f"cursor_updated={result['cursor_updated']} "
+                f"cursor={result['cursor']} "
+                f"had_failure={result['had_processing_failure']} "
+                f"candidate_fetch_ms={result['candidate_fetch_ms']} "
+                f"detail_fetch_ms={result['detail_fetch_ms']} "
+                f"channel_send_ms={result['channel_send_ms']} "
+                f"account_total_ms={result['account_total_ms']}"
+            )
+            conn.close()
+
+
+def run_forwarding_accounts_serial(accounts: list[Dict[str, Any]],
+                                   job_config: Dict[str, Any]) -> list[Dict[str, Any]]:
+    results = []
+    total_accounts = len(accounts)
+    account_delay_seconds = int(job_config.get('account_delay_seconds') or 0)
+    for index, account in enumerate(accounts):
+        results.append(process_forwarding_account(account, job_config))
+        if account_delay_seconds > 0 and index < total_accounts - 1:
+            next_account_email = accounts[index + 1].get('email', '') if accounts[index + 1] else ''
+            safe_console_print(
+                f"[forward] wait before next account: current={account.get('email', '')} next={next_account_email} seconds={account_delay_seconds}"
+            )
+            time.sleep(account_delay_seconds)
+    return results
+
+
+def run_forwarding_accounts_parallel(accounts: list[Dict[str, Any]],
+                                     job_config: Dict[str, Any]) -> list[Dict[str, Any]]:
+    if not accounts:
+        return []
+    max_workers = min(normalize_forward_parallel_workers(job_config.get('parallel_workers')), len(accounts))
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='forward-account') as executor:
+        future_map = {
+            executor.submit(process_forwarding_account, account, job_config): account
+            for account in accounts
+        }
+        for future in as_completed(future_map):
+            account = future_map[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                error_text = stringify_forward_error(exc)
+                app.logger.exception(
+                    '[forward] account future failed: account=%s error=%s',
+                    account.get('email', ''),
+                    error_text,
+                )
+                results.append({
+                    **build_forwarding_account_result(account),
+                    'had_processing_failure': True,
+                    'error': error_text,
+                })
+    return results
+
+
+def summarize_forwarding_results(results: list[Dict[str, Any]]) -> Dict[str, Any]:
+    failed_count = sum(1 for item in results if item.get('had_processing_failure'))
+    return {
+        'processed_count': len(results),
+        'failed_count': failed_count,
+        'email_success_count': sum(int(item.get('email_success_count') or 0) for item in results),
+        'telegram_success_count': sum(int(item.get('telegram_success_count') or 0) for item in results),
+        'wecom_success_count': sum(int(item.get('wecom_success_count') or 0) for item in results),
+    }
+
+
+def process_forwarding_job():
+    if not forwarding_run_lock.acquire(blocking=False):
+        safe_console_print('[forward] skip job: another forwarding job is already running')
+        app.logger.info('[forward] skip job: another forwarding job is already running')
+        return {'success': False, 'skipped': True, 'reason': 'already_running'}
+
+    with app.app_context():
+        try:
+            job_config = build_forwarding_job_config()
+            if not (
+                job_config['email_enabled']
+                or job_config['telegram_enabled']
+                or job_config['wecom_enabled']
+            ):
+                safe_console_print('[forward] skip job: no active channels configured')
+                return {'success': True, 'skipped': True, 'reason': 'no_active_channels'}
+
+            accounts = get_forwarding_enabled_accounts()
+            execution_mode = job_config.get('execution_mode', 'serial')
+            safe_console_print(
+                "[forward] start job: "
+                f"accounts={len(accounts)} "
+                f"mode={execution_mode} "
+                f"workers={job_config.get('parallel_workers')} "
+                f"email_enabled={job_config['email_enabled']} "
+                f"telegram_enabled={job_config['telegram_enabled']} "
+                f"wecom_enabled={job_config['wecom_enabled']} "
+                f"account_delay_seconds={job_config['account_delay_seconds']}"
+            )
+
+            if execution_mode == 'parallel':
+                results = run_forwarding_accounts_parallel(accounts, job_config)
+            else:
+                results = run_forwarding_accounts_serial(accounts, job_config)
+
+            summary = summarize_forwarding_results(results)
+            safe_console_print(
+                "[forward] job done: "
+                f"accounts={len(accounts)} "
+                f"processed={summary['processed_count']} "
+                f"failed_accounts={summary['failed_count']} "
+                f"email_success={summary['email_success_count']} "
+                f"telegram_success={summary['telegram_success_count']} "
+                f"wecom_success={summary['wecom_success_count']}"
+            )
+            return {'success': True, 'skipped': False, **summary}
+        except Exception as exc:
+            safe_console_print(f"[forward] job failed: {str(exc)}")
+            raise
+        finally:
+            forwarding_run_lock.release()
+
+
+@app.route('/api/accounts/trigger-forwarding-check', methods=['POST'])
+@login_required
+@csrf_exempt
+def api_trigger_forwarding_check():
+    """手动触发一次转发检查"""
+    try:
+        result = process_forwarding_job()
+        if result.get('reason') == 'already_running':
+            return jsonify({'success': False, 'error': '转发检查正在执行中，请稍后再试'}), 409
+        return jsonify({'success': True, 'message': '已触发一次转发检查，请查看转发历史或容器日志'})
+    except Exception as exc:
+        return jsonify({'success': False, 'error': f'触发转发检查失败: {str(exc)}'})
+
+
+@app.route('/api/accounts/<int:account_id>/forwarding/reset-cursor', methods=['POST'])
+@login_required
+@csrf_exempt
+def api_reset_account_forward_cursor(account_id):
+    """回退或清空单个账号的转发游标，并可选触发一次重扫。"""
+    account = get_account_by_id(account_id)
+    if not account:
+        return jsonify({'success': False, 'error': '账号不存在'}), 404
+
+    data = request.json or {}
+    mode = str(data.get('mode', 'window') or 'window')
+    lookback_minutes = data.get('lookback_minutes')
+    trigger_check = bool(data.get('trigger_check', True))
+
+    try:
+        cursor_value, reset_message, effective_lookback = build_forward_cursor_reset(account, mode, lookback_minutes)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': '回退时间参数无效'}), 400
+
+    if not set_account_forward_cursor(account_id, cursor_value):
+        return jsonify({'success': False, 'error': '重置转发游标失败'}), 500
+
+    triggered = False
+    trigger_skipped = False
+    if trigger_check:
+        trigger_result = process_forwarding_job()
+        trigger_skipped = bool(trigger_result.get('skipped'))
+        triggered = not trigger_skipped
+
+    action_message = reset_message
+    if triggered:
+        action_message += '，并已立即触发一次转发检查'
+    elif trigger_skipped:
+        action_message += '，但当前转发检查正在执行或未配置可用转发渠道，未重复触发'
+
+    return jsonify({
+        'success': True,
+        'message': action_message,
+        'account_id': account_id,
+        'account_email': account.get('email', ''),
+        'forward_last_checked_at': cursor_value,
+        'lookback_minutes': effective_lookback,
+        'triggered': triggered,
+        'trigger_skipped': trigger_skipped,
+    })
+
+
+@app.route('/api/settings/test-forward-channel', methods=['POST'])
+@login_required
+def api_test_forward_channel():
+    data = request.json or {}
+    channel = str(data.get('channel', '') or '').strip().lower()
+    config = data.get('config', {}) or {}
+
+    subject = f'[测试消息] 转发链路检测 {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+    body_text = (
+        '这是一条由系统主动发送的测试消息。\n'
+        '如果你收到了这条消息，说明当前转发链路配置可用。'
+    )
+    body_html = (
+        '<p>这是一条由系统主动发送的测试消息。</p>'
+        '<p>如果你收到了这条消息，说明当前转发链路配置可用。</p>'
+    )
+    telegram_text = f'{subject}\n\n这是一条由系统主动发送的测试消息。\n如果你收到了这条消息，说明当前转发链路配置可用。'
+
+    try:
+        if channel == 'smtp':
+            smtp_config = config.get('smtp', {}) if isinstance(config, dict) else {}
+            if not send_forward_email_with_config(smtp_config, subject, body_text, body_html):
+                return jsonify({'success': False, 'error': 'SMTP 测试发送失败，请检查当前表单配置'})
+            return jsonify({'success': True, 'message': 'SMTP 测试消息已发送，请检查收件箱'})
+
+        if channel == 'telegram':
+            telegram_config = config.get('telegram', {}) if isinstance(config, dict) else {}
+            if not send_forward_telegram_with_config(telegram_config, telegram_text):
+                return jsonify({'success': False, 'error': 'Telegram 测试发送失败，请检查当前表单配置'})
+            return jsonify({'success': True, 'message': 'Telegram 测试消息已发送，请检查目标会话'})
+
+        if channel == 'wecom':
+            wecom_config = config.get('wecom', {}) if isinstance(config, dict) else {}
+            if not send_forward_wecom_with_config(wecom_config, telegram_text):
+                return jsonify({'success': False, 'error': '企业微信测试发送失败，请检查当前表单配置'})
+            return jsonify({'success': True, 'message': '企业微信测试消息已发送，请检查群机器人所在会话'})
+
+        return jsonify({'success': False, 'error': '未知转发渠道'})
+    except Exception as exc:
+        return jsonify({'success': False, 'error': f'测试失败: {str(exc)}'})
+
+
+def record_webdav_backup_result(status: str, message: str, filename: str = '') -> None:
+    now_text = datetime.now(get_app_timezone_info()).isoformat()
+    set_setting('webdav_backup_last_run_at', now_text)
+    set_setting('webdav_backup_last_status', status)
+    set_setting('webdav_backup_last_message', message)
+    if filename:
+        set_setting('webdav_backup_last_filename', filename)
+
+
+def build_webdav_backup_filename() -> str:
+    timestamp = datetime.now(get_app_timezone_info()).strftime('%Y%m%d_%H%M%S')
+    return f"all_groups_backup_{timestamp}.txt"
+
+
+def build_webdav_upload_url(base_url: str, filename: str) -> str:
+    return f"{base_url.rstrip('/')}/{quote(filename)}"
+
+
+def build_webdav_upload_error_message(action: str, status_code: int) -> str:
+    message = f'WebDAV {action}失败：HTTP {status_code}'
+    if status_code == 404:
+        message += (
+            '。目标目录不存在或不允许写入该路径；请先创建专用备份目录，并填写该目录的 WebDAV URL。'
+            '如果使用坚果云，不要只填写 https://dav.jianguoyun.com/dav，'
+            '建议填写类似 https://dav.jianguoyun.com/dav/mailBackup 的已存在目录'
+        )
+    elif status_code == 409:
+        message += (
+            '。目标路径冲突，通常是上级目录不存在或目录路径写错；请先在 WebDAV 服务中创建专用备份目录，'
+            '再填写该目录的 WebDAV URL。'
+            '如果使用坚果云，请先创建 mailBackup 文件夹，'
+            '然后填写 https://dav.jianguoyun.com/dav/mailBackup，注意大小写一致'
+        )
+    return message
+
+
+def normalize_webdav_backup_config(config: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        'url': str(config.get('url') or '').strip(),
+        'username': str(config.get('username') or '').strip(),
+        'password': str(config.get('password') or ''),
+    }
+
+
+@app.route('/api/settings/test-webdav-backup', methods=['POST'])
+@login_required
+def api_test_webdav_backup():
+    data = request.json or {}
+    config = normalize_webdav_backup_config(data.get('config', {}) if isinstance(data.get('config'), dict) else {})
+    base_url = config['url']
+    parsed_url = urlparse(base_url)
+    if not base_url:
+        return jsonify({'success': False, 'error': '请先填写 WebDAV 目录 URL'})
+    if parsed_url.scheme not in ('http', 'https') or not parsed_url.netloc:
+        return jsonify({'success': False, 'error': 'WebDAV 目录 URL 必须是有效的 http(s) 地址'})
+
+    filename = f"outlookemail_webdav_test_{datetime.now(get_app_timezone_info()).strftime('%Y%m%d_%H%M%S')}.txt"
+    upload_url = build_webdav_upload_url(base_url, filename)
+    auth = (config['username'], config['password']) if config['username'] or config['password'] else None
+    content = (
+        'OutlookEmail WebDAV test file\n'
+        f"created_at={datetime.now(get_app_timezone_info()).isoformat()}\n"
+    )
+
+    try:
+        response = requests.put(
+            upload_url,
+            data=content.encode('utf-8'),
+            headers={'Content-Type': 'text/plain; charset=utf-8'},
+            auth=auth,
+            timeout=HTTP_REQUEST_TIMEOUT,
+        )
+        if response.status_code not in (200, 201, 204):
+            error_message = build_webdav_upload_error_message('测试上传', response.status_code)
+            return jsonify({
+                'success': False,
+                'error': error_message,
+                'status_code': response.status_code,
+            })
+
+        cleanup_message = ''
+        try:
+            cleanup_response = requests.delete(
+                upload_url,
+                auth=auth,
+                timeout=HTTP_REQUEST_TIMEOUT,
+            )
+            if cleanup_response.status_code not in (200, 202, 204, 404):
+                cleanup_message = f'；测试文件已上传，但清理返回 HTTP {cleanup_response.status_code}'
+        except Exception as cleanup_exc:
+            cleanup_message = f'；测试文件已上传，但清理失败：{str(cleanup_exc)}'
+
+        return jsonify({
+            'success': True,
+            'message': f'WebDAV 测试成功，目录可写{cleanup_message}',
+            'filename': filename,
+            'status_code': response.status_code,
+        })
+    except Exception as exc:
+        return jsonify({'success': False, 'error': f'WebDAV 测试失败：{str(exc)}'})
+
+
+def upload_webdav_backup_with_config(base_url: str, username: str, password: str) -> Dict[str, Any]:
+    filename = ''
+    try:
+        parsed_url = urlparse(base_url)
+        if not base_url:
+            message = 'WebDAV 目录 URL 为空'
+            record_webdav_backup_result('failed', message)
+            return {'success': False, 'error': message}
+        if parsed_url.scheme not in ('http', 'https') or not parsed_url.netloc:
+            message = 'WebDAV 目录 URL 必须是有效的 http(s) 地址'
+            record_webdav_backup_result('failed', message)
+            return {'success': False, 'error': message}
+
+        export_payload = build_all_groups_export_content()
+        if export_payload['total_count'] == 0:
+            message = '没有可备份的邮箱账号'
+            record_webdav_backup_result('failed', message)
+            return {'success': False, 'error': message}
+
+        filename = build_webdav_backup_filename()
+        upload_url = build_webdav_upload_url(base_url, filename)
+        auth = (username, password) if username or password else None
+        response = requests.put(
+            upload_url,
+            data=export_payload['content'].encode('utf-8'),
+            headers={'Content-Type': 'text/plain; charset=utf-8'},
+            auth=auth,
+            timeout=HTTP_REQUEST_TIMEOUT,
+        )
+
+        if response.status_code not in (200, 201, 204):
+            message = build_webdav_upload_error_message('上传', response.status_code)
+            record_webdav_backup_result('failed', message, filename)
+            return {'success': False, 'error': message, 'status_code': response.status_code}
+
+        message = f"WebDAV 备份成功：{filename}"
+        record_webdav_backup_result('success', message, filename)
+        log_audit('backup', 'webdav', None, f"备份全部分组，共 {export_payload['total_count']} 个账号")
+        return {
+            'success': True,
+            'message': message,
+            'filename': filename,
+            'total_count': export_payload['total_count'],
+            'status_code': response.status_code,
+        }
+    except Exception as exc:
+        message = f'WebDAV 备份失败：{str(exc)}'
+        record_webdav_backup_result('failed', message, filename)
+        return {'success': False, 'error': message}
+
+
+@app.route('/api/settings/upload-webdav-backup', methods=['POST'])
+@login_required
+def api_upload_webdav_backup():
+    data = request.json or {}
+    login_password = str(data.get('login_password') or '')
+    if not login_password:
+        return jsonify({'success': False, 'error': '手动上传备份需要输入登录密码'})
+    if not verify_login_password(login_password):
+        return jsonify({'success': False, 'error': '登录密码错误'})
+
+    config = normalize_webdav_backup_config(data.get('config', {}) if isinstance(data.get('config'), dict) else {})
+    if not config['url']:
+        config = {
+            'url': get_setting('webdav_backup_url', '').strip(),
+            'username': get_setting('webdav_backup_username', '').strip(),
+            'password': get_setting_decrypted('webdav_backup_password', ''),
+        }
+
+    if not webdav_backup_run_lock.acquire(blocking=False):
+        return jsonify({'success': False, 'error': 'WebDAV 备份正在执行中'})
+
+    try:
+        result = upload_webdav_backup_with_config(config['url'], config['username'], config['password'])
+    finally:
+        webdav_backup_run_lock.release()
+
+    if result.get('success'):
+        return jsonify({
+            'success': True,
+            'message': result.get('message') or 'WebDAV 备份已上传',
+            'filename': result.get('filename', ''),
+            'total_count': result.get('total_count', 0),
+            'status_code': result.get('status_code'),
+        })
+    return jsonify({
+        'success': False,
+        'error': result.get('error', 'WebDAV 备份上传失败'),
+        'status_code': result.get('status_code'),
+    })
+
+
+def run_webdav_backup() -> Dict[str, Any]:
+    if not webdav_backup_run_lock.acquire(blocking=False):
+        return {'success': False, 'error': 'WebDAV 备份正在执行中'}
+
+    try:
+        if get_setting('webdav_backup_enabled', 'false').lower() != 'true':
+            return {'success': False, 'error': 'WebDAV 备份未启用'}
+
+        base_url = get_setting('webdav_backup_url', '').strip()
+        username = get_setting('webdav_backup_username', '').strip()
+        password = get_setting_decrypted('webdav_backup_password', '')
+        return upload_webdav_backup_with_config(base_url, username, password)
+    finally:
+        webdav_backup_run_lock.release()
+
+
+def scheduled_webdav_backup_task():
+    try:
+        with app.app_context():
+            result = run_webdav_backup()
+            if result.get('success'):
+                safe_console_print(f"[WebDAV 备份] 已上传 {result.get('filename', '')}")
+            else:
+                safe_console_print(f"[WebDAV 备份] 跳过或失败：{result.get('error', '未知错误')}")
+    except Exception as exc:
+        safe_console_print(f"[WebDAV 备份] 执行失败：{str(exc)}")
+
+
+def add_webdav_backup_job(scheduler, cron_trigger_cls, app_tzinfo) -> bool:
+    if get_setting('webdav_backup_enabled', 'false').lower() != 'true':
+        return False
+
+    cron_expr = get_setting('webdav_backup_cron', '0 3 * * *').strip()
+    cron_error = validate_five_field_cron_expression_for_timezone(cron_expr, get_app_timezone())
+    if cron_error:
+        safe_console_print(f"⚠ WebDAV 备份 Cron 表达式无效：{cron_error}")
+        return False
+
+    parts = cron_expr.split()
+    if len(parts) != 5:
+        safe_console_print("⚠ WebDAV 备份仅支持 5 段 Cron，未启动备份任务")
+        return False
+
+    minute, hour, day, month, day_of_week = parts
+    scheduler.add_job(
+        func=scheduled_webdav_backup_task,
+        trigger=cron_trigger_cls(
+            minute=minute,
+            hour=hour,
+            day=day,
+            month=month,
+            day_of_week=day_of_week,
+            timezone=app_tzinfo,
+        ),
+        id='webdav_backup',
+        name='WebDAV 定时备份',
+        replace_existing=True,
+    )
+    safe_console_print(f"✓ WebDAV 备份任务已启动：Cron 表达式 '{cron_expr}'")
+    return True
+
+
+def build_forwarding_poll_trigger(interval_trigger_cls, interval_seconds: Any, timezone):
+    """构建转发秒级轮询触发器。"""
+    normalized_interval = normalize_forward_check_interval_seconds(interval_seconds)
+    return interval_trigger_cls(seconds=normalized_interval, timezone=timezone)
+
+
+def _scheduler_has_registered_job(scheduler, job_id: str) -> bool:
+    get_job = getattr(scheduler, 'get_job', None)
+    if callable(get_job):
+        return get_job(job_id) is not None
+    jobs = getattr(scheduler, 'jobs', None)
+    if isinstance(jobs, list):
+        return any(isinstance(job, dict) and job.get('id') == job_id for job in jobs)
+    return False
+
+
+def _run_cluster_replication_maintenance_scheduler_job():
+    from datetime import timedelta
+
+    if CLUSTER_CONFIG.is_replica:
+        return
+    now = _utc_now()
+    cutoff = (now - timedelta(days=CLUSTER_CONFIG.event_retention_days)).isoformat().replace('+00:00', 'Z')
+    with app.app_context():
+        db = get_db()
+        with db:
+            prune_expired_nonces(db, int(now.timestamp()))
+            prune_replication_events(db, cutoff)
+
+
+def _add_cluster_maintenance_job(scheduler, cron_trigger_cls, app_tzinfo) -> bool:
+    job_id = 'cluster_replication_maintenance'
+    if CLUSTER_CONFIG.is_replica or _scheduler_has_registered_job(scheduler, job_id):
+        return False
+    scheduler.add_job(
+        func=_run_cluster_replication_maintenance_scheduler_job,
+        trigger=cron_trigger_cls(hour=3, minute=0, timezone=app_tzinfo),
+        id=job_id,
+        name='Cluster replication maintenance',
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    return True
+
+
+def init_scheduler():
+    """初始化定时任务调度器"""
+    global scheduler_instance
+    if CLUSTER_CONFIG.is_replica:
+        return None
+
+    with scheduler_lock:
+        if scheduler_instance is not None:
+            return scheduler_instance
+
+        try:
+            from apscheduler.schedulers.background import BackgroundScheduler
+            from apscheduler.triggers.cron import CronTrigger
+            from apscheduler.triggers.interval import IntervalTrigger
+            import atexit
+
+            with app.app_context():
+                app_timezone = get_app_timezone()
+                app_tzinfo = get_app_timezone_info()
+                scheduler = BackgroundScheduler(timezone=app_tzinfo)
+                enable_scheduled = get_setting('enable_scheduled_refresh', 'true').lower() == 'true'
+                jobs_added = False
+
+                if enable_scheduled:
+                    use_cron = get_setting('use_cron_schedule', 'false').lower() == 'true'
+                    token_job_added = False
+
+                    if use_cron:
+                        cron_expr = get_setting('refresh_cron', '0 2 * * *')
+                        try:
+                            from croniter import croniter
+                            from datetime import datetime
+                            croniter(cron_expr, datetime.now(app_tzinfo))
+
+                            parts = cron_expr.split()
+                            if len(parts) == 5:
+                                minute, hour, day, month, day_of_week = parts
+                                trigger = CronTrigger(
+                                    minute=minute,
+                                    hour=hour,
+                                    day=day,
+                                    month=month,
+                                    day_of_week=day_of_week,
+                                    timezone=app_tzinfo
+                                )
+                                scheduler.add_job(
+                                    func=scheduled_refresh_task,
+                                    trigger=trigger,
+                                    id='token_refresh',
+                                    name='Token 定时刷新',
+                                    replace_existing=True
+                                )
+                                token_job_added = True
+                                jobs_added = True
+                                safe_console_print(f"✓ 定时刷新任务已启动：Cron 表达式 '{cron_expr}'")
+                            else:
+                                safe_console_print("⚠ Cron 表达式格式错误，回退到默认配置")
+                        except Exception as e:
+                            safe_console_print(f"⚠ Cron 表达式解析失败: {str(e)}，回退到默认配置")
+
+                    if not token_job_added:
+                        refresh_interval_days = int(get_setting('refresh_interval_days', '30'))
+                        scheduler.add_job(
+                            func=scheduled_refresh_task,
+                            trigger=CronTrigger(hour=2, minute=0, timezone=app_tzinfo),
+                            id='token_refresh',
+                            name='Token 定时刷新',
+                            replace_existing=True
+                        )
+                        jobs_added = True
+                        safe_console_print(f"✓ 定时刷新任务已启动：每天凌晨 2:00 检查刷新（周期：{refresh_interval_days} 天）")
+
+                    forward_interval_seconds = normalize_forward_check_interval_seconds()
+                    scheduler.add_job(
+                        func=process_forwarding_job,
+                        trigger=build_forwarding_poll_trigger(IntervalTrigger, forward_interval_seconds, app_tzinfo),
+                        id='forward_mail',
+                        name='邮件转发轮询',
+                        replace_existing=True,
+                        max_instances=1,
+                        coalesce=True
+                    )
+                    jobs_added = True
+                else:
+                    safe_console_print("✓ 定时刷新已禁用")
+
+                jobs_added = add_webdav_backup_job(scheduler, CronTrigger, app_tzinfo) or jobs_added
+                jobs_added = _add_cluster_maintenance_job(scheduler, CronTrigger, app_tzinfo) or jobs_added
+
+                if not jobs_added:
+                    return None
+
+                scheduler.start()
+                scheduler_instance = scheduler
+                safe_console_print(f"✓ 定时任务调度器已启动（时区：{app_timezone}）")
+
+            atexit.register(shutdown_scheduler)
+
+            return scheduler_instance
+        except ImportError:
+            safe_console_print("⚠ APScheduler 未安装，定时任务功能不可用")
+            safe_console_print("  安装命令：pip install APScheduler>=3.10.0")
+            return None
+        except Exception as e:
+            safe_console_print(f"⚠ 定时任务初始化失败：{str(e)}")
+            return None
+
+
+def shutdown_scheduler():
+    """关闭定时任务调度器。"""
+    global scheduler_instance
+
+    with scheduler_lock:
+        if scheduler_instance is None:
+            return
+        try:
+            scheduler_instance.shutdown(wait=False)
+        except Exception:
+            pass
+        scheduler_instance = None
+
+
+def ensure_scheduler_started():
+    """确保调度器已启动（兼容 gunicorn / docker compose）"""
+    if os.getenv('WERKZEUG_RUN_MAIN') == 'false':
+        return None
+    return init_scheduler()
+
+
+def scheduled_refresh_task():
+    """定时刷新任务（由调度器调用）"""
+    from datetime import datetime, timedelta
+
+    try:
+        with app.app_context():
+            enable_scheduled = get_setting('enable_scheduled_refresh', 'true').lower() == 'true'
+
+            if not enable_scheduled:
+                safe_console_print(f"[定时任务] 定时刷新已禁用，跳过执行")
+                return
+
+            use_cron = get_setting('use_cron_schedule', 'false').lower() == 'true'
+
+            if use_cron:
+                safe_console_print(f"[定时任务] 使用 Cron 调度，直接执行刷新...")
+                trigger_refresh_internal()
+                safe_console_print(f"[定时任务] Token 刷新完成")
+                return
+
+            refresh_interval_days = int(get_setting('refresh_interval_days', '30'))
+            last_refresh = build_refresh_stats().get('last_refresh_time')
+
+        if last_refresh:
+            last_refresh_time = datetime.fromisoformat(last_refresh)
+            next_refresh_time = last_refresh_time + timedelta(days=refresh_interval_days)
+            if datetime.now() < next_refresh_time:
+                safe_console_print(f"[定时任务] 距离上次刷新未满 {refresh_interval_days} 天，跳过本次刷新")
+                return
+
+        safe_console_print(f"[定时任务] 开始执行 Token 刷新...")
+        trigger_refresh_internal()
+        safe_console_print(f"[定时任务] Token 刷新完成")
+
+    except Exception as e:
+        safe_console_print(f"[定时任务] 执行失败：{str(e)}")
+
+
+ensure_scheduler_started()
+
+
+def trigger_refresh_internal():
+    """内部触发刷新（不通过 HTTP）"""
+    try:
+        result = run_full_refresh('scheduled', 'scheduled')
+    except TokenRefreshInProgressError as exc:
+        safe_console_print(f"[定时任务] 跳过执行：{str(exc)}")
+        return {
+            'type': 'conflict',
+            'total': 0,
+            'success_count': 0,
+            'failed_count': 0,
+            'message': str(exc),
+        }
+    safe_console_print(f"[定时任务] 刷新结果：总计 {result['total']}，成功 {result['success_count']}，失败 {result['failed_count']}")
+    return result
+
+
+# ==================== 错误处理 ====================
+
+def api_update_account_v2(account_id):
+    data = request.json or {}
+
+    if 'status' in data and len(data) == 1:
+        return api_update_account_status(account_id, data['status'])
+
+    current_account = get_account_by_id(account_id) or {}
+    email_addr = (data.get('email', '') or '').strip()
+    password = data['password'] if 'password' in data else current_account.get('password', '')
+    client_id = (data.get('client_id', '') or '').strip()
+    refresh_token = (data.get('refresh_token', '') or '').strip()
+    account_type = (data.get('account_type', 'outlook') or 'outlook').strip().lower()
+    provider = (data.get('provider', 'outlook') or 'outlook').strip().lower()
+    imap_host = (data.get('imap_host', '') or '').strip()
+    imap_password = data['imap_password'] if 'imap_password' in data else current_account.get('imap_password', '')
+    group_id = data.get('group_id', 1)
+    sort_order = parse_account_sort_order_input(data.get('sort_order')) if 'sort_order' in data else None
+    remark = sanitize_input(data.get('remark', ''), max_length=200)
+    status = data.get('status', 'active')
+    forward_enabled = bool(data.get('forward_enabled', False))
+    proxy_url = str(data.get('proxy_url', current_account.get('proxy_url', '')) or '').strip()
+    fallback_proxy_url_1 = str(
+        data.get('fallback_proxy_url_1', current_account.get('fallback_proxy_url_1', '')) or ''
+    ).strip()
+    fallback_proxy_url_2 = str(
+        data.get('fallback_proxy_url_2', current_account.get('fallback_proxy_url_2', '')) or ''
+    ).strip()
+    aliases_provided = 'aliases' in data
+    aliases = parse_alias_payload(data.get('aliases', [])) if aliases_provided else []
+
+    try:
+        group_id = int(group_id or 1)
+    except (TypeError, ValueError):
+        group_id = 1
+
+    try:
+        imap_port = int(data.get('imap_port', 993) or 993)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'IMAP 端口无效'})
+
+    provider_meta = get_provider_meta(provider, email_addr)
+    is_outlook = account_type == 'outlook' or provider_meta['key'] == 'outlook'
+
+    if is_outlook:
+        if not email_addr or not client_id or not refresh_token:
+            return jsonify({'success': False, 'error': '邮箱、Client ID 和 Refresh Token 不能为空'})
+        account_type = 'outlook'
+        provider = 'outlook'
+        imap_host = IMAP_SERVER_NEW
+        imap_port = IMAP_PORT
+        imap_password = ''
+    else:
+        if not email_addr or not imap_password:
+            return jsonify({'success': False, 'error': '邮箱和 IMAP 密码不能为空'})
+        account_type = 'imap'
+        provider = provider_meta['key']
+        client_id = ''
+        refresh_token = ''
+        password = ''
+        if provider == 'custom':
+            if not imap_host:
+                return jsonify({'success': False, 'error': '自定义 IMAP 必须填写服务器地址'})
+        else:
+            imap_host = provider_meta.get('imap_host', '')
+            imap_port = int(provider_meta.get('imap_port', 993) or 993)
+
+    if aliases_provided:
+        _, alias_errors = validate_account_aliases(account_id, email_addr, aliases)
+        if alias_errors:
+            return jsonify({'success': False, 'error': '；'.join(alias_errors), 'errors': alias_errors})
+
+    if update_account(
+        account_id,
+        email_addr,
+        password,
+        client_id,
+        refresh_token,
+        group_id,
+        sort_order,
+        remark,
+        status,
+        account_type,
+        provider,
+        imap_host,
+        imap_port,
+        imap_password,
+        forward_enabled,
+        proxy_url,
+        fallback_proxy_url_1,
+        fallback_proxy_url_2
+    ):
+        cleaned_aliases = get_account_aliases(account_id)
+        if aliases_provided:
+            db = get_db()
+            alias_success, cleaned_aliases, alias_errors = replace_account_aliases(account_id, email_addr, aliases, db)
+            if not alias_success:
+                db.rollback()
+                return jsonify({'success': False, 'error': '；'.join(alias_errors), 'errors': alias_errors})
+            db.commit()
+        return jsonify({'success': True, 'message': '账号更新成功', 'aliases': cleaned_aliases})
+    return jsonify({'success': False, 'error': '更新失败'})
+
+
+def add_resolved_account_metadata(result: Dict[str, Any], requested_email: str,
+                                  account: Dict[str, Any]) -> Dict[str, Any]:
+    result['requested_email'] = requested_email
+    result['resolved_email'] = account.get('email', '')
+    if account.get('resolved_query_email'):
+        result['resolved_query_email'] = account.get('resolved_query_email')
+        result['fallback_used'] = bool(account.get('fallback_used'))
+        result['fallback_email'] = account.get('fallback_email', '')
+    if account.get('matched_alias'):
+        result['matched_alias'] = account.get('matched_alias')
+    return result
+
+
+def get_email_filter_args() -> tuple[str, str, str]:
+    return (
+        get_query_arg_preserve_plus('subject_contains', '').strip().lower(),
+        get_query_arg_preserve_plus('from_contains', '').strip().lower(),
+        get_query_arg_preserve_plus('keyword', '').strip().lower(),
+    )
+
+
+def apply_email_list_filters(account: Dict[str, Any], result: Dict[str, Any],
+                             local_retention_request: bool,
+                             subject_contains: str, from_contains: str,
+                             keyword: str) -> None:
+    if not (subject_contains or from_contains or keyword):
+        return
+    if local_retention_request:
+        result['emails'] = [
+            item for item in result.get('emails', [])
+            if email_matches_local_retention_filters(
+                item, subject_contains, from_contains, keyword
+            )
+        ]
+        return
+    result['emails'] = [
+        item for item in result.get('emails', [])
+        if email_matches_filters(account, item, subject_contains, from_contains, keyword)
+    ]
+
+
+def handle_local_retention_list_request(account: Dict[str, Any], requested_email: str,
+                                        folder: str, subject_contains: str,
+                                        from_contains: str, keyword: str):
+    skip = parse_non_negative_int(request.args.get('skip', 0), 0)
+    top = parse_non_negative_int(request.args.get('top', 20), 20)
+    if not is_normal_mail_local_retention_enabled():
+        result = {
+            'success': True,
+            'emails': [],
+            'has_more': False,
+            'count': 0,
+            'method': 'Local Retention',
+            'source': 'local_retention_disabled',
+            'request_method': 'local',
+            'local_retention': False,
+            'local_retention_enabled': False,
+            'message': '本地存储未启用',
+            'folder': folder,
+        }
+        add_resolved_account_metadata(result, requested_email, account)
+        return jsonify(result)
+    result = fetch_retained_normal_mail_list(
+        account,
+        folder,
+        skip,
+        top,
+        include_body=bool(keyword),
+        subject_contains=subject_contains,
+        from_contains=from_contains,
+        keyword=keyword,
+    )
+    if result.get('success'):
+        add_resolved_account_metadata(result, requested_email, account)
+    return jsonify(result)
+
+
+def handle_remote_email_list_request(account: Dict[str, Any], requested_email: str,
+                                     folder: str, subject_contains: str,
+                                     from_contains: str, keyword: str):
+    skip = parse_non_negative_int(request.args.get('skip', 0), 0)
+    top = parse_non_negative_int(request.args.get('top', 20), 20, 50)
+    result = fetch_account_emails(account, folder, skip, top)
+    if result.get('success'):
+        if is_normal_mail_local_retention_enabled():
+            if skip == 0:
+                new_message_ids = find_new_retained_normal_mail_identifiers(
+                    account, folder, result.get('emails', [])
+                )
+                result['new_count'] = len(new_message_ids)
+                result['new_message_ids'] = new_message_ids
+            upsert_retained_normal_mail_list_items(account, folder, result.get('emails', []))
+        apply_email_list_filters(
+            account, result, False, subject_contains, from_contains, keyword
+        )
+        add_resolved_account_metadata(result, requested_email, account)
+    return jsonify(result)
+
+
+def api_get_emails_v2(email_addr):
+    requested_email = str(email_addr or '').strip()
+    account = resolve_account_for_email_api(requested_email)
+    if not account:
+        error_payload = build_error_payload(
+            "ACCOUNT_NOT_FOUND",
+            "账号不存在",
+            "NotFoundError",
+            404,
+            f"email={requested_email}"
+        )
+        return jsonify({'success': False, 'error': error_payload})
+
+    folder = normalize_folder_name(request.args.get('folder', 'inbox'))
+    subject_contains, from_contains, keyword = get_email_filter_args()
+    if is_local_retention_request():
+        return handle_local_retention_list_request(
+            account, requested_email, folder, subject_contains, from_contains, keyword
+        )
+    return handle_remote_email_list_request(
+        account, requested_email, folder, subject_contains, from_contains, keyword
+    )
+
+
+def api_external_get_emails_v2():
+    email_addr = get_query_arg_preserve_plus('email', '').strip()
+    folder = normalize_folder_name(request.args.get('folder', 'inbox'))
+    skip = parse_non_negative_int(request.args.get('skip', 0), 0)
+    top = parse_non_negative_int(request.args.get('top', 1), 1, 50)
+    subject_contains = get_query_arg_preserve_plus('subject_contains', '').strip().lower()
+    from_contains = get_query_arg_preserve_plus('from_contains', '').strip().lower()
+    keyword = get_query_arg_preserve_plus('keyword', '').strip().lower()
+
+    if not email_addr:
+        return jsonify({'success': False, 'error': '缺少 email 参数'}), 400
+
+    valid_folders = sorted(VALID_MAIL_FOLDERS)
+    if folder not in VALID_MAIL_FOLDERS:
+        return jsonify({'success': False, 'error': f'folder 参数无效，仅支持 {", ".join(valid_folders)}'}), 400
+
+    account = resolve_account_for_email_api(email_addr)
+    if not account:
+        return jsonify({'success': False, 'error': '邮箱账号不存在'}), 404
+    result = fetch_account_emails(account, folder, skip, top)
+    if result.get('success'):
+        if subject_contains or from_contains or keyword:
+            result['emails'] = [
+                item for item in result.get('emails', [])
+                if email_matches_filters(account, item, subject_contains, from_contains, keyword)
+            ]
+        result['requested_email'] = email_addr
+        result['resolved_email'] = account.get('email', '')
+        if account.get('resolved_query_email'):
+            result['resolved_query_email'] = account.get('resolved_query_email')
+            result['fallback_used'] = bool(account.get('fallback_used'))
+            result['fallback_email'] = account.get('fallback_email', '')
+        if account.get('matched_alias'):
+            result['matched_alias'] = account.get('matched_alias')
+    return jsonify(result)
+
+
+def email_matches_filters(account: Dict[str, Any], item: Dict[str, Any],
+                          subject_contains: str = '', from_contains: str = '',
+                          keyword: str = '') -> bool:
+    subject = str(item.get('subject', '') or '')
+    sender = str(item.get('from', '') or '')
+    preview = str(item.get('body_preview', '') or '')
+
+    if subject_contains and subject_contains not in subject.lower():
+        return False
+    if from_contains and from_contains not in sender.lower():
+        return False
+    if not keyword:
+        return True
+
+    base_text = '\n'.join([subject, preview]).lower()
+    if keyword in base_text:
+        return True
+
+    cached_body = str(item.get('body') or '')
+    if cached_body and keyword in strip_html_content(cached_body).lower():
+        return True
+
+    proxy_url = get_account_proxy_url(account)
+    fallback_proxy_urls = get_account_proxy_failover_urls(account)
+    if account.get('account_type') == 'imap':
+        detail_payload = get_email_detail_imap_generic_result(
+            account['email'],
+            account.get('imap_password', ''),
+            account.get('imap_host', ''),
+            account.get('imap_port', 993),
+            str(item.get('id', '')),
+            item.get('folder', 'inbox'),
+            account.get('provider', 'custom'),
+            proxy_url
+        )
+        if detail_payload and detail_payload.get('success'):
+            body = str((detail_payload.get('email') or {}).get('body', '') or '')
+            return keyword in strip_html_content(body).lower()
+        return False
+
+    item_id_mode = str(item.get('id_mode') or item.get('idMode') or '').strip().lower()
+    if item_id_mode in {'uid', 'sequence'}:
+        detail = get_email_detail_imap(
+            account.get('email', ''),
+            account.get('client_id', ''),
+            account.get('refresh_token', ''),
+            str(item.get('id', '')),
+            item.get('folder', 'inbox'),
+            proxy_url,
+            fallback_proxy_urls,
+            'uid' if item_id_mode == 'uid' else 'sequence',
+        )
+        if not detail:
+            return False
+        body = str(detail.get('body', '') or '')
+        return keyword in strip_html_content(body).lower()
+
+    detail = get_email_detail_graph(
+        account.get('client_id', ''),
+        account.get('refresh_token', ''),
+        str(item.get('id', '')),
+        proxy_url,
+        fallback_proxy_urls,
+    )
+    if not detail:
+        return False
+    body = str((detail.get('body') or {}).get('content', '') or '')
+    return keyword in strip_html_content(body).lower()
+
+
+app.view_functions['api_update_account'] = csrf_exempt(login_required(api_update_account_v2))
+app.view_functions['api_get_emails'] = login_required(api_get_emails_v2)
+app.view_functions['api_external_get_emails'] = api_key_required(api_external_get_emails_v2)
+
+assert_endpoint_protection('api_update_account', '_requires_login', 'login_required')
+assert_endpoint_protection('api_get_emails', '_requires_login', 'login_required')
+assert_endpoint_protection('api_external_get_emails', '_requires_api_key', 'api_key_required')
+
+
+def handle_csrf_error(error):
+    """Expose CSRF failures so the frontend can refresh the token and retry."""
+    error_description = str(getattr(error, 'description', '') or error)
+    safe_console_print(f"CSRF Error: {error_description}")
+    return jsonify({
+        'success': False,
+        'error': 'CSRF 校验失败，请刷新后重试',
+        'csrf_error': True,
+        'description': error_description,
+    }), 400
+
+
+if CSRF_AVAILABLE:
+    app.register_error_handler(CSRFError, handle_csrf_error)
+
+
+@app.errorhandler(400)
+def bad_request(error):
+    """处理400错误"""
+    error_description = str(getattr(error, 'description', '') or error)
+    is_csrf_error = (
+        (CSRF_AVAILABLE and isinstance(error, CSRFError))
+        or 'csrf' in error.__class__.__name__.lower()
+        or 'csrf' in error_description.lower()
+    )
+    if is_csrf_error:
+        return handle_csrf_error(error)
+    safe_console_print(f"400 Bad Request: {error}")
+    return jsonify({
+        'success': False,
+        'error': '请求格式错误',
+        'description': error_description,
+    }), 400
+
+
+@app.errorhandler(Exception)
+def handle_exception(error):
+    """处理未捕获的异常"""
+    if isinstance(error, HTTPException):
+        return jsonify({'success': False, 'error': error.description}), error.code
+
+    safe_console_print(f"Unhandled exception: {error}")
+    import traceback
+    traceback.print_exc()
+    return jsonify({'success': False, 'error': str(error)}), 500
