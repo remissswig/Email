@@ -141,9 +141,20 @@ def normalize_public_base_url(value: Any) -> str:
 
 
 def _recipient_email_from_import_line(line: str) -> str:
-    if "----" in line:
-        return line.split("----", 1)[0].strip()
-    return line
+    if "----" not in line:
+        return line
+
+    parts = [part.strip() for part in line.split("----")]
+    for part in parts:
+        if not part:
+            continue
+        try:
+            normalize_recipient_email(part)
+        except RecipientLinkInputError:
+            continue
+        return part
+
+    return parts[0] if parts else line
 
 
 def _parse_recipient_txt_lines(lines: list[tuple[int, str]]) -> ParsedRecipientFile:

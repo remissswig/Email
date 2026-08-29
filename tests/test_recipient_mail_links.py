@@ -638,6 +638,29 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         self.assertEqual(group["errors"][0]["error_code"], "invalid_email")
         self.assertEqual(self.count_recipient_links(), 1)
 
+    def test_import_single_file_extracts_main_email_from_first_line_segments(self):
+        account_id = self.insert_account("owner@example.com")
+
+        response = self.import_links(
+            mode="single",
+            files=[
+                (
+                    "wrong-file-name.txt",
+                    b"Outlook full info----Owner@Example.com\nRecipient01@iCloud.com----https://mail.example/link\n",
+                )
+            ],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(len(payload["groups"]), 1)
+        group = payload["groups"][0]
+        self.assertEqual(group["main_email"], "Owner@Example.com")
+        self.assertEqual(group["account_id"], account_id)
+        self.assertEqual(group["created_count"], 1)
+        self.assertEqual(self.count_recipient_links(), 1)
+
     def test_import_requires_login_with_no_store_header(self):
         self.insert_account("owner@example.com")
 
