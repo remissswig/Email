@@ -198,6 +198,37 @@ def _cleanup_recipient_import_savepoint(db, name: str) -> None:
         raise
 
 
+def _ensure_recipient_import_account(main_email: str) -> tuple[Any, bool]:
+    account = resolve_account_by_address(main_email)
+    if account is not None:
+        return account, False
+
+    db = get_db()
+    db.execute(
+        ACCOUNT_INSERT_SQL,
+        build_account_insert_values(
+            main_email,
+            "",
+            "",
+            "",
+            1,
+            "",
+            "",
+            "auto",
+            "",
+            993,
+            "",
+            False,
+            None,
+            "active",
+            "",
+            "",
+            "",
+        ),
+    )
+    return resolve_account_by_address(main_email), True
+
+
 def _recipient_import_summary(
     *,
     successful_files: int,
@@ -457,7 +488,7 @@ def api_import_recipient_verification_links():
                     )
                 continue
 
-            account = resolve_account_by_address(import_file["main_email"])
+            account, created_account = _ensure_recipient_import_account(import_file["main_email"])
             if account is None:
                 invalid_total += len(file_errors)
                 failed_files.append(
@@ -574,6 +605,7 @@ def api_import_recipient_verification_links():
                     "created_count": created_count,
                     "reused_count": reused_count,
                     "errors": file_errors,
+                    "account_created": created_account,
                 }
             )
             export_items.append(

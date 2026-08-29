@@ -661,6 +661,34 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         self.assertEqual(group["created_count"], 1)
         self.assertEqual(self.count_recipient_links(), 1)
 
+    def test_import_single_file_auto_creates_missing_main_mailbox(self):
+        response = self.import_links(
+            mode="single",
+            files=[
+                (
+                    "missing-main.txt",
+                    b"newowner@outlook.com\nrecipient01@example.com\nrecipient02@example.com\n",
+                )
+            ],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["summary"]["successful_files"], 1)
+        self.assertEqual(payload["summary"]["failed_files"], 0)
+        self.assertEqual(payload["summary"]["created_records"], 2)
+        self.assertEqual(len(payload["groups"]), 1)
+        group = payload["groups"][0]
+        self.assertEqual(group["main_email"], "newowner@outlook.com")
+        self.assertEqual(group["created_count"], 2)
+        self.assertEqual(group["reused_count"], 0)
+        self.assertEqual(group["account_created"], True)
+        with self.app_context():
+            account = self.module.get_account_by_email("newowner@outlook.com")
+            self.assertIsNotNone(account)
+        self.assertEqual(self.count_recipient_links(), 2)
+
     def test_import_single_file_prefers_outlook_email_among_multiple_candidates(self):
         account_id = self.insert_account("owner@outlook.com")
 
@@ -722,7 +750,7 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         self.assertEqual(link["main_email_display"], "Alias@Example.com")
         self.assertEqual(link["expires_at"], "2026-08-30T00:00:00Z")
 
-    def test_import_batch_commits_valid_file_and_skips_unknown_mailbox(self):
+    def test_import_batch_auto_creates_missing_mailboxes(self):
         account_id = self.insert_account("valid@example.com")
 
         response = self.import_links(
@@ -735,17 +763,22 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
-        self.assertEqual(payload["summary"]["successful_files"], 1)
-        self.assertEqual(payload["summary"]["failed_files"], 1)
-        self.assertEqual(payload["summary"]["created_records"], 1)
+        self.assertEqual(payload["summary"]["successful_files"], 2)
+        self.assertEqual(payload["summary"]["failed_files"], 0)
+        self.assertEqual(payload["summary"]["created_records"], 2)
         self.assertEqual(payload["summary"]["reused_records"], 0)
         self.assertNotIn("created_links", payload["summary"])
         self.assertNotIn("reused_links", payload["summary"])
         self.assertEqual(payload["summary"]["invalid_lines"], 0)
+        self.assertEqual(len(payload["groups"]), 2)
         self.assertEqual(payload["groups"][0]["account_id"], account_id)
         self.assertEqual(len(payload["groups"][0]["record_ids"]), 1)
-        self.assertEqual(payload["failed_files"][0]["error_code"], "main_mailbox_not_found")
-        self.assertEqual(self.count_recipient_links(), 1)
+        self.assertEqual(payload["groups"][1]["main_email"], "missing@example.com")
+        self.assertEqual(payload["groups"][1]["account_created"], True)
+        with self.app_context():
+            self.assertIsNotNone(self.module.get_account_by_email("missing@example.com"))
+        self.assertEqual(payload["failed_files"], [])
+        self.assertEqual(self.count_recipient_links(), 2)
 
     def test_import_batch_treats_invalid_utf8_as_per_file_failure(self):
         self.insert_account("valid@example.com")
@@ -854,12 +887,12 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content_type, "application/zip")
         archive = zipfile.ZipFile(io.BytesIO(response.get_data()))
-        self.assertCountEqual(archive.namelist(), ["api-valid.txt", "失败-missing.txt"])
+        self.assertCountEqual(archive.namelist(), ["api-valid.txt", "api-missing.txt"])
         success_lines = archive.read("api-valid.txt").decode("utf-8").splitlines()
-        failure_lines = archive.read("失败-missing.txt").decode("utf-8").splitlines()
+        missing_lines = archive.read("api-missing.txt").decode("utf-8").splitlines()
         self.assertEqual(success_lines[0], "valid@example.com")
-        self.assertEqual(failure_lines[0], "导入失败")
-        self.assertTrue(any("主邮箱不存在或未导入" in line for line in failure_lines))
+        self.assertEqual(missing_lines[0], "missing@example.com")
+        self.assertTrue(any(line.startswith("bad@example.com----") for line in missing_lines[1:]))
 
     def test_import_rejects_request_wide_binding_limit_before_writes(self):
         self.insert_account("owner@example.com")
@@ -891,24 +924,25 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.status_code, 200)
         payload = response.get_json()
-        self.assertEqual(payload["error_code"], "no_valid_records")
+        self.assertTrue(payload["success"])
         self.assertEqual(
             payload["summary"],
             {
-                "successful_files": 0,
-                "failed_files": 2,
-                "created_records": 0,
+                "successful_files": 1,
+                "failed_files": 1,
+                "created_records": 1,
                 "reused_records": 0,
                 "invalid_lines": 1,
             },
         )
         self.assertNotIn("created_links", payload["summary"])
         self.assertNotIn("reused_links", payload["summary"])
-        self.assertEqual(payload["groups"], [])
-        self.assertEqual(len(payload["failed_files"]), 2)
-        self.assertEqual(self.count_recipient_links(), 0)
+        self.assertEqual(len(payload["groups"]), 1)
+        self.assertEqual(len(payload["failed_files"]), 1)
+        self.assertEqual(payload["failed_files"][0]["error_code"], "no_valid_recipients")
+        self.assertEqual(self.count_recipient_links(), 1)
 
     def test_import_rejects_invalid_mode_before_writes(self):
         self.insert_account("owner@example.com")
