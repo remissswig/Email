@@ -13,39 +13,40 @@
       --line: #dfe5ec;
       --blue: #126ee8;
       --blue-soft: #eef5ff;
-      --shadow: 0 2px 5px rgba(37, 56, 75, 0.08);
+      --shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
     }
     * { box-sizing: border-box; }
     body { margin: 0; background: #f5f7fa; }
     a { color: inherit; }
-    .page { max-width: 960px; margin: 0 auto; padding: 28px 20px 56px; }
+    .page { max-width: 1140px; margin: 0 auto; padding: 22px 18px 56px; }
     .hero {
       display: flex;
       justify-content: space-between;
-      align-items: flex-end;
+      align-items: flex-start;
       gap: 20px;
-      margin-bottom: 18px;
+      margin-bottom: 14px;
     }
-    .eyebrow {
-      margin: 0 0 6px;
-      color: #6b7784;
-      font-size: 11px;
-      letter-spacing: 2px;
-    }
-    h1 { margin: 0; font-size: 30px; line-height: 1.2; word-break: break-all; }
+    h1 { margin: 0; font-size: 20px; line-height: 1.2; font-weight: 700; word-break: break-all; }
     .lead {
-      margin: 8px 0 0;
-      color: #667686;
-      line-height: 1.6;
+      margin: 0;
+      color: #1f2937;
+      font-size: 14px;
+      line-height: 1.5;
       word-break: break-all;
     }
-    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      margin-top: 2px;
+    }
     .button {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-height: 38px;
-      padding: 9px 13px;
+      min-height: 34px;
+      padding: 8px 12px;
       border: 1px solid #cfd7df;
       border-radius: 6px;
       background: #fff;
@@ -55,30 +56,35 @@
       white-space: nowrap;
     }
     .button:hover { border-color: var(--blue); color: var(--blue); }
-    .button.primary {
-      background: var(--blue);
-      border-color: var(--blue);
-      color: #fff;
-    }
+    .button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
     .button.primary:hover { color: #fff; }
-    .panel {
+    .mail-card {
       border: 1px solid var(--line);
       border-radius: 8px;
       background: #fff;
       box-shadow: var(--shadow);
       overflow: hidden;
     }
-    .panel-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 14px 16px;
+    .mail-card-head {
+      display: block;
+      gap: 14px;
+      padding: 18px 18px 14px;
       border-bottom: 1px solid #edf0f2;
     }
-    .panel-head h2 { margin: 0; font-size: 16px; }
-    .panel-head span { color: #77838f; font-size: 12px; white-space: nowrap; }
-    .panel-body { padding: 12px; }
+    .mail-card-title {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.35;
+      font-weight: 700;
+      word-break: break-word;
+    }
+    .mail-card-meta {
+      display: grid;
+      gap: 4px;
+      margin-top: 10px;
+    }
+    .mail-card-meta .mail-meta { margin: 0; }
+    .panel-body { padding: 0; }
     .empty, .notice {
       padding: 18px 16px;
       border-radius: 6px;
@@ -99,28 +105,9 @@
     .mail-list { display: grid; gap: 10px; }
     .mail-single {
       display: grid;
-      gap: 14px;
-      padding: 2px 0 0;
+      gap: 0;
+      background: #fff;
     }
-    .mail-single-title {
-      margin: 0;
-      font-size: 28px;
-      line-height: 1.2;
-      font-weight: 700;
-      word-break: break-word;
-    }
-    .mail-single-subject {
-      margin: 0;
-      font-size: 16px;
-      line-height: 1.5;
-      color: #293547;
-      word-break: break-word;
-    }
-    .mail-single-meta {
-      display: grid;
-      gap: 10px;
-    }
-    .mail-single-meta .mail-meta { margin: 0; }
     .mail-item {
       border: 1px solid #edf0f2;
       border-radius: 8px;
@@ -181,27 +168,35 @@
       margin-bottom: 14px;
     }
     .mail-meta {
-      padding: 10px;
-      border: 1px solid #edf0f2;
+      padding: 0;
+      border: none;
       border-radius: 6px;
-      background: #fbfcfe;
+      background: #fff;
       color: #5f6f80;
       font-size: 12px;
-      line-height: 1.5;
+      line-height: 1.7;
       word-break: break-all;
     }
     .mail-meta strong {
-      display: block;
-      margin-bottom: 3px;
-      color: #1f2b3a;
+      display: inline-block;
+      width: 72px;
+      margin-right: 18px;
+      color: #516173;
       font-size: 12px;
+      font-weight: 500;
     }
     .mail-frame {
       width: 100%;
-      min-height: 420px;
-      border: 1px solid #e3e8ee;
-      border-radius: 8px;
+      min-height: 620px;
+      border: 0;
+      border-radius: 0;
       background: #fff;
+    }
+    .mail-caption {
+      margin: 10px 2px 0;
+      color: #748290;
+      font-size: 12px;
+      line-height: 1.6;
     }
     .mail-footer {
       display: flex;
@@ -214,13 +209,12 @@
       font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
     }
     @media (max-width: 720px) {
-      .page { padding: 20px 12px 36px; }
+      .page { padding: 16px 10px 36px; }
       .hero { display: grid; align-items: start; }
-      h1 { font-size: 24px; }
-      .actions { width: 100%; }
-      .button { flex: 1 1 auto; }
-      .mail-meta-grid { grid-template-columns: 1fr; }
-      .mail-frame { min-height: 360px; }
+      h1 { font-size: 18px; }
+      .actions { width: 100%; justify-content: flex-start; }
+      .button { flex: 0 0 auto; }
+      .mail-frame { min-height: 420px; }
     }
   </style>
 </head>
@@ -228,11 +222,11 @@
   <main class="page">
     <header class="hero">
       <div>
-        <p class="eyebrow">MAILBOX</p>
         <h1>最新邮件</h1>
-        <p class="lead">{{ recipient_email }}<br>主邮箱：{{ main_email }}</p>
       </div>
-      <div class="actions">
+      <div style="display:grid; gap:8px; justify-items:end;">
+        <p class="lead" style="text-align:right;">{{ recipient_email }}</p>
+        <div class="actions">
         <a class="button primary" href="{{ refresh_url }}">刷新</a>
         {% if show_all %}
           {% if collapse_url %}
@@ -244,6 +238,7 @@
         {% elif load_more_url %}
           <a class="button" href="{{ load_more_url }}">查看更多</a>
         {% endif %}
+        </div>
       </div>
     </header>
 
@@ -252,8 +247,8 @@
     {% endif %}
 
     {% if show_all %}
-      <section class="panel">
-        <div class="panel-head">
+      <section class="mail-card">
+        <div class="mail-card-head">
           <h2>邮件列表</h2>
           <span>已加载 {{ loaded_count }} 封</span>
         </div>
@@ -291,12 +286,16 @@
       </section>
     {% else %}
       {% if current_subject or current_body_srcdoc %}
-        <section class="mail-single">
-          <h2 class="mail-single-title">{{ current_subject or '无主题' }}</h2>
-          <div class="mail-single-meta">
-            <div class="mail-meta"><strong>发件人</strong>{{ current_sender or '未知发件人' }}</div>
-            <div class="mail-meta"><strong>收件人</strong>{{ recipient_email }}</div>
-            <div class="mail-meta"><strong>时间</strong>{{ current_received_at or '未知时间' }}</div>
+        <section class="mail-card mail-single">
+          <div class="mail-card-head">
+            <div>
+              <h2 class="mail-card-title">{{ current_subject or '无主题' }}</h2>
+              <div class="mail-card-meta">
+                <div class="mail-meta"><strong>发件人</strong><span>{{ current_sender or '未知发件人' }}</span></div>
+                <div class="mail-meta"><strong>收件人</strong><span>{{ recipient_email }}</span></div>
+                <div class="mail-meta"><strong>时间</strong><span>{{ current_received_at or '未知时间' }}</span></div>
+              </div>
+            </div>
           </div>
           <iframe
             class="mail-frame"
@@ -304,10 +303,10 @@
             referrerpolicy="no-referrer"
             title="{{ current_subject or '邮件详情' }}"
             srcdoc="{{ current_body_srcdoc|e }}"></iframe>
-          <div class="mail-caption">点击“查看更多”后，所有邮件会切换成折叠列表。</div>
         </section>
+        <div class="mail-caption">点击“查看更多”后，所有邮件会切换成折叠列表。</div>
       {% else %}
-        <section class="panel">
+        <section class="mail-card">
           <div class="panel-body">
             <div class="empty">暂无邮件</div>
           </div>
