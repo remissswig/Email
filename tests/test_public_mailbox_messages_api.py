@@ -1318,6 +1318,26 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
             }],
         }
 
+    @staticmethod
+    def success_messages_result(count):
+        return {
+            'success': True,
+            'status': 200,
+            'count': count,
+            'messages': [
+                {
+                    'id': f'message-{index}',
+                    'subject': f'Verification code {index:02d}',
+                    'from': 'sender@example.com',
+                    'to': 'Hide My Email <01litany_muster@icloud.com>',
+                    'received_at': f'2026-08-21T10:{index:02d}:00Z',
+                    'body': f'<p>mail body {index}</p>',
+                    'body_type': 'html',
+                }
+                for index in range(1, count + 1)
+            ],
+        }
+
     def test_public_html_response_accepts_header_key_without_session(self):
         with self.client.session_transaction() as session:
             self.assertNotIn('logged_in', session)
@@ -1792,13 +1812,20 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
 
         self.assertEqual(show_response.status_code, 200)
         self.assertEqual(show_response.content_type, 'text/html; charset=utf-8')
-        self.assertEqual(show_response.get_data(as_text=True), '<b>123456</b>')
+        show_html = show_response.get_data(as_text=True)
+        self.assertIn('邮箱展 - Recipient01@iCloud.com', show_html)
+        self.assertIn('邮件列表', show_html)
+        self.assertIn('Verification code', show_html)
+        self.assertIn('已加载 1 封', show_html)
+        self.assertIn('class="mail-item"', show_html)
+        self.assertIn('data-srcdoc=', show_html)
+        self.assertNotIn('查看全部邮件', show_html)
         self.assert_public_token_headers(show_response)
         account_mock.assert_called_once_with(int(link['account_id']))
         search_mock.assert_called_once_with(
             account,
             'recipient01@icloud.com',
-            1,
+            20,
         )
         row = self.get_public_link_row(int(link['id']))
         self.assertEqual(int(row['primary_access_count'] or 0), 1)
@@ -1851,17 +1878,52 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content_type, 'text/html; charset=utf-8')
-        self.assertEqual(response.get_data(as_text=True), '<b>123456</b>')
+        response_html = response.get_data(as_text=True)
+        self.assertIn('邮件列表', response_html)
+        self.assertIn('Verification code', response_html)
+        self.assertIn('已加载 1 封', response_html)
         self.assert_public_token_headers(response)
         account_mock.assert_called_once_with(int(link['account_id']))
         search_mock.assert_called_once_with(
             account,
             'recipient01+promo@icloud.com',
-            1,
+            20,
         )
         row = self.get_public_link_row(int(link['id']))
         self.assertEqual(int(row['primary_access_count'] or 0), 1)
         self.assertIsNotNone(row['last_accessed_at'])
+
+    def test_public_show_route_load_more_increments_by_twenty(self):
+        link = self.seed_public_link('Recipient01@iCloud.com')
+        shared = web_outlook_app.build_recipient_link_share_segment(int(link['account_id']))
+        account = {
+            'id': int(link['account_id']),
+            'email': 'owner@example.com',
+            'account_type': 'outlook',
+        }
+
+        with patch.object(
+            web_outlook_app,
+            'get_account_by_id',
+            return_value=account,
+        ), patch.object(
+            web_outlook_app,
+            'find_public_mailbox_messages',
+            return_value=self.success_messages_result(40),
+        ) as search_mock:
+            response = self.client.get(f"/show/{shared}/Recipient01@iCloud.com?limit=21")
+
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn('已加载 40 封', html)
+        self.assertIn('查看更多', html)
+        self.assertIn('limit=60', html)
+        self.assertNotIn('查看全部邮件', html)
+        search_mock.assert_called_once_with(
+            account,
+            'recipient01@icloud.com',
+            40,
+        )
 
     def test_touch_primary_recipient_link_keeps_updated_at_and_replication_events_unchanged(self):
         link = self.seed_public_link('Recipient01@iCloud.com')

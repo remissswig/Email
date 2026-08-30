@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import hashlib
 import hmac
 import io
@@ -10,7 +11,7 @@ from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 import zipfile
 
 from outlook_web.recipient_links import (
@@ -34,6 +35,8 @@ RECIPIENT_LINK_MAX_TOTAL_BYTES = 5 * 1024 * 1024
 RECIPIENT_LINK_MAX_BINDINGS = 10_000
 RECIPIENT_LINK_MAX_PAGE_SIZE = 100
 RECIPIENT_LINK_MAX_MAILBOX_OPTIONS = 10
+RECIPIENT_LINK_PUBLIC_PAGE_LIMIT = 20
+RECIPIENT_LINK_PUBLIC_PAGE_MAX_LIMIT = 10_000
 
 RECIPIENT_LINK_ERROR_MESSAGES = {
     "invalid_mode": "导入模式无效",
@@ -109,6 +112,23 @@ def recipient_link_json_error(code: str, status: int, **extra):
     }
     payload.update(extra)
     return recipient_link_json_response(payload, status)
+
+
+def _recipient_link_public_page_limit(value: Any) -> int:
+    step = RECIPIENT_LINK_PUBLIC_PAGE_LIMIT
+    try:
+        parsed = int(str(value or "").strip() or step)
+    except (TypeError, ValueError):
+        parsed = step
+    parsed = max(step, parsed)
+    parsed = ((parsed + step - 1) // step) * step
+    return min(parsed, RECIPIENT_LINK_PUBLIC_PAGE_MAX_LIMIT)
+
+
+def _recipient_link_public_page_url(limit: int) -> str:
+    query = dict(request.args.items())
+    query["limit"] = str(_recipient_link_public_page_limit(limit))
+    return f"{request.base_url}?{urlencode(query)}"
 
 
 def recipient_link_no_store(f):
@@ -938,6 +958,72 @@ def _recipient_link_public_json_response(payload: dict[str, Any], status: int = 
     return response
 
 
+def _recipient_link_message_srcdoc(message: dict[str, Any]) -> str:
+    body = str(message.get("body") or "")
+    if str(message.get("body_type") or "").strip().lower() == "html":
+        return body or "<div class=\"mail-empty\">当前无正文</div>"
+    if body:
+        return f"<pre>{html.escape(body)}</pre>"
+    return "<div class=\"mail-empty\">当前无正文</div>"
+
+
+def _recipient_link_public_mailbox_page_response(
+    row,
+    account: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    shared: str,
+    recipient_email: str,
+    loaded_limit: int,
+):
+    messages = []
+    for source in result.get("messages") or []:
+        item = dict(source or {})
+        item["body_srcdoc"] = _recipient_link_message_srcdoc(item)
+        messages.append(item)
+    notice = ""
+    response_status = 200
+
+    if not result.get("success"):
+        response_status = int(result.get("status") or 502)
+        if response_status == 404:
+            notice = "当前无邮件"
+            response_status = 200
+        else:
+            notice = str(result.get("error") or "邮箱服务查询失败")
+
+    refresh_url = request.url
+    loaded_count = len(messages)
+    has_more = result.get("success") and loaded_count >= loaded_limit
+    load_more_url = (
+        _recipient_link_public_page_url(loaded_limit + RECIPIENT_LINK_PUBLIC_PAGE_LIMIT)
+        if has_more and loaded_limit < RECIPIENT_LINK_PUBLIC_PAGE_MAX_LIMIT
+        else ""
+    )
+    page_title = f"邮箱展 - {str(row['recipient_email_display'] or recipient_email).strip()}"
+    response = make_response(
+        render_template(
+            "recipient_mailbox_show.html",
+            page_title=page_title,
+            main_email=str(row["main_email_display"] or "").strip(),
+            recipient_email=str(row["recipient_email_display"] or recipient_email).strip(),
+            shared=shared,
+            refresh_url=refresh_url,
+            notice=notice,
+            loaded_count=loaded_count,
+            loaded_limit=loaded_limit,
+            has_more=has_more,
+            load_more_url=load_more_url,
+            messages=messages,
+        ),
+        response_status,
+    )
+    response.headers["X-Robots-Tag"] = "noindex"
+    response.headers["Content-Type"] = "text/html; charset=utf-8"
+    response = add_public_mailbox_response_headers(response, html_response=True)
+    return response
+
+
 def _recipient_link_public_mailbox_response(shared: str, recipient_email: str, *, response_format: str):
     row = resolve_recipient_link_public(shared, recipient_email)
     if row is None:
@@ -993,21 +1079,35 @@ def _recipient_link_public_mailbox_response(shared: str, recipient_email: str, *
     except RecipientLinkInputError:
         requested_recipient = str(row["recipient_email_normalized"] or "")
 
-    result = find_public_mailbox_messages(account, requested_recipient, 1)
     if response_format == "json":
+        result = find_public_mailbox_messages(account, requested_recipient, 1)
         status = int(result.get("status") or (200 if result.get("success") else 502))
         payload = {key: value for key, value in result.items() if key != "status"}
         return _recipient_link_public_json_response(payload, status)
 
-    response = public_mailbox_html_result_response(result)
-    response.headers["X-Robots-Tag"] = "noindex"
-    return response
+    loaded_limit = _recipient_link_public_page_limit(request.args.get("limit"))
+    result = find_public_mailbox_messages(account, requested_recipient, loaded_limit)
+    return _recipient_link_public_mailbox_page_response(
+        row,
+        account,
+        result,
+        shared=shared,
+        recipient_email=recipient_email,
+        loaded_limit=loaded_limit,
+    )
 
 
 @app.route("/show/<shared>/<path:recipient_email>", methods=["GET"])
 @recipient_link_no_store
 @csrf_exempt
 def api_public_recipient_mailbox_show(shared: str, recipient_email: str):
+    return _recipient_link_public_mailbox_response(shared, recipient_email, response_format="html")
+
+
+@app.route("/mailbox/<shared>/<path:recipient_email>", methods=["GET"])
+@recipient_link_no_store
+@csrf_exempt
+def api_public_recipient_mailbox_page(shared: str, recipient_email: str):
     return _recipient_link_public_mailbox_response(shared, recipient_email, response_format="html")
 
 
