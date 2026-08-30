@@ -240,13 +240,14 @@ def decode_recipient_txt(content: bytes) -> ParsedRecipientFile:
     return _parse_recipient_txt_lines(list(enumerate(decoded.splitlines(), start=1)))
 
 
-def decode_recipient_txt_with_main_email(content: bytes) -> tuple[str, ParsedRecipientFile]:
+def decode_recipient_txt_with_main_email(content: bytes) -> tuple[str, str, ParsedRecipientFile]:
     try:
         decoded = content.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise RecipientLinkInputError("invalid_utf8") from exc
 
     main_email = ""
+    main_line = ""
     recipient_lines: list[tuple[int, str]] = []
     found_main_email = False
     for line_number, raw_line in enumerate(decoded.splitlines(), start=1):
@@ -254,12 +255,13 @@ def decode_recipient_txt_with_main_email(content: bytes) -> tuple[str, ParsedRec
         if not found_main_email:
             if not line:
                 continue
+            main_line = line
             main_email = _recipient_email_from_import_line(line)
             found_main_email = True
             continue
         recipient_lines.append((line_number, raw_line))
 
-    return main_email, _parse_recipient_txt_lines(recipient_lines)
+    return main_email, main_line, _parse_recipient_txt_lines(recipient_lines)
 
 
 def safe_export_stem(value: Any) -> str:

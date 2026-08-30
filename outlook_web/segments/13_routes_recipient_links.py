@@ -152,11 +152,12 @@ def parse_recipient_import_request() -> dict[str, Any]:
         parsed = None
         file_error = None
         main_email = explicit_main_email if mode == "single" and explicit_main_email else ""
+        main_line = main_email
         try:
             if main_email:
                 parsed = decode_recipient_txt(content)
             else:
-                main_email, parsed = decode_recipient_txt_with_main_email(content)
+                main_email, main_line, parsed = decode_recipient_txt_with_main_email(content)
             total_bindings += len(parsed.recipients)
         except RecipientLinkInputError as exc:
             file_error = exc.code
@@ -165,6 +166,7 @@ def parse_recipient_import_request() -> dict[str, Any]:
             {
                 "source_file": source_file,
                 "main_email": main_email,
+                "main_line": main_line,
                 "parsed": parsed,
                 "file_error": file_error,
             }
@@ -402,7 +404,7 @@ def _recipient_import_export_response(export_items: list[dict[str, Any]], *, for
             )
         group = item
         return _recipient_link_attachment_response(
-            _recipient_link_txt_for_import_records(group["main_email"], group["records"]),
+            _recipient_link_txt_for_import_records(group["main_line"], group["records"]),
             "text/plain; charset=utf-8",
             _recipient_link_source_export_name(group["source_file"]),
         )
@@ -424,7 +426,7 @@ def _recipient_import_export_response(export_items: list[dict[str, Any]], *, for
             else:
                 archive.writestr(
                     _recipient_link_source_export_name(item["source_file"], used_names=used_names),
-                    _recipient_link_txt_for_import_records(item["main_email"], item["records"]),
+                    _recipient_link_txt_for_import_records(item["main_line"], item["records"]),
                 )
     timestamp = recipient_link_now().strftime("%Y%m%d-%H%M%S")
     return _recipient_link_attachment_response(
@@ -482,6 +484,7 @@ def api_import_recipient_verification_links():
                             "status": "failed",
                             "source_file": import_file["source_file"],
                             "main_email": import_file["main_email"],
+                            "main_line": import_file["main_line"],
                             "error_code": import_file["file_error"],
                             "errors": [],
                         }
@@ -505,6 +508,7 @@ def api_import_recipient_verification_links():
                             "status": "failed",
                             "source_file": import_file["source_file"],
                             "main_email": import_file["main_email"],
+                            "main_line": import_file["main_line"],
                             "error_code": "main_mailbox_not_found",
                             "errors": file_errors,
                         }
@@ -527,6 +531,7 @@ def api_import_recipient_verification_links():
                             "status": "failed",
                             "source_file": import_file["source_file"],
                             "main_email": import_file["main_email"],
+                            "main_line": import_file["main_line"],
                             "error_code": "no_valid_recipients",
                             "errors": file_errors,
                         }
@@ -582,6 +587,7 @@ def api_import_recipient_verification_links():
                             "status": "failed",
                             "source_file": import_file["source_file"],
                             "main_email": import_file["main_email"],
+                            "main_line": import_file["main_line"],
                             "error_code": "file_persistence_failed",
                             "errors": file_errors,
                         }
@@ -613,6 +619,7 @@ def api_import_recipient_verification_links():
                     "status": "success",
                     "source_file": import_file["source_file"],
                     "main_email": import_file["main_email"],
+                    "main_line": import_file["main_line"],
                     "records": records,
                 }
             )
@@ -864,8 +871,8 @@ def _recipient_link_txt_for_rows(rows: list[Any]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def _recipient_link_txt_for_import_records(main_email: str, records: list[dict[str, Any]]) -> bytes:
-    lines = [str(main_email or "").strip()]
+def _recipient_link_txt_for_import_records(main_line: str, records: list[dict[str, Any]]) -> bytes:
+    lines = [str(main_line or "").strip()]
     for record in records:
         lines.append(f"{record['recipient_email_display']}----{build_recipient_link_url(record['token'])}")
     return ("\n".join(lines) + "\n").encode("utf-8")

@@ -808,7 +808,12 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
 
         response = self.import_links(
             mode="single",
-            files=[("customers.txt", b"owner@example.com\nrecipient@example.com\n")],
+            files=[
+                (
+                    "customers.txt",
+                    b"owner@example.com----password----client-id----token\nrecipient@example.com\n",
+                )
+            ],
             auto_export="1",
         )
 
@@ -816,7 +821,7 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         self.assertEqual(response.content_type, "text/plain; charset=utf-8")
         self.assertIn("api-customers.txt", response.headers.get("Content-Disposition", ""))
         lines = response.get_data(as_text=True).splitlines()
-        self.assertEqual(lines[0], "owner@example.com")
+        self.assertEqual(lines[0], "owner@example.com----password----client-id----token")
         self.assertTrue(lines[1].startswith("recipient@example.com----http://localhost/api/v2/mailboxes/"))
         self.assertEqual(self.count_recipient_links(), 1)
 
@@ -847,8 +852,8 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         response = self.import_links(
             mode="batch",
             files=[
-                ("alpha-list.txt", b"alpha@example.com\none@example.com\n"),
-                ("beta-list.txt", b"beta@example.com\ntwo@example.com\n"),
+                ("alpha-list.txt", b"alpha@example.com----alpha-pass----alpha-token\none@example.com\n"),
+                ("beta-list.txt", b"beta@example.com----beta-pass----beta-token\ntwo@example.com\n"),
             ],
             auto_export="1",
         )
@@ -858,7 +863,7 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         archive = zipfile.ZipFile(io.BytesIO(response.get_data()))
         self.assertCountEqual(archive.namelist(), ["api-alpha-list.txt", "api-beta-list.txt"])
         alpha_lines = archive.read("api-alpha-list.txt").decode("utf-8").splitlines()
-        self.assertEqual(alpha_lines[0], "alpha@example.com")
+        self.assertEqual(alpha_lines[0], "alpha@example.com----alpha-pass----alpha-token")
         self.assertTrue(alpha_lines[1].startswith("one@example.com----http://localhost/api/v2/mailboxes/"))
         self.assertEqual(self.count_recipient_links(), 2)
 
