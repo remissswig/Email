@@ -1211,17 +1211,26 @@ def api_delete_recipient_verification_links_by_main_mailbox():
     db = get_db()
     db.execute("BEGIN")
     try:
-        cursor = db.execute(
-            "DELETE FROM recipient_mail_links WHERE account_id = ?",
-            (int(account["id"]),),
+        account_id = int(account["id"])
+        linked_count = int(
+            db.execute(
+                "SELECT COUNT(*) AS count FROM recipient_mail_links WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()["count"]
+            or 0
         )
+        mark_project_accounts_deleted_for_account_ids([account_id], db=db)
+        cursor = db.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+        if int(cursor.rowcount or 0) != 1:
+            db.rollback()
+            return recipient_link_json_error("main_mailbox_not_found", 404)
         db.commit()
         return recipient_link_json_response(
             {
                 "success": True,
-                "account_id": int(account["id"]),
+                "account_id": account_id,
                 "main_email": main_email,
-                "deleted_count": int(cursor.rowcount or 0),
+                "deleted_count": linked_count + 1,
             }
         )
     except Exception:

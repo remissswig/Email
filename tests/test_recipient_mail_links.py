@@ -1520,13 +1520,17 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(payload["account_id"], owner_id)
-        self.assertEqual(payload["deleted_count"], 2)
+        self.assertEqual(payload["deleted_count"], 3)
         with self.app_context():
             db = self.module.get_db()
             owner_account = db.execute(
                 "SELECT id FROM accounts WHERE id = ?",
                 (owner_id,),
             ).fetchone()
+            owner_aliases = db.execute(
+                "SELECT id FROM account_aliases WHERE account_id = ?",
+                (owner_id,),
+            ).fetchall()
             remaining = db.execute(
                 """
                 SELECT account_id, recipient_email_normalized
@@ -1534,7 +1538,8 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
                 ORDER BY account_id
                 """
             ).fetchall()
-        self.assertIsNotNone(owner_account)
+        self.assertIsNone(owner_account)
+        self.assertEqual(owner_aliases, [])
         self.assertEqual(len(remaining), 1)
         self.assertEqual(int(remaining[0]["account_id"]), other_id)
         self.assertEqual(remaining[0]["recipient_email_normalized"], "other-one@example.com")

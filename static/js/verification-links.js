@@ -209,7 +209,7 @@
     if (!has('mainEmailFilter')) return;
     const mainEmail = $('mainEmailFilter').value.trim();
     if (!mainEmail) return notify('请先选择主邮箱');
-    const message = `确认删除主邮箱 ${mainEmail} 下所有已导入收件人邮箱？不会删除主邮箱账号。`;
+    const message = `确认删除主邮箱 ${mainEmail} 及其全部已导入收件人邮箱？`;
     if (!confirm(message)) return;
     try {
       const data = await api('/api/verification-links/main-mailbox', {
