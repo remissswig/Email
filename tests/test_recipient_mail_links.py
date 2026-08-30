@@ -12,6 +12,7 @@ import uuid
 import zipfile
 from dataclasses import replace
 from unittest.mock import patch
+from urllib.parse import urlparse
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parents[1]
 WEB_OUTLOOK_APP_PATH = ROOT_DIR / "web_outlook_app.py"
@@ -417,6 +418,10 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
             ).fetchall()
             return [dict(row) for row in rows]
 
+    @staticmethod
+    def _public_link_parts(url: str) -> list[str]:
+        return urlparse(url).path.strip("/").split("/")
+
     def test_schema_has_recipient_link_constraints(self):
         with self.app_context():
             db = self.module.get_db()
@@ -667,7 +672,7 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
             files=[
                 (
                     "missing-main.txt",
-                    b"newowner@outlook.com\nrecipient01@example.com\nrecipient02@example.com\n",
+                    b"newowner@outlook.com----secret-pass----11111111-2222-3333-4444-555555555555----refresh-token\nrecipient01@example.com\nrecipient02@example.com\n",
                 )
             ],
         )
@@ -687,6 +692,9 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         with self.app_context():
             account = self.module.get_account_by_email("newowner@outlook.com")
             self.assertIsNotNone(account)
+            self.assertEqual(account["password"], "secret-pass")
+            self.assertEqual(account["client_id"], "11111111-2222-3333-4444-555555555555")
+            self.assertEqual(account["refresh_token"], "refresh-token")
         self.assertEqual(self.count_recipient_links(), 2)
 
     def test_import_single_file_prefers_outlook_email_among_multiple_candidates(self):
@@ -822,7 +830,7 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         self.assertIn("api-customers.txt", response.headers.get("Content-Disposition", ""))
         lines = response.get_data(as_text=True).splitlines()
         self.assertEqual(lines[0], "owner@example.com----password----client-id----token")
-        self.assertTrue(lines[1].startswith("recipient@example.com----http://localhost/api/v2/mailboxes/"))
+        self.assertTrue(lines[1].startswith("recipient@example.com----http://localhost/show/"))
         self.assertEqual(self.count_recipient_links(), 1)
 
     def test_import_auto_export_single_file_rejects_existing_main_mailbox_data(self):
@@ -835,7 +843,10 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
 
         response = self.import_links(
             mode="single",
-            files=[("customers.txt", b"owner@example.com\nrecipient@example.com\n")],
+            files=[(
+                "customers.txt",
+                b"owner@example.com----secret-pass----11111111-2222-3333-4444-555555555555----refresh-token\nrecipient@example.com\n",
+            )],
             auto_export="1",
         )
 
@@ -843,6 +854,12 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload["error_code"], "main_mailbox_data_exists")
         self.assertIn("owner@example.com", payload["error"])
+        with self.app_context():
+            account = self.module.get_account_by_email("owner@example.com")
+            self.assertIsNotNone(account)
+            self.assertEqual(account["password"], "secret-pass")
+            self.assertEqual(account["client_id"], "11111111-2222-3333-4444-555555555555")
+            self.assertEqual(account["refresh_token"], "refresh-token")
         self.assertEqual(self.count_recipient_links(), 1)
 
     def test_import_auto_export_batch_always_returns_zip_with_api_source_filenames(self):
@@ -864,7 +881,7 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         self.assertCountEqual(archive.namelist(), ["api-alpha-list.txt", "api-beta-list.txt"])
         alpha_lines = archive.read("api-alpha-list.txt").decode("utf-8").splitlines()
         self.assertEqual(alpha_lines[0], "alpha@example.com----alpha-pass----alpha-token")
-        self.assertTrue(alpha_lines[1].startswith("one@example.com----http://localhost/api/v2/mailboxes/"))
+        self.assertTrue(alpha_lines[1].startswith("one@example.com----http://localhost/show/"))
         self.assertEqual(self.count_recipient_links(), 2)
 
         response = self.import_links(
@@ -1405,9 +1422,22 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         self.assertEqual(len(payload["items"]), 2)
         for item in payload["items"]:
             self.assertIn("share_url", item)
-            self.assertTrue(item["share_url"].startswith("http://localhost/api/v2/mailboxes/"))
+            self.assertIn("query_url", item)
+            self.assertTrue(item["share_url"].startswith("http://localhost/show/"))
+            self.assertTrue(item["query_url"].startswith("http://localhost/query/"))
             self.assertNotIn("token_encrypted", item)
             self.assertNotIn("token_hash", item)
+
+        share_segments = {
+            self._public_link_parts(item["share_url"])[1]
+            for item in payload["items"]
+        }
+        query_segments = {
+            self._public_link_parts(item["query_url"])[1]
+            for item in payload["items"]
+        }
+        self.assertEqual(len(share_segments), 1)
+        self.assertEqual(share_segments, query_segments)
 
         active_all = self.client.get(
             "/api/verification-links?page=1&page_size=50&query=TARGET&status=all"
@@ -1707,7 +1737,7 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         body = response.get_data()
         lines = body.decode("utf-8").splitlines()
         self.assertEqual(lines[0], "Recipient01@iCloud.com")
-        self.assertTrue(lines[1].startswith("Recipient01@iCloud.com----http://localhost/api/v2/mailboxes/"))
+        self.assertTrue(lines[1].startswith("Recipient01@iCloud.com----http://localhost/show/"))
         self.assertTrue(body.endswith(b"\n"))
 
         group_one = self.seed_recipient_link(

@@ -1513,6 +1513,7 @@ def api_update_public_mailbox_api_key_auth():
 PUBLIC_MAILBOX_BATCH_SIZE = 50
 PUBLIC_MAILBOX_MAX_LIMIT = 20
 PUBLIC_MAILBOX_FORMATS = {'html', 'json'}
+PUBLIC_MAILBOX_SEARCH_FOLDERS = ('inbox', 'junkemail', 'deleteditems')
 PUBLIC_MAILBOX_HTML_CSP = (
     "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'"
 )
@@ -1643,50 +1644,32 @@ def find_public_mailbox_messages(
 ) -> Dict[str, Any]:
     matches: List[Dict[str, Any]] = []
     seen = set()
+    folder_errors: List[Dict[str, Any]] = []
     try:
         scan_limit = get_mailboxes_messages_scanned_count()
     except RuntimeError:
         scan_limit = MAILBOXES_MESSAGES_SCANNED_COUNT_DEFAULT
     scanned_count = 0
     skip = 0
-    should_scan = True
+    should_scan = str(account.get('account_type') or '').strip().lower() != 'imap'
     candidates_remain = False
 
-    if str(account.get('account_type') or '').strip().lower() == 'imap':
-        imap_result = fetch_account_imap_emails_by_recipient(
-            account,
-            'inbox',
-            recipient,
-            limit,
-            scan_limit,
-        )
-        if imap_result.get('recipient_search_supported') is False:
-            should_scan = True
-        elif not imap_result.get('success'):
-            return public_mailbox_upstream_error(imap_result)
-        else:
-            should_scan = False
+    if not should_scan:
+        for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
+            imap_result = fetch_account_imap_emails_by_recipient(
+                account,
+                folder_name,
+                recipient,
+                scan_limit,
+                scan_limit,
+            )
+            if imap_result.get('recipient_search_supported') is False:
+                should_scan = True
+                break
+            if not imap_result.get('success'):
+                folder_errors.append(imap_result)
+                continue
             strict_items = list(imap_result.get('emails') or [])
-            if not strict_items:
-                if 'scanned_count' in imap_result or 'scan_limit_reached' in imap_result:
-                    scan_limit_reached = bool(imap_result.get('scan_limit_reached'))
-                    return {
-                        'success': False,
-                        'status': 404,
-                        'error': (
-                            '鏈湪鎵弿鑼冨洿鍐呮壘鍒板尮閰嶉偖浠?'
-                            if scan_limit_reached
-                            else '鏈壘鍒板尮閰嶉偖浠?'
-                        ),
-                        'scan_limit_reached': scan_limit_reached,
-                        'scanned_count': int(imap_result.get('scanned_count') or 0),
-                    }
-                return {
-                    'success': False,
-                    'status': 404,
-                    'error': '未找到匹配邮件',
-                }
-
             for source in strict_items:
                 item = dict(source or {})
                 key = public_mailbox_message_key(item)
@@ -1696,34 +1679,52 @@ def find_public_mailbox_messages(
                 item['_request_method'] = 'imap'
                 matches.append(item)
 
-    if should_scan:
-        while scanned_count < scan_limit and len(matches) < limit:
-            page_size = min(
-                PUBLIC_MAILBOX_BATCH_SIZE,
-                scan_limit - scanned_count,
-            )
-            page = fetch_account_emails(account, 'inbox', skip, page_size)
-            if not page.get('success'):
-                return public_mailbox_upstream_error(page)
-
-            page_items = list(page.get('emails') or [])
-            items = page_items[:page_size]
-            candidates_remain = bool(page.get('has_more')) or len(page_items) > len(items)
-            request_method = str(page.get('request_method') or 'graph').strip().lower()
-            for source in items:
-                item = dict(source or {})
-                scanned_count += 1
-                key = public_mailbox_message_key(item)
-                if not key[2] or key in seen:
-                    continue
-                seen.add(key)
-                if public_mailbox_to_matches(item.get('to'), recipient):
-                    item['_request_method'] = request_method
-                    matches.append(item)
-
-            if len(matches) >= limit or not page.get('has_more') or not items:
+            if folder_name == 'inbox' and matches:
                 break
-            skip += len(items)
+
+        if not should_scan:
+            if folder_errors and not matches:
+                return public_mailbox_upstream_error(folder_errors[0])
+            if not matches:
+                return {
+                    'success': False,
+                    'status': 404,
+                    'error': '未找到匹配邮件',
+                }
+
+    if should_scan:
+        for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
+            folder_skip = 0
+            while scanned_count < scan_limit:
+                page_size = min(
+                    PUBLIC_MAILBOX_BATCH_SIZE,
+                    scan_limit - scanned_count,
+                )
+                page = fetch_account_emails(account, folder_name, folder_skip, page_size)
+                if not page.get('success'):
+                    return public_mailbox_upstream_error(page)
+
+                page_items = list(page.get('emails') or [])
+                items = page_items[:page_size]
+                candidates_remain = candidates_remain or bool(page.get('has_more')) or len(page_items) > len(items)
+                request_method = str(page.get('request_method') or 'graph').strip().lower()
+                for source in items:
+                    item = dict(source or {})
+                    scanned_count += 1
+                    key = public_mailbox_message_key(item)
+                    if not key[2] or key in seen:
+                        continue
+                    seen.add(key)
+                    if public_mailbox_to_matches(item.get('to'), recipient):
+                        item['_request_method'] = request_method
+                        matches.append(item)
+
+                if not page.get('has_more') or not items or scanned_count >= scan_limit:
+                    break
+                folder_skip += len(items)
+
+            if folder_name == 'inbox' and matches:
+                break
 
     matches.sort(
         key=lambda item: parse_email_datetime(item.get('date')) or datetime.min,

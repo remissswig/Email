@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import io
 import secrets
 import sqlite3
@@ -70,6 +72,27 @@ def generate_recipient_mail_token() -> str:
 
 def digest_recipient_mail_token(token: str) -> str:
     return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def _recipient_link_share_seed(account_id: int) -> bytes:
+    return f"recipient-mailbox:{int(account_id)}".encode("utf-8")
+
+
+def build_recipient_link_share_segment(account_id: int) -> str:
+    secret_key = str(app.secret_key or "").strip()
+    seed = _recipient_link_share_seed(account_id)
+    if secret_key:
+        digest = hmac.new(secret_key.encode("utf-8"), seed, hashlib.sha256).digest()
+    else:
+        digest = hashlib.sha256(seed).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _recipient_link_lookup_recipient_email(value: Any) -> str:
+    recipient = normalize_recipient_email(value)
+    local_part, domain = recipient.normalized.split("@", 1)
+    lookup_local_part = local_part.split("+", 1)[0] or local_part
+    return f"{lookup_local_part}@{domain}"
 
 
 def recipient_link_json_response(payload: dict[str, Any], status: int = 200):
@@ -167,6 +190,7 @@ def parse_recipient_import_request() -> dict[str, Any]:
                 "source_file": source_file,
                 "main_email": main_email,
                 "main_line": main_line,
+                "account_data": _recipient_import_account_payload(main_email, main_line),
                 "parsed": parsed,
                 "file_error": file_error,
             }
@@ -200,9 +224,57 @@ def _cleanup_recipient_import_savepoint(db, name: str) -> None:
         raise
 
 
-def _ensure_recipient_import_account(main_email: str) -> tuple[Any, bool]:
+def _recipient_import_account_payload(main_email: str, main_line: str) -> dict[str, Any]:
+    parsed = parse_outlook_account_string(main_line)
+    if not parsed:
+        return {}
+    parsed_email = str(parsed.get("email") or "").strip()
+    if parsed_email.lower() != str(main_email or "").strip().lower():
+        return {}
+    return parsed
+
+
+def _update_recipient_import_account_credentials(db, account_id: int, account_data: dict[str, Any]) -> None:
+    if not account_data:
+        return
+    refresh_token = str(account_data.get("refresh_token") or "").strip()
+    db.execute(
+        """
+        UPDATE accounts
+        SET password = ?,
+            client_id = ?,
+            refresh_token = ?,
+            account_type = 'outlook',
+            provider = 'outlook',
+            imap_host = ?,
+            imap_port = ?,
+            imap_password = '',
+            refresh_token_updated_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            encrypt_data(str(account_data.get("password") or "")),
+            str(account_data.get("client_id") or "").strip(),
+            encrypt_data(refresh_token),
+            IMAP_SERVER_NEW,
+            IMAP_PORT,
+            int(account_id),
+        ),
+    )
+
+
+def _ensure_recipient_import_account(main_email: str, main_line: str = "") -> tuple[Any, bool]:
+    account_data = _recipient_import_account_payload(main_email, main_line)
     account = resolve_account_by_address(main_email)
     if account is not None:
+        _update_recipient_import_account_credentials(
+            get_db(),
+            int(account["id"]),
+            account_data,
+        )
+        if account_data:
+            account = resolve_account_by_address(main_email)
         return account, False
 
     db = get_db()
@@ -210,15 +282,15 @@ def _ensure_recipient_import_account(main_email: str) -> tuple[Any, bool]:
         ACCOUNT_INSERT_SQL,
         build_account_insert_values(
             main_email,
-            "",
-            "",
-            "",
+            str(account_data.get("password") or ""),
+            str(account_data.get("client_id") or ""),
+            str(account_data.get("refresh_token") or ""),
             1,
             "",
-            "",
-            "auto",
-            "",
-            993,
+            "outlook",
+            "outlook",
+            IMAP_SERVER_NEW,
+            IMAP_PORT,
             "",
             False,
             None,
@@ -491,7 +563,10 @@ def api_import_recipient_verification_links():
                     )
                 continue
 
-            account, created_account = _ensure_recipient_import_account(import_file["main_email"])
+            account, created_account = _ensure_recipient_import_account(
+                import_file["main_email"],
+                import_file["main_line"],
+            )
             if account is None:
                 invalid_total += len(file_errors)
                 failed_files.append(
@@ -547,7 +622,10 @@ def api_import_recipient_verification_links():
                     or 0
                 )
                 if existing_count:
-                    db.rollback()
+                    if import_file["account_data"]:
+                        db.commit()
+                    else:
+                        db.rollback()
                     return recipient_link_json_error(
                         "main_mailbox_data_exists",
                         409,
@@ -708,10 +786,29 @@ def build_recipient_link_url(token: str) -> str:
     return f"{effective_recipient_link_base_url().rstrip('/')}/api/v2/mailboxes/{token}"
 
 
+def build_recipient_link_public_url(account_id: int, recipient_email: str, *, mode: str = "show") -> str:
+    normalized_mode = "query" if str(mode or "").strip().lower() == "query" else "show"
+    recipient = quote(str(recipient_email or "").strip(), safe="@._-+")
+    return (
+        f"{effective_recipient_link_base_url().rstrip('/')}/{normalized_mode}/"
+        f"{build_recipient_link_share_segment(account_id)}/{recipient}"
+    )
+
+
 def serialize_recipient_link(row) -> dict[str, Any]:
     record = _recipient_link_row(row, include_token=True)
     token = record.pop("token", "")
-    record["share_url"] = build_recipient_link_url(token)
+    record["share_url"] = build_recipient_link_public_url(
+        int(record["account_id"]),
+        str(record["recipient_email_display"] or "").strip(),
+        mode="show",
+    )
+    record["query_url"] = build_recipient_link_public_url(
+        int(record["account_id"]),
+        str(record["recipient_email_display"] or "").strip(),
+        mode="query",
+    )
+    record["legacy_share_url"] = build_recipient_link_url(token)
     return record
 
 
@@ -735,6 +832,32 @@ def resolve_recipient_link_token(token: Any):
         """,
         (digest_recipient_mail_token(normalized),),
     ).fetchone()
+
+
+def resolve_recipient_link_public(shared: Any, recipient_email: Any):
+    normalized_shared = str(shared or "").strip()
+    if not normalized_shared or len(normalized_shared) > 256:
+        return None
+    try:
+        recipient = normalize_recipient_email(recipient_email)
+        lookup_recipient = _recipient_link_lookup_recipient_email(recipient_email)
+    except RecipientLinkInputError:
+        return None
+
+    rows = get_db().execute(
+        """
+        SELECT l.*, a.id AS bound_account_exists
+        FROM recipient_mail_links AS l
+        LEFT JOIN accounts AS a ON a.id = l.account_id
+        WHERE l.recipient_email_normalized = ?
+        ORDER BY l.id
+        """,
+        (lookup_recipient,),
+    ).fetchall()
+    for row in rows:
+        if build_recipient_link_share_segment(int(row["account_id"])) == normalized_shared:
+            return row
+    return None
 
 
 def touch_primary_recipient_link(record_id: int) -> bool:
@@ -808,6 +931,93 @@ def api_public_recipient_mailbox_messages(token: str):
     return response
 
 
+def _recipient_link_public_json_response(payload: dict[str, Any], status: int = 200):
+    response = public_mailbox_json_response(payload, status)
+    response.headers["X-Robots-Tag"] = "noindex"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+def _recipient_link_public_mailbox_response(shared: str, recipient_email: str, *, response_format: str):
+    row = resolve_recipient_link_public(shared, recipient_email)
+    if row is None:
+        if response_format == "json":
+            return _recipient_link_public_json_response({"success": False, "error": "链接不存在"}, 404)
+        return recipient_link_html_response("链接不存在", 404)
+
+    expires_at = str(row["expires_at"] or "").strip()
+    if expires_at and expires_at <= recipient_link_timestamp():
+        if response_format == "json":
+            return _recipient_link_public_json_response({"success": False, "error": "链接已过期"}, 410)
+        return recipient_link_html_response("链接已过期", 410)
+
+    if not row["bound_account_exists"]:
+        if response_format == "json":
+            return _recipient_link_public_json_response({"success": False, "error": "链接不存在"}, 404)
+        return recipient_link_html_response("链接不存在", 404)
+
+    if CLUSTER_CONFIG.is_replica:
+        replica_state = _load_replica_state_with_repair()
+        is_ready, error_code = replica_readiness(
+            replica_state,
+            datetime.now(timezone.utc),
+            CLUSTER_CONFIG.max_stale_seconds,
+        )
+        if not is_ready:
+            if response_format == "json":
+                response = _replica_readiness_error_response(error_code, "json")
+                response.headers["X-Robots-Tag"] = "noindex"
+                return response
+            response = _replica_readiness_error_response(error_code, "html")
+            response.headers["X-Robots-Tag"] = "noindex"
+            return response
+
+    account = get_account_by_id(int(row["account_id"]))
+    if not account:
+        if response_format == "json":
+            return _recipient_link_public_json_response({"success": False, "error": "链接不存在"}, 404)
+        return recipient_link_html_response("链接不存在", 404)
+
+    if not CLUSTER_CONFIG.is_replica:
+        try:
+            touch_primary_recipient_link(int(row["id"]))
+        except Exception:
+            app.logger.exception("recipient mailbox access count update failed")
+            try:
+                get_db().rollback()
+            except sqlite3.Error:
+                app.logger.exception("recipient mailbox access count rollback failed")
+
+    try:
+        requested_recipient = normalize_recipient_email(recipient_email).normalized
+    except RecipientLinkInputError:
+        requested_recipient = str(row["recipient_email_normalized"] or "")
+
+    result = find_public_mailbox_messages(account, requested_recipient, 1)
+    if response_format == "json":
+        status = int(result.get("status") or (200 if result.get("success") else 502))
+        payload = {key: value for key, value in result.items() if key != "status"}
+        return _recipient_link_public_json_response(payload, status)
+
+    response = public_mailbox_html_result_response(result)
+    response.headers["X-Robots-Tag"] = "noindex"
+    return response
+
+
+@app.route("/show/<shared>/<path:recipient_email>", methods=["GET"])
+@recipient_link_no_store
+@csrf_exempt
+def api_public_recipient_mailbox_show(shared: str, recipient_email: str):
+    return _recipient_link_public_mailbox_response(shared, recipient_email, response_format="html")
+
+
+@app.route("/query/<shared>/<path:recipient_email>", methods=["GET"])
+@recipient_link_no_store
+@csrf_exempt
+def api_public_recipient_mailbox_query(shared: str, recipient_email: str):
+    return _recipient_link_public_mailbox_response(shared, recipient_email, response_format="json")
+
+
 def _recipient_link_escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
@@ -834,6 +1044,30 @@ def _recipient_link_rows_map_by_id(db, ids: list[int]) -> dict[int, Any]:
 
 def _recipient_link_group_key(account_id: int, main_email: str) -> tuple[int, str]:
     return int(account_id), str(main_email or "").strip().lower()
+
+
+def _recipient_link_account_export_line(account: dict[str, Any], fallback_main_email: str) -> str:
+    account_type = str(account.get("account_type") or "").strip().lower()
+    if account_type == "imap":
+        provider = str(account.get("provider") or "custom").strip().lower()
+        imap_password = str(account.get("imap_password") or "")
+        if not imap_password:
+            return fallback_main_email
+        if provider == "custom":
+            return (
+                f"{account.get('email', '')}----{imap_password}----"
+                f"{account.get('imap_host', '')}----{account.get('imap_port', 993)}"
+            )
+        return f"{account.get('email', '')}----{imap_password}"
+    if not any(
+        str(account.get(field) or "").strip()
+        for field in ("password", "client_id", "refresh_token")
+    ):
+        return fallback_main_email
+    return (
+        f"{account.get('email', '')}----{account.get('password', '')}----"
+        f"{account.get('client_id', '')}----{account.get('refresh_token', '')}"
+    )
 
 
 def _recipient_link_group_rows(rows: list[Any]) -> list[dict[str, Any]]:
@@ -864,17 +1098,36 @@ def _recipient_link_group_rows(rows: list[Any]) -> list[dict[str, Any]]:
 
 
 def _recipient_link_txt_for_rows(rows: list[Any]) -> bytes:
-    lines = [str(rows[0]["main_email_display"] or "").strip()] if rows else []
+    account_cache: dict[int, Any] = {}
+
+    def _main_line(row: Any) -> str:
+        account_id = int(row["account_id"])
+        if account_id not in account_cache:
+            account_cache[account_id] = get_account_by_id(account_id)
+        account = account_cache[account_id]
+        if account:
+            return _recipient_link_account_export_line(
+                account,
+                str(row["main_email_display"] or "").strip(),
+            )
+        return str(row["main_email_display"] or "").strip()
+
+    lines = [_main_line(rows[0])] if rows else []
     for row in rows:
-        token = decrypt_data(row["token_encrypted"] or "")
-        lines.append(f"{row['recipient_email_display']}----{build_recipient_link_url(token)}")
+        lines.append(
+            f"{row['recipient_email_display']}----"
+            f"{build_recipient_link_public_url(int(row['account_id']), row['recipient_email_display'], mode='show')}"
+        )
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def _recipient_link_txt_for_import_records(main_line: str, records: list[dict[str, Any]]) -> bytes:
     lines = [str(main_line or "").strip()]
     for record in records:
-        lines.append(f"{record['recipient_email_display']}----{build_recipient_link_url(record['token'])}")
+        lines.append(
+            f"{record['recipient_email_display']}----"
+            f"{build_recipient_link_public_url(int(record['account_id']), record['recipient_email_display'], mode='show')}"
+        )
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 

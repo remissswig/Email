@@ -26,7 +26,7 @@
 ### 升级到最新稳定分支构建
 
 ```bash
-docker pull ghcr.io/lemon-casino/email:latest
+docker pull seldomzq/email:latest
 docker compose down
 docker compose up -d
 ```
@@ -36,7 +36,7 @@ docker compose up -d
 建议正式环境优先使用明确版本号：
 
 ```bash
-docker pull ghcr.io/assast/outlookemail:v2.0.15
+docker pull seldomzq/email:v2.0.15
 docker compose down
 docker compose up -d
 ```
@@ -46,7 +46,7 @@ docker compose up -d
 ```yaml
 services:
   outlook-mail-reader:
-    image: ghcr.io/assast/outlookemail:v2.0.15
+    image: seldomzq/email:v2.0.15
 ```
 
 完成后执行：
@@ -108,7 +108,7 @@ python web_outlook_app.py
 ### Docker 回滚
 
 ```bash
-docker pull ghcr.io/assast/outlookemail:v2.0.13
+docker pull seldomzq/email:v2.0.13
 docker compose down
 docker compose up -d
 ```

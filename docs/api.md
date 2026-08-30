@@ -6,7 +6,8 @@
 
 - 基础地址：`http(s)://<host>:<port>`
 - 所有路由都在 `/api/*`
-- 接口分为两类：
+- 接口分为三类：
+  - 邮箱消息读取 API：`/api/v1/mailboxes/messages`，默认无需登录或密钥；开启接口密钥校验后使用专用 API Key
   - 对外 API：`/api/external/*`，使用 API Key
   - 完整管理 API：其余 `/api/*`，先登录 Web，再带 Session Cookie
 - 浏览器扩展可以使用 `POST /api/extension/login` 通过 Web 登录密码换取一次性跳转地址，再建立正常 Web Session
@@ -38,6 +39,12 @@
 | GET | `/api/external/accounts` | API Key | JSON | 获取普通邮箱账号列表 |
 | GET | `/api/external/emails` | API Key | JSON | 获取指定邮箱邮件列表 |
 | POST | `/api/external/outlook/upload` | API Key | JSON | 上传 Outlook 邮箱账号密码到上传表（默认未授权，支持单条/批量） |
+
+### 邮箱消息读取 API
+
+| 方法 | 路径 | 鉴权 | 返回类型 | 说明 |
+| --- | --- | --- | --- | --- |
+| GET | `/api/v1/mailboxes/messages` | 默认无；开关开启时专用 API Key | HTML / JSON | 在一个已配置账户中按实际 `To` 收件人读取最新邮件正文 |
 
 ### 分组、账号、标签、项目
 
@@ -142,6 +149,11 @@
 | POST | `/api/settings/validate-cron` | Session + CSRF | JSON | 校验 Cron 表达式 |
 | GET | `/api/settings` | Session | JSON | 获取系统设置 |
 | PUT | `/api/settings` | Session + CSRF | JSON | 更新系统设置 |
+| GET | `/api/settings/public-mailbox-api-keys` | Session | JSON | 获取邮箱消息接口鉴权状态和专用密钥元数据 |
+| POST | `/api/settings/public-mailbox-api-keys` | Session + CSRF | JSON | 创建系统生成或管理员指定的专用密钥 |
+| GET | `/api/settings/public-mailbox-api-keys/<id>/secret` | Session | JSON | 重新查看专用密钥明文 |
+| DELETE | `/api/settings/public-mailbox-api-keys/<id>` | Session + CSRF | JSON | 删除专用密钥并立即使其失效 |
+| PUT | `/api/settings/public-mailbox-api-key-auth` | Session + CSRF | JSON | 开启或关闭邮箱消息接口鉴权 |
 | POST | `/api/settings/test-forward-channel` | Session + CSRF | JSON | 直接测试转发渠道 |
 | GET | `/api/skins` | Session | JSON | 获取系统级外观皮肤列表与当前皮肤 |
 | POST | `/api/skins/<skin_id>/activate` | Session + CSRF | JSON | 启用指定皮肤 |
@@ -342,6 +354,161 @@ AI 客户端应优先判断 `success`，再兼容 `error` 既可能是字符串�
 1. 把外部邮箱 B 的邮件自动转发到本项目管理的邮箱 A
 2. 在邮箱 A 下把邮箱 B 设置为别名
 3. 后续直接通过本项目 API，用邮箱 B 作为 `email` 参数取邮件或取验证码
+
+## 邮箱消息读取 API
+
+### GET `/api/v1/mailboxes/messages`
+
+当前行为说明：
+
+- `limit` 省略或留空时默认为 `1`。
+- `format` 省略或留空时默认为 `html`，因此响应为 `text/html`。
+- 使用未绑定密钥，或关闭鉴权时，`mainemail` 省略、为空或仅包含空白字符会继续使用 `email` 的值定位系统中的主邮箱或别名。
+- 使用已绑定邮箱的密钥时可以省略 `mainemail`，服务端直接使用密钥绑定的账户；仍传入 `mainemail` 时只能填写该账户的主邮箱或别名。
+- `format=json` 仍受支持，而 `format=html` 仍要求 `limit=1`。
+- `mailboxes_messages_scanned_count` 在 Web 界面 `系统设置 -> 外部 API 密钥` 中配置，默认值为 `100`，取值范围 `1..10000`，保存后立即生效。
+- 一个共享的候选邮件预算覆盖 Graph、New Outlook IMAP、Old Outlook IMAP 的分页扫描，以及 Generic IMAP 的严格候选校验和在支持 `HEADER TO` 但搜索结果为空时的仅头部恢复扫描。
+- `scanned_count` 只统计实际检查过的候选邮件数，不统计 IMAP 命令、批次或搜索结果条数；只有预算耗尽且仍有未检查候选时，才返回 `scan_limit_reached: true`。
+- Generic IMAP 先尝试服务器端 `HEADER TO` 搜索；如果服务器明确不支持搜索，则回退到旧的列表扫描。如果搜索受支持但结果为空，则进入按最新到最旧排序的分批仅头部恢复，逐批读取 `To`、`Subject`、`From`、`Date`，并对解析后的 `To` 做精确匹配。
+- 候选读取失败与超时仍分别返回 `502` / `504`，不会并入普通 `404` 未命中。
+
+该接口在一个已配置的普通邮箱账户中查找实际 `To` 收件人匹配的最新邮件，只查询 `inbox`，不查询垃圾邮件，也不跨账户搜索。
+
+鉴权总开关默认关闭，以保持现有公开调用兼容。关闭时，服务端完全忽略 `X-API-Key` 请求头和 `key` 查询参数，不查询密钥表，也不更新密钥的最近使用时间。任何知道 `mainemail` 和 `email` 的访问者都可能读取匹配邮件的完整正文，因此公网部署应尽快完成下面的迁移并开启鉴权。
+
+总开关开启后，调用必须提供在 Web 界面 `系统设置 -> 外部 API 密钥` 中创建的专用密钥。该密钥只授权 `GET /api/v1/mailboxes/messages`，不授权 `/api/external/*`；现有通用 `external_api_key` 也不能调用本接口。
+
+创建密钥时可选择绑定一个已配置的邮箱账户。绑定后，外部调用不再需要暴露主邮箱，只需传入目标收件人：
+
+```bash
+curl -H "X-API-Key: pmk_bound_key" \
+  "https://mail.example.com/api/v1/mailboxes/messages?email=recipient@example.test"
+```
+
+浏览器直接打开时，也可通过 URL 传入绑定密钥：
+
+```text
+https://mail.example.com/api/v1/mailboxes/messages?email=recipient@example.test&key=pmk_bound_key
+```
+
+未绑定密钥保持旧调用方式，现有调用方无需迁移：
+
+```text
+https://mail.example.com/api/v1/mailboxes/messages?mainemail=owner@example.com&email=recipient@example.test&key=pmk_legacy_key
+```
+
+绑定密钥也兼容显式传入与绑定账户一致的主邮箱或别名。若 `mainemail` 指向其他账户，服务端返回 `403`，不会回退到未绑定模式。密钥绑定的账户被删除时，该密钥会一并删除，避免意外扩大访问范围。
+
+若请求中存在 `X-API-Key` 请求头，服务端只校验该请求头；即使请求头为空或无效，也不会回退到 `key` 查询参数。鉴权发生在查询参数校验、账户解析和邮箱读取之前。有效密钥的 `last_used_at` 最多每 60 秒更新一次。
+
+查询参数可能进入浏览器历史和反向代理日志。自定义密钥中的空格、Unicode 和 URL 保留字符还必须正确进行 URL 编码，因此程序调用应始终使用请求头，并优先使用系统生成的密钥。
+
+建议迁移顺序：
+
+1. 在系统设置中创建至少一个专用密钥。
+2. 将所有调用方更新为发送该密钥，并验证调用成功。
+3. 打开“接口密钥校验”总开关。
+
+#### 查询参数
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `mainemail` | string | 否 | 使用绑定密钥时可省略，显式传入时必须属于绑定账户；使用未绑定密钥或关闭鉴权时，省略、为空或仅包含空白字符会使用 `email` 的值定位账户 |
+| `email` | string | 是 | 目标收件人，与邮件 `To` 中解析出的完整邮箱地址进行大小写不敏感匹配 |
+| `limit` | int | 否 | 默认 `1`；不传、空字符串或仅包含空白符时也按 `1` 处理；范围 `1..20`；`format=html` 时必须为 `1` |
+| `format` | string | 否 | `json` 或 `html`；不传、空字符串或仅包含空白符时默认 `html`；显式传 `format=json` 时仍返回 JSON |
+| `key` | string | 否 | 鉴权开启时可用的专用密钥；仅用于浏览器兼容，程序调用推荐使用 `X-API-Key` |
+
+匹配基于标准邮件地址解析，而不是字符串包含。示例：
+
+- `Hide My Email <recipient@example.test>` 匹配 `recipient@example.test`
+- `TARGET@EXAMPLE.COM` 匹配 `target@example.com`
+- `user@example.com.evil.test` 不匹配 `user@example.com`
+- 只读取 `To`；仅出现在 `Cc`、`Bcc` 或正文中的地址不匹配
+
+若地址包含 `+`，建议编码为 `%2B`。接口也会从原始查询字符串读取地址，避免未编码的 `+` 被转换为空格。
+
+`format` 不传、为空或仅包含空白符时会回退到 HTML 响应；只有显式传 `format=json` 时才返回 JSON。`limit` 不传、为空或仅包含空白符时都会回落到 `1`。
+
+#### 默认 HTML 请求示例（省略 `limit` / `format`）
+
+```bash
+curl -H "X-API-Key: pmk_your-key" \
+  "http://localhost:5000/api/v1/mailboxes/messages?mainemail=xxx@example.com&email=recipient@example.test"
+```
+
+成功时直接返回邮件正文：
+
+```http
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+Cache-Control: no-store
+Content-Security-Policy: sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+
+<p>邮件正文</p>
+```
+
+若邮件只有纯文本正文，服务端会先进行 HTML 转义，再使用 `<pre>` 包裹。HTML 安全策略会阻止脚本、表单、跳转和远程图片，因此部分邮件的外部图片不会显示。
+
+#### 空白参数仍使用默认 HTML
+
+```bash
+curl -H "X-API-Key: pmk_your-key" \
+  "http://localhost:5000/api/v1/mailboxes/messages?mainemail=xxx@example.com&email=recipient@example.test&limit=%20%20%20&format=%20%20%20"
+```
+
+该请求与省略 `limit` / `format` 的效果相同：仍返回 `text/html; charset=utf-8`，并按 `limit=1` 处理。
+
+#### 显式 JSON 请求示例
+
+```bash
+curl -H "X-API-Key: pmk_your-key" \
+  "http://localhost:5000/api/v1/mailboxes/messages?mainemail=alias@example.com&email=recipient@example.test&limit=2&format=json"
+```
+
+```json
+{
+  "success": true,
+  "count": 1,
+  "messages": [
+    {
+      "id": "AAMk...",
+      "subject": "Verification code",
+      "from": "sender@example.com",
+      "to": "Hide My Email <recipient@example.test>",
+      "received_at": "2026-08-21T10:00:00Z",
+      "body": "<p>Your code is 123456</p>",
+      "body_type": "html"
+    }
+  ]
+}
+```
+
+JSON 响应包含完整正文，不只是邮件列表预览，并带有 `Cache-Control: no-store`。
+
+#### 查询边界
+
+- Graph、New Outlook IMAP 与 Old Outlook IMAP 维持现有分页扫描行为：从账户收件箱最新邮件开始，每批查询 50 封，找到足够结果后停止；本次请求最多检查的候选邮件数由 `mailboxes_messages_scanned_count` 控制，默认 `100`，允许范围 `1..10000`。
+- Generic IMAP 在服务器支持 `HEADER TO` 搜索时，会先按最新到最旧执行候选搜索；若搜索结果为空，则切换到按最新到最旧排序的分批仅头部恢复，逐批读取 `To`、`Subject`、`From`、`Date` 并对解析后的 `To` 做精确匹配。只有当服务器不支持 `HEADER TO` 搜索时，才回退到现有的每批 50 封列表扫描。
+- `scanned_count` 表示本次请求实际检查过的候选邮件数量；只有当预算耗尽且仍有未检查候选时，JSON 响应才返回带 `scan_limit_reached: true` 的 HTTP `404`。HTML 响应统一显示“当前无邮件”并返回 HTTP `200`。
+- Generic IMAP `HEADER TO` 路径不会跳过当前候选去返回更旧邮件；候选读取失败仍按 `502` 处理，超时仍按 `504` 处理。
+- 当邮箱约有 774 封邮件且需要覆盖全部历史范围时，建议将 `mailboxes_messages_scanned_count` 设为至少 `1000`；数值越大，IMAP 工作量和响应时间越高。
+
+#### 状态码
+
+| 状态码 | 场景 |
+| --- | --- |
+| `200` | 成功返回 HTML 正文或 JSON 消息列表；HTML 模式未找到匹配邮件时也返回此状态并显示“当前无邮件” |
+| `400` | 缺少或非法地址、格式无效、limit 越界，或 HTML 格式的 limit 不是 1 |
+| `401` | 鉴权开启且未提供专用 API 密钥 |
+| `403` | 鉴权开启且密钥无效、已删除或已过期；绑定账户不存在，或显式 `mainemail` 与密钥绑定账户不一致 |
+| `404` | `mainemail` 无法解析到账户；JSON 模式未找到匹配邮件时也返回此状态，如果扫描预算已用尽且仍有未检查候选，会额外带 `scan_limit_reached: true` |
+| `502` | 所有可用邮箱读取方式均失败，或邮件详情读取失败 |
+| `504` | 邮箱列表或详情查询超时 |
+
+`format=html` 或省略/留空 `format` 时，参数错误、鉴权错误、主邮箱不存在、上游查询失败或超时都返回 `text/html; charset=utf-8`，响应体只包含提示文字，不附加页面结构或样式；这些响应保留对应的 `400`、`401`、`403`、`404`、`502` 或 `504` 状态码，只有“当前无邮件”使用 `200`。显式 `format=json` 时仍返回原有 JSON 数据和状态码。无效格式（例如 `format=xml`）尚未选择有效的 HTML 输出，因此返回 JSON `400`。错误响应不会透传刷新令牌、密码、代理地址或上游错误详情，并带有 `Cache-Control: no-store`。该路由不添加 CORS 响应头。
 
 ## 对外 API
 
@@ -1998,6 +2165,35 @@ POST /api/cloudflare/channels
 注意：Microsoft 授权码通常只能使用一次。为已有账号重新授权时，应直接调用 `/api/accounts/<account_id>/reauthorize`，不要先调用 `/api/oauth/exchange-token` 预览后再重复提交同一个回调 URL。
 
 ## 设置接口
+
+### 邮箱消息接口密钥管理
+
+以下接口要求已登录的 Web Session。`POST`、`DELETE` 和 `PUT` 写操作继续受 CSRF 保护，所有响应（包括未登录和 CSRF 失败）都包含 `Cache-Control: no-store`。
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/settings/public-mailbox-api-keys` | 返回 `auth_enabled`、掩码和元数据，不返回密钥明文 |
+| `POST` | `/api/settings/public-mailbox-api-keys` | 创建系统生成或管理员指定的密钥 |
+| `GET` | `/api/settings/public-mailbox-api-keys/<id>/secret` | 重新查看完整密钥 |
+| `DELETE` | `/api/settings/public-mailbox-api-keys/<id>` | 物理删除并立即使调用失效 |
+| `PUT` | `/api/settings/public-mailbox-api-key-auth` | 立即开启或关闭邮箱消息接口鉴权 |
+
+创建请求接受以下字段：
+
+| 字段 | 类型 | 必填 | 规则 |
+| --- | --- | --- | --- |
+| `name` | string | 是 | 去除首尾空白后 `1..80` 个字符 |
+| `remark` | string | 否 | 去除首尾空白后最多 500 个字符 |
+| `expires_at` | string / null | 否 | `null`、空字符串或带时区的未来 ISO 8601 时间；不传表示永久 |
+| `secret` | string / null | 否 | 缺失、`null` 或空字符串时由服务端生成；非空时使用管理员指定值 |
+
+系统生成的密钥格式为 `pmk_` 加 `secrets.token_urlsafe(32)`。管理员指定的 `secret` 去除首尾空白后必须为 `1..512` 个字符，内部空格、Unicode 和特殊字符保持不变，不要求 `pmk_` 前缀。非字符串、仅空白或超过 512 个字符返回 `400`；摘要重复返回 `409`，不会覆盖已有密钥。界面默认推荐系统生成，并提供永久、7 天、30 天和自定义到期时间。
+
+创建成功响应和 `GET /<id>/secret` 会返回完整密钥；列表接口返回用于后续查看或删除的 `id`、掩码、`key_suffix`、名称、备注、状态、到期时间、创建时间和最近使用时间，不返回完整密钥。密钥状态包括 `active`、`expiring_soon`（少于 72 小时到期）和 `expired`。四个字符或更短的自定义密钥不会在掩码中泄露任何后缀。
+
+`PUT /api/settings/public-mailbox-api-key-auth` 的请求体只能是 `{"enabled": true}` 或 `{"enabled": false}`。字符串、数字、`null`、数组或缺失值返回 `400`。即使尚无密钥也允许开启；开启前应先按上文迁移顺序更新调用方。密钥列表响应中的 `auth_enabled` 是服务端持久化的真实状态。
+
+完整密钥使用由 `SECRET_KEY` 派生的 Fernet 密钥加密保存，同时保存 SHA-256 摘要用于鉴权索引，并保存最多四个字符的明文后缀用于掩码显示；数据库不保存完整密钥明文。服务器部署必须固定并备份 `SECRET_KEY`；更换或丢失后，已有密钥仍可按摘要鉴权，但管理员无法重新查看明文，只能删除并重新创建。
 
 ### POST `/api/settings/validate-cron`
 

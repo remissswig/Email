@@ -20,7 +20,7 @@
 
 ```bash
 # 拉取最新镜像
-docker pull ghcr.io/lemon-casino/email:latest
+docker pull seldomzq/email:latest
 
 # 运行容器
 docker run -d \
@@ -29,7 +29,7 @@ docker run -d \
   -v $(pwd)/data:/app/data \
   -e LOGIN_PASSWORD=admin123 \
   -e SECRET_KEY=your-secret-key-here \
-  ghcr.io/lemon-casino/email:latest
+  seldomzq/email:latest
 
 # 查看日志
 docker logs -f outlook-mail-reader
@@ -79,6 +79,146 @@ gunicorn -k gthread -w 1 --threads ${GUNICORN_THREADS:-4} ...
 
 如需调整并发，请优先调整 `GUNICORN_THREADS`，不要增加 worker 数。
 
+## Linux 服务器一键安装
+
+安装脚本支持 Ubuntu、Debian、CentOS、RHEL、Rocky Linux 和 AlmaLinux。脚本会检测 Docker Engine 与 Docker Compose Plugin；缺少时通过 Docker 官方 CE 软件源安装，并启动 Docker 服务。
+
+在希望部署的目录执行。脚本内嵌 `docker-compose.yml`，不会下载项目源码或要求手工创建配置文件；脚本会在当前目录生成 Compose 配置、`.env` 和 `data` 目录：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/seldom1024/email-scripts/refs/heads/master/install.sh)
+```
+
+root 用户直接运行即可；非 root 用户脚本会按需调用 `sudo`。如果使用仓库内的脚本文件，也可以执行 `bash scripts/install.sh`。需要指定其他部署目录时使用 `--install-dir PATH`（`--project-dir` 仍兼容）。默认使用 `seldomzq/email:latest`、容器名 `outlook-mail-reader` 和宿主端口 `5000`；命令末尾增加 `--v 3.6` 即部署 `seldomzq/email:3.6`，增加 `--n test-mail` 可自定义容器名，增加 `--p 5001` 可指定宿主端口。
+
+脚本首次运行会提示输入 `LOGIN_PASSWORD` 和 `SECRET_KEY`。直接回车会生成安全随机值，并将配置保存到 `.env`（权限 `600`）。已有非空值会在重复运行时复用，不会因为重新安装而更换 `SECRET_KEY`。
+
+默认宿主端口为 `5000`。如果端口已被占用，脚本会要求输入 `1024-65535` 范围内的可用端口；也可以通过 `--p PORT` 显式指定端口。显式指定的端口无效或已被占用时脚本会直接失败，不会等待交互输入；容器内部端口始终为 `5000`。
+
+每次运行都会执行：
+
+```bash
+docker compose -f docker-compose.yml pull
+docker compose -f docker-compose.yml up -d
+```
+
+即使本地已有 `seldomzq/email:latest`，也会检查 Docker Hub 的最新镜像。远程拉取失败时脚本会停止，不会静默使用旧本地镜像。脚本不会删除其他容器、镜像、数据目录或数据卷。
+
+安装完成后，脚本会输出访问 URL、容器名称、登录密码和 `SECRET_KEY`。升级时保留 `.env` 与 `./data`，再次执行同一脚本或运行上面的 Compose 命令即可。
+
+## 分布式只读副本
+
+这套副本复制协议不依赖 Nginx Proxy Manager。主节点默认仍按现有方式运行；副本节点只需要单独指定 `NODE_ROLE=replica`、`MASTER_URL` 和本地独立的 `SECRET_KEY`。
+
+副本的首次安装可以直接在空目录执行：
+
+```bash
+bash scripts/install-node.sh --master https://PRIMARY_HOST --node-id NODE_ID --master-fingerprint SHA256:...
+```
+
+脚本会在当前目录生成 `docker-compose.yml`、`.env` 和 `data/cluster/identity.db`，并在重复运行时复用已有身份、重新拉取所选版本的 `seldomzq/email` 镜像。增加 `--v 3.6` 可部署 `seldomzq/email:3.6`，增加 `--n test-mail` 可自定义副本容器名，增加 `--p 5001` 可指定宿主端口，省略时分别使用 `latest`、`outlook-mail-reader` 和 `5000`。`LOGIN_PASSWORD` 不参与副本运行；`SECRET_KEY` 为空时会自动生成并保存。
+
+副本只同步 `/api/v1/mailboxes/messages` 所需的数据。公共 API Key 只保留鉴权与绑定所需的最小字段，不会同步可恢复密钥、名称或备注；因此副本列表页只应依赖摘要、后缀、绑定账号和过期信息。
+
+副本在首次快照前不会提供邮件查询；如果最后一次成功同步距当前超过 24 小时，邮件查询也会停止。可用的健康接口是：
+
+```text
+/health/live
+/health/ready
+/api/v1/cluster/status
+```
+
+### Enrollment、凭据轮换与恢复
+
+主节点设置页的“节点管理”可以创建节点、生成一次性 enrollment token，并显示包含 `MASTER_URL`、节点 ID 和主节点指纹的安装命令。token 只在结果窗口中显示一次，不会写入 `.env` 或 Compose 文件。副本安装脚本首次运行时从标准输入读取 token；重复运行会校验并复用本地身份，然后先拉取最新镜像再启动。
+
+节点凭据轮换由主节点发起，副本在收到新版本并成功提交后再确认；撤销会立即阻止该节点继续同步，只有状态为 `revoked` 的节点才允许删除。删除或损坏副本的 `data/cluster/identity.db` 后，必须重新创建/签发节点并执行一次新的 enrollment，不能把另一台机器的身份库复制过来。
+
+主节点会按事件保留周期清理增量事件。副本发现游标早于保留窗口时会收到 `snapshot_required`，自动重新拉取完整快照。备份时应将 `.env`、`SECRET_KEY` 和 `data/cluster/identity.db` 视为密钥材料单独保护；不要把副本身份库恢复到另一节点，也不要把 enrollment token 放入备份。更换副本主机时使用新的本地 `SECRET_KEY` 并重新 enrollment。
+
+同步请求和响应在应用层使用 X25519/HKDF 派生密钥、AES-GCM 加密和 HMAC 请求签名，因此即使节点之间暂时通过公网 HTTP，邮箱凭据、API key 和邮件数据也不会以明文出现在同步载荷中。但 HTTP 仍会暴露流量元数据并允许主动网络攻击，生产环境应优先使用 HTTPS 或可信专网；应用层加密不是 TLS 的替代品。
+
+## Nginx Proxy Manager 一键安装
+
+如果希望由 Nginx Proxy Manager（NPM）提供唯一公网入口，请在一个独立的部署目录执行：
+
+```bash
+mkdir outlook-email-npm
+cd outlook-email-npm
+bash <(curl -fsSL https://raw.githubusercontent.com/seldom1024/Email/refs/heads/feature/public-mailbox-messages/scripts/install-with-npm.sh)
+```
+
+NPM 安装命令支持可选的 `--v VERSION` 和 `--n CONTAINER_NAME` 参数，例如 `--v 3.6 --n test-mail`；省略时分别使用 `seldomzq/email:latest` 和 `outlook-mail-reader`。自定义容器名后，Proxy Host 的 Forward Hostname / IP 也应填写该名称。
+
+仓库内脚本也可直接运行：
+
+```bash
+bash scripts/install-with-npm.sh
+```
+
+脚本支持与普通一键安装相同的 Linux 发行版、Docker 自动安装、root/sudo 判断、`--install-dir PATH` 和 `--project-dir PATH`。它会在安装目录生成：
+
+```text
+docker-compose.yml
+.env
+npm/data/
+npm/letsencrypt/
+email/data/
+```
+
+其中 NPM 与邮件服务的数据目录相互隔离。`.env` 权限为 `600`；已有 `LOGIN_PASSWORD` 和 `SECRET_KEY` 会在重复执行时复用。
+
+### 网络和端口
+
+两个容器加入名为 `npm` 的可附加 Docker 网络。只有 NPM 发布宿主机端口：
+
+- `80`: HTTP 代理入口
+- `443`: HTTPS 代理入口
+- `81`: NPM 管理页面
+
+邮件服务不映射宿主机 `5000` 端口，因此不能访问 `http://SERVER_IP:5000`。它只能由同一 Docker 网络中的 NPM 通过 `outlook-mail-reader:5000` 访问。
+
+启动前脚本会检查 `80`、`443` 和 `81`。只要任一端口被其他进程或容器占用，脚本就会列出冲突端口并停止；不会关闭占用服务，也不会询问替代端口。重复执行时，由脚本自己的 `nginx-proxy-manager` 容器占用这些端口属于正常状态。
+
+### NPM 配置
+
+安装完成后打开：
+
+```text
+http://SERVER_IP:81
+```
+
+完成 NPM 首次初始化，然后创建 Proxy Host。域名或公网 IP 按实际部署填写，上游必须使用 Docker 容器名称，而不是 `localhost`：
+
+```text
+Scheme: http
+Forward Hostname / IP: outlook-mail-reader
+Forward Port: 5000
+```
+
+在 Proxy Host 创建完成前，邮件服务不会从公网直接访问。只有公网 IP、没有域名时可以先使用 HTTP；申请受信任的 HTTPS 证书通常需要一个解析到该服务器的域名。
+
+### 启动与升级顺序
+
+每次运行脚本都会按以下顺序执行：
+
+1. 拉取 `jc21/nginx-proxy-manager:latest`。
+2. 启动 NPM，并等待管理端口 `81` 可用。
+3. 拉取 `seldomzq/email:latest`。
+4. 启动 `outlook-mail-reader`，并从容器内部检查端口 `5000`。
+
+本地已有镜像时仍会拉取远程最新版本。任何镜像拉取失败都会停止，不会使用缓存旧镜像继续启动。邮件服务启动失败时，已经正常运行的 NPM 会保留，脚本不会执行破坏性回滚。
+
+脚本会覆盖安装目录中的 `docker-compose.yml`，因此不要在包含其他 Compose 项目的目录运行。重复执行不会删除 `npm/data`、`npm/letsencrypt`、`email/data`、镜像或数据卷。
+
+排查命令：
+
+```bash
+docker compose ps
+docker compose logs --tail 100 npm
+docker compose logs --tail 100 outlook-mail-reader
+```
+
 ## 使用 Docker Compose
 
 ```yaml
@@ -86,7 +226,7 @@ version: '3.8'
 
 services:
   outlook-mail-reader:
-    image: ghcr.io/lemon-casino/email:latest
+    image: seldomzq/email:latest
     container_name: outlook-mail-reader
     ports:
       - "5000:5000"
@@ -171,10 +311,15 @@ ports:
 
 ### 可用镜像标签
 
-- `ghcr.io/lemon-casino/email:latest` - 默认分支最近一次符合条件的稳定构建
-- `ghcr.io/assast/outlookemail:main` - `main` 分支最近一次符合条件的构建
-- `ghcr.io/assast/outlookemail:dev` - `dev` 分支最近一次符合条件的构建
-- `ghcr.io/assast/outlookemail:vX.Y.Z` - 指定正式版本镜像，由手动发版工作流生成
+- `seldomzq/email:latest` - 默认分支最近一次符合条件的稳定构建
+- `seldomzq/email:main` - `main` 分支最近一次符合条件的构建
+- `seldomzq/email:dev` - `dev` 分支最近一次符合条件的构建
+- `seldomzq/email:vX.Y.Z` - 指定正式版本镜像，由手动发版工作流生成
+
+GitHub Actions 发布到 Docker Hub 需要在仓库的 Actions secrets 中配置：
+
+- `DOCKERHUB_USERNAME`: `seldomzq`
+- `DOCKERHUB_TOKEN`: Docker Hub Access Token（不要填写账户密码）
 
 补充说明：
 
@@ -185,7 +330,7 @@ ports:
 ### 更新镜像
 
 ```bash
-docker pull ghcr.io/lemon-casino/email:latest
+docker pull seldomzq/email:latest
 docker-compose down
 docker-compose up -d
 ```
@@ -193,13 +338,13 @@ docker-compose up -d
 ### 自己构建镜像（可选）
 
 ```bash
-docker build -t outlook-mail-reader .
+docker build -t outlookemail:local .
 docker run -d \
   --name outlook-mail-reader \
   -p 5000:5000 \
   -v $(pwd)/data:/app/data \
   -e LOGIN_PASSWORD=admin123 \
-  outlook-mail-reader
+  outlookemail:local
 ```
 
 ## 生产环境部署

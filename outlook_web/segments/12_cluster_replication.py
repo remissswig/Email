@@ -75,7 +75,7 @@ _REPLICA_ALLOWED_EXACT_PATHS = {
     '/api/v1/cluster/sync/pull',
     '/api/v1/cluster/sync/ack',
 }
-_REPLICA_ALLOWED_PREFIXES = ('/static/', '/api/v2/mailboxes/')
+_REPLICA_ALLOWED_PREFIXES = ('/static/', '/api/v2/mailboxes/', '/show/', '/query/')
 
 
 def _replica_request_is_allowed(path: str) -> bool:
