@@ -874,13 +874,21 @@ def email_header_matches_address(header_value: Any, target_email: str) -> bool:
     if not target:
         return False
 
+    candidates = []
+    for candidate in build_email_query_candidates(target):
+        normalized_candidate = normalize_email_address(candidate)
+        if normalized_candidate and normalized_candidate not in candidates:
+            candidates.append(normalized_candidate)
+    if not candidates:
+        return False
+
     if isinstance(header_value, (list, tuple, set)):
         headers = [str(value or '') for value in header_value]
     else:
         headers = [str(header_value or '')]
 
     return any(
-        normalize_email_address(address) == target
+        normalize_email_address(address) in candidates
         for _display_name, address in email.utils.getaddresses(headers)
         if address
     )
@@ -3309,9 +3317,31 @@ def parse_imap_account_string(account_str: str, provider: str = 'custom', imap_h
     }
 
 
+def infer_account_import_provider(email_addr: str, provider: str = 'outlook') -> str:
+    provider_key = normalize_provider(provider, email_addr)
+    if provider_key == 'custom':
+        provider_key = infer_provider_from_email(email_addr)
+    return provider_key
+
+
+def looks_like_imap_host_port(third: str, fourth: str) -> bool:
+    third = str(third or '').strip()
+    fourth = str(fourth or '').strip()
+    if not third or not fourth.isdigit():
+        return False
+    return '.' in third or ':' in third or third.lower() == 'localhost'
+
+
 def parse_account_import(account_str: str, account_format: str = 'client_id_refresh_token',
                          provider: str = 'outlook', imap_host: str = '', imap_port: int = 993) -> Optional[Dict]:
-    provider_key = normalize_provider(provider, account_str.split('----', 1)[0].strip() if account_str else '')
-    if provider_key == 'outlook':
-        return parse_outlook_account_string(account_str, account_format)
+    parts = [part.strip() for part in str(account_str or '').strip().split('----')]
+    if len(parts) < 2 or not parts[0]:
+        return None
+
+    provider_key = infer_account_import_provider(parts[0], provider)
+    if len(parts) >= 4:
+        if provider_key == 'outlook' or not looks_like_imap_host_port(parts[2], parts[3]):
+            parsed = parse_outlook_account_string(account_str, account_format)
+            if parsed:
+                return parsed
     return parse_imap_account_string(account_str, provider_key, imap_host, imap_port)

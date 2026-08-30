@@ -117,6 +117,12 @@ class PublicMailboxMessageHelperTests(unittest.TestCase):
             'user@example.com',
         ))
 
+    def test_matches_plus_tag_aliases_against_base_address(self):
+        self.assertTrue(web_outlook_app.public_mailbox_to_matches(
+            'Hide My Email <meaty.payers0p@icloud.com>',
+            'meaty.payers0p+aa@icloud.com',
+        ))
+
     def test_query_defaults(self):
         parsed, error = web_outlook_app.parse_public_mailbox_message_query({
             'mainemail': 'Owner@Example.com',

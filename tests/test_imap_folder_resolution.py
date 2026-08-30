@@ -1,0 +1,5070 @@
+import importlib
+import json
+import os
+import tempfile
+import threading
+import unittest
+from email.message import EmailMessage
+from unittest.mock import patch
+
+
+os.environ.setdefault('SECRET_KEY', 'test-secret-key')
+_temp_dir = tempfile.mkdtemp(prefix='outlookEmail-tests-')
+os.environ['DATABASE_PATH'] = os.path.join(_temp_dir, 'test.db')
+
+web_outlook_app = importlib.import_module('web_outlook_app')
+
+
+class FakeMail:
+    def __init__(self, selectable=None, list_entries=None, selectable_by_mode=None):
+        self.selectable = set(selectable or [])
+        self.selectable_by_mode = dict(selectable_by_mode or {})
+        self.list_entries = list_entries or []
+        self.select_calls = []
+        self.logged_out = False
+        self.xatom_calls = []
+
+    def login(self, *_args, **_kwargs):
+        return 'OK', [b'logged in']
+
+    def xatom(self, name, *args):
+        self.xatom_calls.append((name, args))
+        return 'OK', [b'ID completed']
+
+    def select(self, name, readonly=True):
+        self.select_calls.append((name, readonly))
+        if (name, readonly) in self.selectable_by_mode:
+            return self.selectable_by_mode[(name, readonly)]
+        if name in self.selectable:
+            return 'OK', [b'']
+        return 'NO', [b'folder not found']
+
+    def list(self):
+        return 'OK', self.list_entries
+
+    def uid(self, *_args, **_kwargs):
+        return 'OK', [b'']
+
+    def search(self, *_args, **_kwargs):
+        return 'OK', [b'']
+
+    def fetch(self, *_args, **_kwargs):
+        return 'OK', [b'']
+
+    def logout(self):
+        self.logged_out = True
+        return 'BYE', [b'logout']
+
+
+class ImapFolderResolutionTests(unittest.TestCase):
+    def test_2925_domain_maps_to_builtin_provider(self):
+        meta = web_outlook_app.get_provider_meta('custom', 'user@2925.com')
+
+        self.assertEqual(meta['key'], '2925')
+        self.assertEqual(meta['imap_host'], 'imap.2925.com')
+        self.assertEqual(meta['imap_port'], 993)
+
+    def test_icloud_domain_infers_builtin_imap_provider(self):
+        meta = web_outlook_app.get_provider_meta('auto', 'user@icloud.com')
+
+        self.assertEqual(meta['key'], 'icloud')
+        self.assertEqual(meta['imap_host'], 'imap.mail.me.com')
+        self.assertEqual(meta['imap_port'], 993)
+
+    def test_parse_account_import_uses_icloud_imap_for_two_part_lines(self):
+        parsed = web_outlook_app.parse_account_import('user@icloud.com----app-password', 'client_id_refresh_token', 'auto')
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed['email'], 'user@icloud.com')
+        self.assertEqual(parsed['provider'], 'icloud')
+        self.assertEqual(parsed['account_type'], 'imap')
+        self.assertEqual(parsed['imap_host'], 'imap.mail.me.com')
+        self.assertEqual(parsed['imap_port'], 993)
+        self.assertEqual(parsed['imap_password'], 'app-password')
+        self.assertEqual(parsed['password'], '')
+        self.assertEqual(parsed['client_id'], '')
+        self.assertEqual(parsed['refresh_token'], '')
+
+    def test_parse_outlook_import_default_order(self):
+        parsed = web_outlook_app.parse_outlook_account_string(
+            'user@outlook.com----password123----24d9a0ed-8787-4584-883c-2fd79308940a----0.AXEA_refresh',
+            'client_id_refresh_token',
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed['client_id'], '24d9a0ed-8787-4584-883c-2fd79308940a')
+        self.assertEqual(parsed['refresh_token'], '0.AXEA_refresh')
+
+    def test_parse_outlook_import_reversed_order_even_when_selector_is_default(self):
+        parsed = web_outlook_app.parse_outlook_account_string(
+            'user@outlook.com----password123----0.AXEA_refresh----24d9a0ed-8787-4584-883c-2fd79308940a',
+            'client_id_refresh_token',
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed['client_id'], '24d9a0ed-8787-4584-883c-2fd79308940a')
+        self.assertEqual(parsed['refresh_token'], '0.AXEA_refresh')
+
+    def test_email_query_candidates_combine_plus_and_gmail_suffix_fallbacks(self):
+        candidates = web_outlook_app.build_email_query_candidates('User+Team+Code@Gmail.com')
+
+        self.assertEqual(candidates, [
+            'user+team+code@gmail.com',
+            'user+team@gmail.com',
+            'user@gmail.com',
+            'user+team+code@googlemail.com',
+            'user+team@googlemail.com',
+            'user@googlemail.com',
+        ])
+
+    def test_email_query_candidates_do_not_add_gmail_suffix_for_other_domains(self):
+        candidates = web_outlook_app.build_email_query_candidates('alias+team@example.com')
+
+        self.assertEqual(candidates, [
+            'alias+team@example.com',
+            'alias@example.com',
+        ])
+
+    def test_resolve_126_inbox_from_listed_folder(self):
+        mail = FakeMail(
+            selectable={'INBOX.收件箱'},
+            list_entries=[
+                b'(\\HasNoChildren) "." "INBOX.Archive"',
+                '(\\HasNoChildren) "." "INBOX.收件箱"'.encode('utf-8'),
+            ],
+        )
+
+        selected, diagnostics = web_outlook_app.resolve_imap_folder(mail, '126', 'inbox', readonly=True)
+
+        self.assertEqual(selected, 'INBOX.收件箱')
+        self.assertIn('INBOX.收件箱', diagnostics.get('matched_folders', []))
+        self.assertNotIn('INBOX.Archive', diagnostics.get('matched_folders', []))
+
+    def test_resolve_junk_folder_from_terminal_alias(self):
+        mail = FakeMail(
+            selectable={'INBOX.Spam'},
+            list_entries=[b'(\\HasNoChildren) "." "INBOX.Spam"'],
+        )
+
+        selected, diagnostics = web_outlook_app.resolve_imap_folder(mail, 'custom', 'junkemail', readonly=True)
+
+        self.assertEqual(selected, 'INBOX.Spam')
+        self.assertEqual(diagnostics.get('matched_folders'), ['INBOX.Spam'])
+
+    def test_imap_folder_not_found_returns_available_folders(self):
+        mail = FakeMail(
+            selectable=set(),
+            list_entries=[b'(\\HasNoChildren) "." "INBOX"', b'(\\HasNoChildren) "." "INBOX.Archive"'],
+        )
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='deleteditems',
+                provider='custom',
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'IMAP_FOLDER_NOT_FOUND')
+        details = json.loads(result['error']['details'])
+        self.assertEqual(details['folder'], 'deleteditems')
+        self.assertEqual(details['provider'], 'custom')
+        self.assertEqual(details['available_folders'], ['INBOX', 'INBOX.Archive'])
+        self.assertTrue(mail.logged_out)
+
+    def test_gmail_imap_list_uses_internaldate_for_sorting(self):
+        raw_old_header = (
+            b"Subject: older-header\r\n"
+            b"From: sender@example.com\r\n"
+            b"To: user@gmail.com\r\n"
+            b"Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n"
+            b"\r\n"
+            b"body old\r\n"
+        )
+        raw_new_header = (
+            b"Subject: newer-header\r\n"
+            b"From: sender@example.com\r\n"
+            b"To: user@gmail.com\r\n"
+            b"Date: Mon, 01 Jan 2026 00:00:00 +0000\r\n"
+            b"\r\n"
+            b"body new\r\n"
+        )
+
+        class GmailListMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b'1 2']
+                if command == 'FETCH':
+                    uid = args[0]
+                    uid_text = uid.decode('utf-8') if isinstance(uid, (bytes, bytearray)) else str(uid)
+                    if uid_text == '1':
+                        return 'OK', [(
+                            b'1 (FLAGS () INTERNALDATE "14-Apr-2026 10:00:00 +0000" RFC822 {128}',
+                            raw_old_header,
+                        )]
+                    if uid_text == '2':
+                        return 'OK', [(
+                            b'2 (FLAGS () INTERNALDATE "13-Apr-2026 10:00:00 +0000" RFC822 {128}',
+                            raw_new_header,
+                        )]
+                return super().uid(command, *args, **kwargs)
+
+        mail = GmailListMail(selectable={'INBOX'})
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic(
+                email_addr='user@gmail.com',
+                imap_password='app-password',
+                imap_host='imap.gmail.com',
+                provider='gmail',
+                folder='inbox',
+                top=20,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual([item['id'] for item in result['emails']], ['1', '2'])
+        self.assertEqual(result['emails'][0]['date'], '14-Apr-2026 10:00:00 +0000')
+        self.assertTrue(mail.logged_out)
+
+    def test_custom_imap_has_more_tracks_older_pages(self):
+        class PaginatedMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b' '.join(str(index).encode('utf-8') for index in range(1, 46))]
+                if command == 'FETCH':
+                    uid = args[0]
+                    uid_text = uid.decode('utf-8') if isinstance(uid, (bytes, bytearray)) else str(uid)
+                    minute = int(uid_text) % 60
+                    internal_date = f'14-Apr-2026 08:{minute:02d}:00 +0000'
+                    raw_email = (
+                        f"Subject: page message {uid_text}\r\n"
+                        "From: sender@example.com\r\n"
+                        "To: user@example.com\r\n"
+                        f"Date: Tue, 14 Apr 2026 08:{minute:02d}:00 +0000\r\n"
+                        "\r\n"
+                        "hello\r\n"
+                    ).encode('utf-8')
+                    return 'OK', [(
+                        f'{uid_text} (FLAGS () INTERNALDATE "{internal_date}" RFC822 {{{len(raw_email)}}}'.encode('utf-8'),
+                        raw_email,
+                    )]
+                return super().uid(command, *args, **kwargs)
+
+        def fetch_page(skip):
+            mail = PaginatedMail(selectable={'INBOX'})
+            with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+                result = web_outlook_app.get_emails_imap_generic(
+                    email_addr='user@example.com',
+                    imap_password='secret',
+                    imap_host='imap.example.com',
+                    provider='custom',
+                    folder='inbox',
+                    skip=skip,
+                    top=20,
+                )
+            self.assertTrue(result['success'])
+            self.assertTrue(mail.logged_out)
+            return result
+
+        first_page = fetch_page(0)
+        middle_page = fetch_page(20)
+        final_page = fetch_page(40)
+
+        self.assertEqual(first_page['emails'][0]['id'], '45')
+        self.assertTrue(first_page['has_more'])
+        self.assertEqual(middle_page['emails'][0]['id'], '25')
+        self.assertTrue(middle_page['has_more'])
+        self.assertEqual(final_page['emails'][0]['id'], '5')
+        self.assertFalse(final_page['has_more'])
+
+    def test_gmail_imap_list_reads_seen_flag_from_split_fetch_response(self):
+        raw_email = (
+            b"Subject: seen-mail\r\n"
+            b"From: sender@example.com\r\n"
+            b"To: user@gmail.com\r\n"
+            b"Date: Tue, 14 Apr 2026 08:20:50 +0000\r\n"
+            b"\r\n"
+            b"hello gmail\r\n"
+        )
+
+        class GmailSeenMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b'11']
+                if command == 'FETCH':
+                    return 'OK', [
+                        (
+                            b'11 (INTERNALDATE "14-Apr-2026 08:20:50 +0000" RFC822 {128}',
+                            raw_email,
+                        ),
+                        b' FLAGS (\\Seen))',
+                    ]
+                return super().uid(command, *args, **kwargs)
+
+        mail = GmailSeenMail(selectable={'INBOX'})
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic(
+                email_addr='user@gmail.com',
+                imap_password='app-password',
+                imap_host='imap.gmail.com',
+                provider='gmail',
+                folder='inbox',
+                top=20,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(len(result['emails']), 1)
+        self.assertTrue(result['emails'][0]['is_read'])
+        self.assertEqual(result['emails'][0]['subject'], 'seen-mail')
+        self.assertTrue(mail.logged_out)
+
+    def test_parse_email_datetime_accepts_parenthesized_timezone_name(self):
+        parsed = web_outlook_app.parse_email_datetime('Tue, 14 Apr 2026 08:20:50 +0000 (UTC)')
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.year, 2026)
+        self.assertEqual(parsed.month, 4)
+        self.assertEqual(parsed.day, 14)
+
+    def test_fallback_from_examine_to_select_for_126_inbox(self):
+        mail = FakeMail(
+            selectable_by_mode={
+                ('INBOX', True): ('NO', [b'EXAMINE not supported']),
+                ('"INBOX"', True): ('NO', [b'EXAMINE not supported']),
+                ('INBOX', False): ('OK', [b'12']),
+            },
+            list_entries=[b'(\\HasNoChildren) "." "INBOX"'],
+        )
+
+        selected, diagnostics = web_outlook_app.resolve_imap_folder(mail, '126', 'inbox', readonly=True)
+
+        self.assertEqual(selected, 'INBOX')
+        self.assertEqual(diagnostics.get('fallback_mode'), 'select')
+        self.assertIn(('INBOX', True), mail.select_calls)
+        self.assertIn(('INBOX', False), mail.select_calls)
+
+    def test_unsafe_login_is_classified_as_provider_block(self):
+        unsafe = "Unsafe Login. Please contact kefu@188.com for help"
+        mail = FakeMail(
+            selectable_by_mode={
+                ('INBOX', True): ('NO', [unsafe.encode('utf-8')]),
+                ('"INBOX"', True): ('NO', [unsafe.encode('utf-8')]),
+                ('INBOX', False): ('NO', [unsafe.encode('utf-8')]),
+                ('"INBOX"', False): ('NO', [unsafe.encode('utf-8')]),
+            },
+            list_entries=[b'(\\HasNoChildren) "." "INBOX"'],
+        )
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic(
+                email_addr='user@126.com',
+                imap_password='secret',
+                imap_host='imap.126.com',
+                folder='inbox',
+                provider='126',
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'IMAP_UNSAFE_LOGIN_BLOCKED')
+        self.assertEqual(result['error']['status'], 403)
+        self.assertEqual(result['error']['code'], 'IMAP_UNSAFE_LOGIN_BLOCKED')
+        self.assertIn('Unsafe Login', result['error']['message'])
+        self.assertEqual(mail.xatom_calls[0][0], 'ID')
+
+    def test_send_imap_id_after_login(self):
+        mail = FakeMail(
+            selectable={'INBOX'},
+            list_entries=[b'(\\HasNoChildren) "." "INBOX"'],
+        )
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic(
+                email_addr='user@126.com',
+                imap_password='secret',
+                imap_host='imap.126.com',
+                folder='inbox',
+                provider='126',
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(mail.xatom_calls[0][0], 'ID')
+        payload = mail.xatom_calls[0][1][0]
+        self.assertIn('"name" "outlookEmail"', payload)
+        self.assertIn('"version"', payload)
+
+    def test_imap_recipient_search_returns_newest_confirmed_matches(self):
+        latest_header = (
+            b"To: Match Recipient <target@example.com>\r\n"
+            b"Subject: newest match\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 09:20:50 +0000\r\n"
+            b"\r\n"
+        )
+        older_header = (
+            b"To: target@example.com\r\n"
+            b"Subject: older match\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 08:20:50 +0000\r\n"
+            b"\r\n"
+        )
+
+        class RecipientSearchMail(FakeMail):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.uid_calls = []
+
+            def uid(self, command, *args, **kwargs):
+                self.uid_calls.append((command, args))
+                if command == 'SEARCH':
+                    return 'OK', [b'11 22']
+                if command == 'FETCH':
+                    uid = args[0]
+                    uid_text = uid.decode('utf-8') if isinstance(uid, (bytes, bytearray)) else str(uid)
+                    if uid_text == '22':
+                        return 'OK', [(
+                            b'22 (INTERNALDATE "14-Apr-2026 09:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            latest_header,
+                        )]
+                    if uid_text == '11':
+                        return 'OK', [(
+                            b'11 (INTERNALDATE "14-Apr-2026 08:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            older_header,
+                        )]
+                return super().uid(command, *args, **kwargs)
+
+        mail = RecipientSearchMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=2,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['method'], 'IMAP (Generic Recipient Search)')
+        self.assertTrue(result['recipient_search_supported'])
+        self.assertFalse(result['has_more'])
+        self.assertEqual([item['id'] for item in result['emails']], ['22', '11'])
+        self.assertEqual(result['emails'][0]['subject'], 'newest match')
+        self.assertEqual(result['emails'][1]['subject'], 'older match')
+        self.assertEqual(
+            mail.uid_calls[0],
+            ('SEARCH', (None, 'HEADER', 'TO', 'target@example.com')),
+        )
+        fetch_queries = [
+            args[1]
+            for command, args in mail.uid_calls
+            if command == 'FETCH'
+        ]
+        self.assertTrue(fetch_queries)
+        self.assertTrue(all('BODY.PEEK[HEADER.FIELDS' in query for query in fetch_queries))
+        self.assertTrue(all('RFC822' not in query for query in fetch_queries))
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_falls_back_to_plain_search_when_uid_search_is_rejected(self):
+        raw_header = (
+            b"To: target@example.com\r\n"
+            b"Subject: sequence match\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 10:20:50 +0000\r\n"
+            b"\r\n"
+        )
+
+        class RecipientSearchFallbackMail(FakeMail):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.uid_search_attempted = False
+                self.sequence_search_attempted = False
+                self.uid_fetch_attempted = False
+
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    self.uid_search_attempted = True
+                    return 'BAD', [b'UID SEARCH unsupported']
+                if command == 'FETCH':
+                    self.uid_fetch_attempted = True
+                return super().uid(command, *args, **kwargs)
+
+            def search(self, *_args, **_kwargs):
+                self.sequence_search_attempted = True
+                return 'OK', [b'7']
+
+            def fetch(self, message_id, _query):
+                return 'OK', [(
+                    b'7 (INTERNALDATE "14-Apr-2026 10:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                    raw_header,
+                )]
+
+        mail = RecipientSearchFallbackMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=1,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertTrue(mail.uid_search_attempted)
+        self.assertTrue(mail.sequence_search_attempted)
+        self.assertFalse(mail.uid_fetch_attempted)
+        self.assertEqual(result['emails'][0]['id'], '7')
+        self.assertEqual(result['emails'][0]['id_mode'], 'sequence')
+
+    def test_imap_recipient_search_rejects_substring_candidates_until_exact_match(self):
+        false_positive_header = (
+            b"To: target@example.com.evil@example.net\r\n"
+            b"Subject: false positive\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 11:20:50 +0000\r\n"
+            b"\r\n"
+        )
+        exact_match_header = (
+            b"To: Friendly Name <target@example.com>\r\n"
+            b"Subject: exact match\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 10:20:50 +0000\r\n"
+            b"\r\n"
+        )
+
+        class StrictRecipientMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b'31 32']
+                if command == 'FETCH':
+                    uid = args[0]
+                    uid_text = uid.decode('utf-8') if isinstance(uid, (bytes, bytearray)) else str(uid)
+                    if uid_text == '32':
+                        return 'OK', [(
+                            b'32 (INTERNALDATE "14-Apr-2026 11:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            false_positive_header,
+                        )]
+                    if uid_text == '31':
+                        return 'OK', [(
+                            b'31 (INTERNALDATE "14-Apr-2026 10:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            exact_match_header,
+                        )]
+                return super().uid(command, *args, **kwargs)
+
+        mail = StrictRecipientMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=1,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(len(result['emails']), 1)
+        self.assertEqual(result['emails'][0]['id'], '31')
+        self.assertEqual(result['emails'][0]['subject'], 'exact match')
+
+    def test_imap_recipient_search_uses_actual_fetch_mode_for_id_mode(self):
+        raw_header = (
+            b"To: target@example.com\r\n"
+            b"Subject: sequence fetch winner\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 12:20:50 +0000\r\n"
+            b"\r\n"
+        )
+
+        class FetchModeRecipientMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b'99']
+                if command == 'FETCH':
+                    return 'NO', [b'UID FETCH unsupported']
+                return super().uid(command, *args, **kwargs)
+
+            def fetch(self, message_id, query):
+                if str(message_id) == '99':
+                    return 'OK', [(
+                        b'99 (INTERNALDATE "14-Apr-2026 12:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                        raw_header,
+                    )]
+                return 'NO', [b'not found']
+
+        mail = FetchModeRecipientMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=1,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(len(result['emails']), 1)
+        self.assertEqual(result['emails'][0]['id'], '99')
+        self.assertEqual(result['emails'][0]['id_mode'], 'sequence')
+        self.assertEqual(result['emails'][0]['subject'], 'sequence fetch winner')
+
+    def test_imap_recipient_search_supports_empty_ok_payload(self):
+        class EmptyRecipientSearchMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b'']
+                return super().uid(command, *args, **kwargs)
+
+        mail = EmptyRecipientSearchMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=1,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['emails'], [])
+        self.assertTrue(result['recipient_search_supported'])
+        self.assertFalse(result['has_more'])
+        self.assertEqual(result['method'], 'IMAP (Generic Recipient Search)')
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_recovers_from_supported_empty_search_with_header_scan(self):
+        newest_other_header = (
+            b"To: Other Person <other@example.com>\r\n"
+            b"Subject: newest other\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 11:20:50 +0000\r\n"
+            b"\r\n"
+        )
+        exact_display_name_header = (
+            b"To: Litany Muster <01litany_muster@icloud.com>\r\n"
+            b"Subject: exact display name match\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 10:20:50 +0000\r\n"
+            b"\r\n"
+        )
+        oldest_other_header = (
+            b"To: oldest@example.com\r\n"
+            b"Subject: oldest other\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 09:20:50 +0000\r\n"
+            b"\r\n"
+        )
+
+        class FalseEmptyRecipientSearchMail(FakeMail):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.uid_calls = []
+                self.fetch_calls = []
+
+            def uid(self, command, *args, **kwargs):
+                self.uid_calls.append((command, args))
+                if command == 'SEARCH' and args == (None, 'HEADER', 'TO', '01litany_muster@icloud.com'):
+                    return 'OK', [b'']
+                if command == 'SEARCH' and args == (None, 'ALL'):
+                    return 'OK', [b'10 20 30']
+                if command == 'FETCH':
+                    if args[0] != b'30,20,10':
+                        return 'NO', [b'unexpected uid set']
+                    if args[1] != '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (TO SUBJECT FROM DATE)])':
+                        return 'NO', [b'unexpected fetch query']
+                    return 'OK', [
+                        (
+                            b'30 (UID 30 INTERNALDATE "14-Apr-2026 11:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            newest_other_header,
+                        ),
+                        b')',
+                        (
+                            b'20 (UID 20 INTERNALDATE "14-Apr-2026 10:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            exact_display_name_header,
+                        ),
+                        b')',
+                        (
+                            b'10 (UID 10 INTERNALDATE "14-Apr-2026 09:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            oldest_other_header,
+                        ),
+                        b')',
+                    ]
+                return super().uid(command, *args, **kwargs)
+
+            def fetch(self, message_id, query):
+                self.fetch_calls.append((message_id, query))
+                return 'NO', [b'sequence fetch should not run']
+
+        mail = FalseEmptyRecipientSearchMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@163.com',
+                imap_password='secret',
+                imap_host='imap.163.com',
+                folder='inbox',
+                provider='163',
+                recipient='01litany_muster@icloud.com',
+                limit=1,
+                scan_limit=50,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['scanned_count'], 2)
+        self.assertFalse(result['scan_limit_reached'])
+        self.assertEqual([item['id'] for item in result['emails']], ['20'])
+        self.assertEqual(result['emails'][0]['subject'], 'exact display name match')
+        self.assertEqual(result['emails'][0]['id_mode'], 'uid')
+        self.assertEqual(
+            mail.uid_calls[:2],
+            [
+                ('SEARCH', (None, 'HEADER', 'TO', '01litany_muster@icloud.com')),
+                ('SEARCH', (None, 'ALL')),
+            ],
+        )
+        self.assertEqual(mail.fetch_calls, [])
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_recovery_uses_exists_count_when_general_search_is_also_empty(self):
+        newest_other_header = (
+            b"To: newest@example.com\r\n"
+            b"Subject: newest other\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 11:20:50 +0000\r\n"
+            b"\r\n"
+        )
+        exact_match_header = (
+            b"To: Match Recipient <target@example.com>\r\n"
+            b"Subject: exists fallback match\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 10:20:50 +0000\r\n"
+            b"\r\n"
+        )
+        oldest_other_header = (
+            b"To: oldest@example.com\r\n"
+            b"Subject: oldest other\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 09:20:50 +0000\r\n"
+            b"\r\n"
+        )
+
+        class ExistsFallbackRecipientSearchMail(FakeMail):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.uid_calls = []
+                self.sequence_fetch_calls = []
+
+            def uid(self, command, *args, **kwargs):
+                self.uid_calls.append((command, args))
+                if command == 'SEARCH' and args == (None, 'HEADER', 'TO', 'target@example.com'):
+                    return 'OK', [b'']
+                if command == 'SEARCH' and args == (None, 'ALL'):
+                    return 'OK', [b'']
+                if command == 'FETCH':
+                    return 'NO', [b'UID FETCH unsupported']
+                return super().uid(command, *args, **kwargs)
+
+            def fetch(self, message_id, query):
+                self.sequence_fetch_calls.append((message_id, query))
+                if str(message_id) != '3,2,1':
+                    return 'NO', [b'unexpected sequence set']
+                if query != '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (TO SUBJECT FROM DATE)])':
+                    return 'NO', [b'unexpected fetch query']
+                return 'OK', [
+                    (
+                        b'3 (UID 300 INTERNALDATE "14-Apr-2026 11:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                        newest_other_header,
+                    ),
+                    b')',
+                    (
+                        b'2 (UID 200 INTERNALDATE "14-Apr-2026 10:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                        exact_match_header,
+                    ),
+                    b')',
+                    (
+                        b'1 (UID 100 INTERNALDATE "14-Apr-2026 09:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                        oldest_other_header,
+                    ),
+                    b')',
+                ]
+
+        mail = ExistsFallbackRecipientSearchMail(
+            selectable_by_mode={('INBOX', True): ('OK', [b'3'])},
+            list_entries=[b'(\\HasNoChildren) "." "INBOX"'],
+        )
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@163.com',
+                imap_password='secret',
+                imap_host='imap.163.com',
+                folder='inbox',
+                provider='163',
+                recipient='target@example.com',
+                limit=1,
+                scan_limit=10,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['scanned_count'], 2)
+        self.assertFalse(result['scan_limit_reached'])
+        self.assertEqual([item['id'] for item in result['emails']], ['2'])
+        self.assertEqual(result['emails'][0]['id_mode'], 'sequence')
+        self.assertEqual(
+            mail.uid_calls[:2],
+            [
+                ('SEARCH', (None, 'HEADER', 'TO', 'target@example.com')),
+                ('SEARCH', (None, 'ALL')),
+            ],
+        )
+        self.assertEqual(
+            mail.sequence_fetch_calls,
+            [('3,2,1', '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (TO SUBJECT FROM DATE)])')],
+        )
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_exists_sequence_ids_do_not_fallback_to_uid_fetch(self):
+        class ExistsSequenceNoUidFallbackMail(FakeMail):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.uid_calls = []
+                self.sequence_fetch_calls = []
+
+            def uid(self, command, *args, **kwargs):
+                self.uid_calls.append((command, args))
+                if command == 'SEARCH' and args == (None, 'HEADER', 'TO', 'target@example.com'):
+                    return 'OK', [b'']
+                if command == 'SEARCH' and args == (None, 'ALL'):
+                    return 'OK', [b'']
+                if command == 'FETCH':
+                    return 'NO', [b'uid fallback should not happen']
+                return super().uid(command, *args, **kwargs)
+
+            def fetch(self, message_id, query):
+                self.sequence_fetch_calls.append((message_id, query))
+                if str(message_id) != '3,2,1':
+                    return 'NO', [b'unexpected sequence set']
+                if query != '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (TO SUBJECT FROM DATE)])':
+                    return 'NO', [b'unexpected fetch query']
+                return 'NO', [b'sequence fetch failed']
+
+        mail = ExistsSequenceNoUidFallbackMail(
+            selectable_by_mode={('INBOX', True): ('OK', [b'3'])},
+            list_entries=[b'(\\HasNoChildren) "." "INBOX"'],
+        )
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@163.com',
+                imap_password='secret',
+                imap_host='imap.163.com',
+                folder='inbox',
+                provider='163',
+                recipient='target@example.com',
+                limit=1,
+                scan_limit=10,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'IMAP_RECIPIENT_FETCH_FAILED')
+        self.assertTrue(result['recipient_search_supported'])
+        self.assertEqual(result['error']['status'], 502)
+        self.assertEqual(
+            mail.uid_calls,
+            [
+                ('SEARCH', (None, 'HEADER', 'TO', 'target@example.com')),
+                ('SEARCH', (None, 'ALL')),
+            ],
+        )
+        self.assertEqual(
+            mail.sequence_fetch_calls,
+            [('3,2,1', '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (TO SUBJECT FROM DATE)])')],
+        )
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_recovery_stops_at_scan_budget_and_marks_limit_reached(self):
+        newest_other_header = (
+            b"To: newest@example.com\r\n"
+            b"Subject: newest other\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 11:20:50 +0000\r\n"
+            b"\r\n"
+        )
+        middle_other_header = (
+            b"To: middle@example.com\r\n"
+            b"Subject: middle other\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 10:20:50 +0000\r\n"
+            b"\r\n"
+        )
+
+        class RecoveryScanLimitMail(FakeMail):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.uid_fetch_sets = []
+
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH' and args == (None, 'HEADER', 'TO', 'target@example.com'):
+                    return 'OK', [b'']
+                if command == 'SEARCH' and args == (None, 'ALL'):
+                    return 'OK', [b'10 20 30']
+                if command == 'FETCH':
+                    self.uid_fetch_sets.append(args[0])
+                    if args[0] != b'30,20':
+                        return 'NO', [b'unexpected uid set']
+                    return 'OK', [
+                        (
+                            b'30 (UID 30 INTERNALDATE "14-Apr-2026 11:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            newest_other_header,
+                        ),
+                        b')',
+                        (
+                            b'20 (UID 20 INTERNALDATE "14-Apr-2026 10:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            middle_other_header,
+                        ),
+                        b')',
+                    ]
+                return super().uid(command, *args, **kwargs)
+
+        mail = RecoveryScanLimitMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@163.com',
+                imap_password='secret',
+                imap_host='imap.163.com',
+                folder='inbox',
+                provider='163',
+                recipient='target@example.com',
+                limit=1,
+                scan_limit=2,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['emails'], [])
+        self.assertEqual(result['scanned_count'], 2)
+        self.assertTrue(result['scan_limit_reached'])
+        self.assertEqual(mail.uid_fetch_sets, [b'30,20'])
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_recovery_falls_back_to_sequence_batch_when_uid_batch_is_rejected(self):
+        matching_header = (
+            b"To: Match Recipient <target@example.com>\r\n"
+            b"Subject: sequence batch match\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 10:20:50 +0000\r\n"
+            b"\r\n"
+        )
+
+        class RecoverySequenceBatchMail(FakeMail):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.uid_fetch_sets = []
+                self.sequence_fetch_sets = []
+
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH' and args == (None, 'HEADER', 'TO', 'target@example.com'):
+                    return 'OK', [b'']
+                if command == 'SEARCH' and args == (None, 'ALL'):
+                    return 'OK', [b'10 20']
+                if command == 'FETCH':
+                    self.uid_fetch_sets.append((args[0], args[1]))
+                    return 'BAD', [b'UID FETCH unsupported']
+                return super().uid(command, *args, **kwargs)
+
+            def fetch(self, message_id, query):
+                self.sequence_fetch_sets.append((message_id, query))
+                if str(message_id) != '20,10':
+                    return 'NO', [b'unexpected sequence set']
+                if query != '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (TO SUBJECT FROM DATE)])':
+                    return 'NO', [b'unexpected fetch query']
+                return 'OK', [
+                    (
+                        b'20 (UID 20 INTERNALDATE "14-Apr-2026 10:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                        matching_header,
+                    ),
+                    b')',
+                    (
+                        b'10 (UID 10 INTERNALDATE "14-Apr-2026 09:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                        b"To: other@example.com\r\nSubject: older other\r\nFrom: sender@example.com\r\nDate: Tue, 14 Apr 2026 09:20:50 +0000\r\n\r\n",
+                    ),
+                    b')',
+                ]
+
+        mail = RecoverySequenceBatchMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@163.com',
+                imap_password='secret',
+                imap_host='imap.163.com',
+                folder='inbox',
+                provider='163',
+                recipient='target@example.com',
+                limit=1,
+                scan_limit=10,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual([item['id'] for item in result['emails']], ['20'])
+        self.assertEqual(result['emails'][0]['id_mode'], 'sequence')
+        self.assertEqual(
+            mail.uid_fetch_sets,
+            [(b'20,10', '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (TO SUBJECT FROM DATE)])')],
+        )
+        self.assertEqual(
+            mail.sequence_fetch_sets,
+            [('20,10', '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (TO SUBJECT FROM DATE)])')],
+        )
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_recovery_falls_back_to_sequence_batch_when_uid_batch_raises_imap_error(self):
+        matching_header = (
+            b"To: Match Recipient <target@example.com>\r\n"
+            b"Subject: sequence exception fallback match\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 10:20:50 +0000\r\n"
+            b"\r\n"
+        )
+
+        class RecoverySequenceBatchExceptionMail(FakeMail):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.uid_fetch_attempts = []
+                self.sequence_fetch_attempts = []
+
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH' and args == (None, 'HEADER', 'TO', 'target@example.com'):
+                    return 'OK', [b'']
+                if command == 'SEARCH' and args == (None, 'ALL'):
+                    return 'OK', [b'10 20']
+                if command == 'FETCH':
+                    self.uid_fetch_attempts.append((args[0], args[1]))
+                    raise web_outlook_app.imaplib.IMAP4.error('UID FETCH unsupported')
+                return super().uid(command, *args, **kwargs)
+
+            def fetch(self, message_id, query):
+                self.sequence_fetch_attempts.append((message_id, query))
+                if str(message_id) != '20,10':
+                    return 'NO', [b'unexpected sequence set']
+                if query != '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (TO SUBJECT FROM DATE)])':
+                    return 'NO', [b'unexpected fetch query']
+                return 'OK', [
+                    (
+                        b'20 (UID 20 INTERNALDATE "14-Apr-2026 10:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                        matching_header,
+                    ),
+                    b')',
+                    (
+                        b'10 (UID 10 INTERNALDATE "14-Apr-2026 09:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                        b"To: other@example.com\r\nSubject: older other\r\nFrom: sender@example.com\r\nDate: Tue, 14 Apr 2026 09:20:50 +0000\r\n\r\n",
+                    ),
+                    b')',
+                ]
+
+        mail = RecoverySequenceBatchExceptionMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@163.com',
+                imap_password='secret',
+                imap_host='imap.163.com',
+                folder='inbox',
+                provider='163',
+                recipient='target@example.com',
+                limit=1,
+                scan_limit=10,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual([item['id'] for item in result['emails']], ['20'])
+        self.assertEqual(result['emails'][0]['id_mode'], 'sequence')
+        self.assertEqual(
+            mail.uid_fetch_attempts,
+            [(b'20,10', '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (TO SUBJECT FROM DATE)])')],
+        )
+        self.assertEqual(
+            mail.sequence_fetch_attempts,
+            [('20,10', '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (TO SUBJECT FROM DATE)])')],
+        )
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_recovery_under_budget_keeps_scan_limit_reached_false(self):
+        class RecoveryUnderBudgetMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH' and args == (None, 'HEADER', 'TO', 'target@example.com'):
+                    return 'OK', [b'']
+                if command == 'SEARCH' and args == (None, 'ALL'):
+                    return 'OK', [b'10 20']
+                if command == 'FETCH':
+                    return 'OK', [
+                        (
+                            b'20 (UID 20 INTERNALDATE "14-Apr-2026 10:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            b"To: newest@example.com\r\nSubject: newest other\r\nFrom: sender@example.com\r\nDate: Tue, 14 Apr 2026 10:20:50 +0000\r\n\r\n",
+                        ),
+                        b')',
+                        (
+                            b'10 (UID 10 INTERNALDATE "14-Apr-2026 09:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            b"To: oldest@example.com\r\nSubject: oldest other\r\nFrom: sender@example.com\r\nDate: Tue, 14 Apr 2026 09:20:50 +0000\r\n\r\n",
+                        ),
+                        b')',
+                    ]
+                return super().uid(command, *args, **kwargs)
+
+        mail = RecoveryUnderBudgetMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@163.com',
+                imap_password='secret',
+                imap_host='imap.163.com',
+                folder='inbox',
+                provider='163',
+                recipient='target@example.com',
+                limit=1,
+                scan_limit=100,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['emails'], [])
+        self.assertEqual(result['scanned_count'], 2)
+        self.assertFalse(result['scan_limit_reached'])
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_recovery_rejects_substring_before_exact_display_name_match(self):
+        class RecoveryStrictMatchMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH' and args == (None, 'HEADER', 'TO', 'target@example.com'):
+                    return 'OK', [b'']
+                if command == 'SEARCH' and args == (None, 'ALL'):
+                    return 'OK', [b'10 20']
+                if command == 'FETCH':
+                    return 'OK', [
+                        (
+                            b'10 (UID 10 INTERNALDATE "14-Apr-2026 09:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            b"To: Friendly Name <target@example.com>\r\nSubject: exact match\r\nFrom: sender@example.com\r\nDate: Tue, 14 Apr 2026 09:20:50 +0000\r\n\r\n",
+                        ),
+                        b')',
+                        (
+                            b'20 (UID 20 INTERNALDATE "14-Apr-2026 10:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            b"To: target@example.com.evil@example.net\r\nSubject: false positive\r\nFrom: sender@example.com\r\nDate: Tue, 14 Apr 2026 10:20:50 +0000\r\n\r\n",
+                        ),
+                        b')',
+                    ]
+                return super().uid(command, *args, **kwargs)
+
+        mail = RecoveryStrictMatchMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@163.com',
+                imap_password='secret',
+                imap_host='imap.163.com',
+                folder='inbox',
+                provider='163',
+                recipient='target@example.com',
+                limit=1,
+                scan_limit=10,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['scanned_count'], 2)
+        self.assertEqual([item['id'] for item in result['emails']], ['10'])
+        self.assertEqual(result['emails'][0]['subject'], 'exact match')
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_recovery_limit_match_in_first_batch_avoids_second_batch(self):
+        class RecoveryLargeBatchMail(FakeMail):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.uid_fetch_sets = []
+
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH' and args == (None, 'HEADER', 'TO', 'target@example.com'):
+                    return 'OK', [b'']
+                if command == 'SEARCH' and args == (None, 'ALL'):
+                    return 'OK', [b' '.join(str(index).encode('utf-8') for index in range(1, 61))]
+                if command == 'FETCH':
+                    self.uid_fetch_sets.append(args[0])
+                    requested_ids = args[0].decode('utf-8').split(',')
+                    records = []
+                    for identifier in requested_ids:
+                        if identifier == '60':
+                            header = (
+                                b"To: Match Recipient <target@example.com>\r\n"
+                                b"Subject: newest batch match\r\n"
+                                b"From: sender@example.com\r\n"
+                                b"Date: Tue, 14 Apr 2026 10:20:50 +0000\r\n"
+                                b"\r\n"
+                            )
+                        else:
+                            header = (
+                                f"To: other{identifier}@example.com\r\n"
+                                f"Subject: other {identifier}\r\n"
+                                "From: sender@example.com\r\n"
+                                "Date: Tue, 14 Apr 2026 09:20:50 +0000\r\n"
+                                "\r\n"
+                            ).encode('utf-8')
+                        records.append((
+                            f'{identifier} (UID {identifier} INTERNALDATE "14-Apr-2026 10:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {{128}}'.encode('utf-8'),
+                            header,
+                        ))
+                        records.append(b')')
+                    return 'OK', records
+                return super().uid(command, *args, **kwargs)
+
+        mail = RecoveryLargeBatchMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@163.com',
+                imap_password='secret',
+                imap_host='imap.163.com',
+                folder='inbox',
+                provider='163',
+                recipient='target@example.com',
+                limit=1,
+                scan_limit=60,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['scanned_count'], 1)
+        self.assertEqual([item['id'] for item in result['emails']], ['60'])
+        self.assertEqual(len(mail.uid_fetch_sets), 1)
+        self.assertEqual(
+            mail.uid_fetch_sets[0],
+            b'60,59,58,57,56,55,54,53,52,51,50,49,48,47,46,45,44,43,42,41,40,39,38,37,36,35,34,33,32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11',
+        )
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_recovery_returns_structured_fetch_failure_for_missing_record(self):
+        class RecoveryMissingRecordMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH' and args == (None, 'HEADER', 'TO', 'target@example.com'):
+                    return 'OK', [b'']
+                if command == 'SEARCH' and args == (None, 'ALL'):
+                    return 'OK', [b'10 20']
+                if command == 'FETCH':
+                    return 'OK', [
+                        (
+                            b'20 (UID 20 INTERNALDATE "14-Apr-2026 10:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            b"To: newest@example.com\r\nSubject: newest other\r\nFrom: sender@example.com\r\nDate: Tue, 14 Apr 2026 10:20:50 +0000\r\n\r\n",
+                        ),
+                        b')',
+                        (
+                            b'10 (UID 10 INTERNALDATE "14-Apr-2026 09:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                        ),
+                        b')',
+                    ]
+                return super().uid(command, *args, **kwargs)
+
+        mail = RecoveryMissingRecordMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@163.com',
+                imap_password='secret',
+                imap_host='imap.163.com',
+                folder='inbox',
+                provider='163',
+                recipient='target@example.com',
+                limit=1,
+                scan_limit=10,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'IMAP_RECIPIENT_FETCH_FAILED')
+        self.assertTrue(result['recipient_search_supported'])
+        self.assertEqual(result['error']['status'], 502)
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_recovery_timeout_returns_timeout_contract(self):
+        class RecoveryTimeoutMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH' and args == (None, 'HEADER', 'TO', 'target@example.com'):
+                    return 'OK', [b'']
+                if command == 'SEARCH' and args == (None, 'ALL'):
+                    return 'OK', [b'10']
+                if command == 'FETCH':
+                    raise TimeoutError('batch header fetch timed out')
+                return super().uid(command, *args, **kwargs)
+
+        mail = RecoveryTimeoutMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@163.com',
+                imap_password='secret',
+                imap_host='imap.163.com',
+                folder='inbox',
+                provider='163',
+                recipient='target@example.com',
+                limit=1,
+                scan_limit=10,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'EMAIL_FETCH_TIMEOUT')
+        self.assertTrue(result['recipient_search_supported'])
+        self.assertEqual(result['error']['status'], 504)
+        self.assertNotEqual(result['error_code'], 'IMAP_RECIPIENT_SEARCH_UNSUPPORTED')
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_recovery_timeout_response_returns_timeout_contract(self):
+        class RecoveryTimeoutResponseMail(FakeMail):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.sequence_fetch_attempted = False
+
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH' and args == (None, 'HEADER', 'TO', 'target@example.com'):
+                    return 'OK', [b'']
+                if command == 'SEARCH' and args == (None, 'ALL'):
+                    return 'OK', [b'10']
+                if command == 'FETCH':
+                    return 'NO', [b'batch header fetch timed out']
+                return super().uid(command, *args, **kwargs)
+
+            def fetch(self, message_id, query):
+                self.sequence_fetch_attempted = True
+                return 'OK', [(
+                    b'10 (UID 10 INTERNALDATE "14-Apr-2026 09:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                    b"To: target@example.com\r\nSubject: should not be reached\r\nFrom: sender@example.com\r\nDate: Tue, 14 Apr 2026 09:20:50 +0000\r\n\r\n",
+                )]
+
+        mail = RecoveryTimeoutResponseMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@163.com',
+                imap_password='secret',
+                imap_host='imap.163.com',
+                folder='inbox',
+                provider='163',
+                recipient='target@example.com',
+                limit=1,
+                scan_limit=10,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'EMAIL_FETCH_TIMEOUT')
+        self.assertTrue(result['recipient_search_supported'])
+        self.assertEqual(result['error']['code'], 'EMAIL_FETCH_TIMEOUT')
+        self.assertEqual(result['error']['status'], 504)
+        self.assertFalse(mail.sequence_fetch_attempted)
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_marks_both_command_rejections_as_unsupported(self):
+        class UnsupportedRecipientSearchMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'BAD', [b'UID SEARCH unsupported']
+                return super().uid(command, *args, **kwargs)
+
+            def search(self, *_args, **_kwargs):
+                return 'NO', [b'HEADER search unsupported']
+
+        mail = UnsupportedRecipientSearchMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=1,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'IMAP_RECIPIENT_SEARCH_UNSUPPORTED')
+        self.assertFalse(result['recipient_search_supported'])
+        self.assertEqual(result['error']['status'], 501)
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_timeout_is_not_classified_as_unsupported(self):
+        class TimeoutRecipientSearchMail(FakeMail):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.sequence_search_attempted = False
+
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    raise TimeoutError('search timed out')
+                return super().uid(command, *args, **kwargs)
+
+            def search(self, *_args, **_kwargs):
+                self.sequence_search_attempted = True
+                return super().search(*_args, **_kwargs)
+
+        mail = TimeoutRecipientSearchMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=1,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'EMAIL_FETCH_TIMEOUT')
+        self.assertTrue(result['recipient_search_supported'])
+        self.assertEqual(result['error']['code'], 'EMAIL_FETCH_TIMEOUT')
+        self.assertEqual(result['error']['status'], 504)
+        self.assertFalse(mail.sequence_search_attempted)
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_connect_timeout_returns_timeout_contract(self):
+        with patch.object(
+            web_outlook_app,
+            'create_imap_connection',
+            side_effect=TimeoutError('connect timed out'),
+        ):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=1,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'EMAIL_FETCH_TIMEOUT')
+        self.assertTrue(result['recipient_search_supported'])
+        self.assertEqual(result['error']['code'], 'EMAIL_FETCH_TIMEOUT')
+        self.assertEqual(result['error']['status'], 504)
+
+    def test_imap_recipient_search_returns_fetch_failure_when_all_candidate_headers_fail(self):
+        class HeaderFetchFailureMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b'41 42']
+                if command == 'FETCH':
+                    return 'NO', [b'header fetch failed']
+                return super().uid(command, *args, **kwargs)
+
+        mail = HeaderFetchFailureMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=1,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'IMAP_RECIPIENT_FETCH_FAILED')
+        self.assertTrue(result['recipient_search_supported'])
+        self.assertEqual(result['error']['status'], 502)
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_fetch_timeout_returns_timeout_contract(self):
+        class HeaderFetchTimeoutMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b'41']
+                if command == 'FETCH':
+                    raise TimeoutError('header fetch timed out')
+                return super().uid(command, *args, **kwargs)
+
+        mail = HeaderFetchTimeoutMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=1,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'EMAIL_FETCH_TIMEOUT')
+        self.assertTrue(result['recipient_search_supported'])
+        self.assertEqual(result['error']['code'], 'EMAIL_FETCH_TIMEOUT')
+        self.assertEqual(result['error']['status'], 504)
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_fails_when_newest_candidate_cannot_be_validated(self):
+        older_match_header = (
+            b"To: target@example.com\r\n"
+            b"Subject: older match\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 08:20:50 +0000\r\n"
+            b"\r\n"
+        )
+
+        class UncertainNewestRecipientMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b'11 22']
+                if command == 'FETCH':
+                    uid = args[0]
+                    uid_text = uid.decode('utf-8') if isinstance(uid, (bytes, bytearray)) else str(uid)
+                    if uid_text == '22':
+                        return 'NO', [b'header fetch failed']
+                    if uid_text == '11':
+                        return 'OK', [(
+                            b'11 (INTERNALDATE "14-Apr-2026 08:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            older_match_header,
+                        )]
+                return super().uid(command, *args, **kwargs)
+
+        mail = UncertainNewestRecipientMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=1,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'IMAP_RECIPIENT_FETCH_FAILED')
+        self.assertTrue(result['recipient_search_supported'])
+        self.assertEqual(result['error']['status'], 502)
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_false_positive_does_not_mask_older_fetch_failure(self):
+        false_positive_header = (
+            b"To: target@example.com.evil@example.net\r\n"
+            b"Subject: false positive\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 11:20:50 +0000\r\n"
+            b"\r\n"
+        )
+
+        class FalsePositiveThenFailureMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b'31 32']
+                if command == 'FETCH':
+                    uid = args[0]
+                    uid_text = uid.decode('utf-8') if isinstance(uid, (bytes, bytearray)) else str(uid)
+                    if uid_text == '32':
+                        return 'OK', [(
+                            b'32 (INTERNALDATE "14-Apr-2026 11:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            false_positive_header,
+                        )]
+                    if uid_text == '31':
+                        return 'NO', [b'header fetch failed']
+                return super().uid(command, *args, **kwargs)
+
+        mail = FalsePositiveThenFailureMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=1,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'IMAP_RECIPIENT_FETCH_FAILED')
+        self.assertTrue(result['recipient_search_supported'])
+        self.assertEqual(result['error']['status'], 502)
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_respects_scan_limit_before_late_strict_match(self):
+        first_header = (
+            b"To: other@example.com\r\n"
+            b"Subject: newest other\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 11:20:50 +0000\r\n"
+            b"\r\n"
+        )
+        second_header = (
+            b"To: another@example.com\r\n"
+            b"Subject: middle other\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 10:20:50 +0000\r\n"
+            b"\r\n"
+        )
+        third_header = (
+            b"To: target@example.com\r\n"
+            b"Subject: oldest match\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 09:20:50 +0000\r\n"
+            b"\r\n"
+        )
+
+        class ScanLimitMail(FakeMail):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.fetch_ids = []
+
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b'11 22 33']
+                if command == 'FETCH':
+                    uid = args[0]
+                    uid_text = uid.decode('utf-8') if isinstance(uid, (bytes, bytearray)) else str(uid)
+                    self.fetch_ids.append(uid_text)
+                    if uid_text == '33':
+                        return 'OK', [(
+                            b'33 (INTERNALDATE "14-Apr-2026 11:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            first_header,
+                        )]
+                    if uid_text == '22':
+                        return 'OK', [(
+                            b'22 (INTERNALDATE "14-Apr-2026 10:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            second_header,
+                        )]
+                    if uid_text == '11':
+                        return 'OK', [(
+                            b'11 (INTERNALDATE "14-Apr-2026 09:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            third_header,
+                        )]
+                return super().uid(command, *args, **kwargs)
+
+        mail = ScanLimitMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=1,
+                scan_limit=2,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['emails'], [])
+        self.assertEqual(result['scanned_count'], 2)
+        self.assertTrue(result['scan_limit_reached'])
+        self.assertEqual(mail.fetch_ids, ['33', '22'])
+        self.assertTrue(mail.logged_out)
+
+    def test_imap_recipient_search_exact_exhaustion_keeps_scan_limit_reached_false(self):
+        newest_header = (
+            b"To: other@example.com\r\n"
+            b"Subject: newest other\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 11:20:50 +0000\r\n"
+            b"\r\n"
+        )
+        oldest_header = (
+            b"To: another@example.com\r\n"
+            b"Subject: oldest other\r\n"
+            b"From: sender@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 10:20:50 +0000\r\n"
+            b"\r\n"
+        )
+
+        class ExhaustedScanMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b'11 22']
+                if command == 'FETCH':
+                    uid = args[0]
+                    uid_text = uid.decode('utf-8') if isinstance(uid, (bytes, bytearray)) else str(uid)
+                    if uid_text == '22':
+                        return 'OK', [(
+                            b'22 (INTERNALDATE "14-Apr-2026 11:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            newest_header,
+                        )]
+                    if uid_text == '11':
+                        return 'OK', [(
+                            b'11 (INTERNALDATE "14-Apr-2026 10:20:50 +0000" BODY[HEADER.FIELDS (TO SUBJECT FROM DATE)] {128}',
+                            oldest_header,
+                        )]
+                return super().uid(command, *args, **kwargs)
+
+        mail = ExhaustedScanMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic_by_recipient(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+                recipient='target@example.com',
+                limit=1,
+                scan_limit=5,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['emails'], [])
+        self.assertEqual(result['scanned_count'], 2)
+        self.assertFalse(result['scan_limit_reached'])
+        self.assertTrue(mail.logged_out)
+
+    def test_custom_imap_list_falls_back_to_plain_search_when_uid_search_fails(self):
+        raw_email = (
+            b"Subject: inbox message\r\n"
+            b"From: sender@example.com\r\n"
+            b"To: user@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 08:20:50 +0000\r\n"
+            b"\r\n"
+            b"hello\r\n"
+        )
+
+        class SearchFallbackMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'BAD', [b'UID SEARCH unsupported']
+                return super().uid(command, *args, **kwargs)
+
+            def search(self, *_args, **_kwargs):
+                return 'OK', [b'7']
+
+            def fetch(self, message_id, _query):
+                self.select_calls.append((f'FETCH:{message_id}', False))
+                return 'OK', [(
+                    b'7 (FLAGS (\\Seen) INTERNALDATE "14-Apr-2026 08:20:50 +0000" RFC822 {128}',
+                    raw_email,
+                )]
+
+        mail = SearchFallbackMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(len(result['emails']), 1)
+        self.assertEqual(result['emails'][0]['id'], '7')
+        self.assertEqual(result['emails'][0]['subject'], 'inbox message')
+
+    def test_custom_imap_detail_falls_back_to_plain_fetch_when_uid_fetch_fails(self):
+        raw_email = (
+            b"Subject: detail message\r\n"
+            b"From: sender@example.com\r\n"
+            b"To: user@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 08:20:50 +0000\r\n"
+            b"\r\n"
+            b"detail body\r\n"
+        )
+
+        class FetchFallbackMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'FETCH':
+                    return 'BAD', [b'UID FETCH unsupported']
+                return super().uid(command, *args, **kwargs)
+
+            def fetch(self, message_id, _query):
+                return 'OK', [(
+                    b'9 (RFC822 {128}',
+                    raw_email,
+                )]
+
+        mail = FetchFallbackMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_email_detail_imap_generic_result(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                message_id='9',
+                folder='inbox',
+                provider='custom',
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['email']['id'], '9')
+        self.assertEqual(result['email']['subject'], 'detail message')
+        self.assertIn('detail body', result['email']['body'])
+
+    def test_custom_imap_detail_uses_body_peek_when_rfc822_returns_no_payload(self):
+        raw_email = (
+            b"Subject: icloud detail message\r\n"
+            b"From: sender@example.com\r\n"
+            b"To: user@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 08:20:50 +0000\r\n"
+            b"\r\n"
+            b"icloud detail body\r\n"
+        )
+
+        class BodyPeekFallbackMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'FETCH' and args[0] == '9':
+                    query = args[1]
+                    if query == '(RFC822)':
+                        return 'OK', [None]
+                    if query == '(BODY.PEEK[])':
+                        return 'OK', [(
+                            b'2 (UID 9 BODY[] {128}',
+                            raw_email,
+                        )]
+                return super().uid(command, *args, **kwargs)
+
+            def fetch(self, *_args, **_kwargs):
+                return 'NO', [b'body peek sequence fetch should not be required']
+
+        mail = BodyPeekFallbackMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_email_detail_imap_generic_result(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                message_id='9',
+                folder='inbox',
+                provider='custom',
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['email']['id'], '9')
+        self.assertEqual(result['email']['subject'], 'icloud detail message')
+        self.assertIn('icloud detail body', result['email']['body'])
+
+    def test_custom_imap_detail_falls_back_when_uid_fetch_returns_ok_without_payload(self):
+        raw_email = (
+            b"Subject: detail fallback payload\r\n"
+            b"From: sender@example.com\r\n"
+            b"To: user@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 08:20:50 +0000\r\n"
+            b"\r\n"
+            b"detail body from sequence fetch\r\n"
+        )
+
+        class EmptyUidFetchMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'FETCH':
+                    return 'OK', [None]
+                return super().uid(command, *args, **kwargs)
+
+            def fetch(self, message_id, _query):
+                if str(message_id) == '9':
+                    return 'OK', [(
+                        b'9 (RFC822 {128}',
+                        raw_email,
+                    )]
+                return 'NO', [b'not found']
+
+        mail = EmptyUidFetchMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_email_detail_imap_generic_result(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                message_id='9',
+                folder='inbox',
+                provider='custom',
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['email']['id'], '9')
+        self.assertEqual(result['email']['subject'], 'detail fallback payload')
+        self.assertIn('detail body from sequence fetch', result['email']['body'])
+
+    def test_custom_imap_raw_fetch_uses_sequence_fallback_when_uid_fetch_has_no_payload(self):
+        raw_email = (
+            b"Subject: raw fallback payload\r\n"
+            b"From: sender@example.com\r\n"
+            b"To: user@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 08:20:50 +0000\r\n"
+            b"\r\n"
+            b"raw body from sequence fetch\r\n"
+        )
+
+        class RawFetchFallbackMail(FakeMail):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.uid_fetch_calls = []
+                self.sequence_fetch_calls = []
+
+            def uid(self, command, *args, **kwargs):
+                if command == 'FETCH':
+                    self.uid_fetch_calls.append((command, args))
+                    return 'OK', [None]
+                return super().uid(command, *args, **kwargs)
+
+            def fetch(self, message_id, query):
+                self.sequence_fetch_calls.append((message_id, query))
+                if str(message_id) == '9':
+                    return 'OK', [(
+                        b'9 (RFC822 {128}',
+                        raw_email,
+                    )]
+                return 'NO', [b'not found']
+
+        mail = RawFetchFallbackMail(selectable={'INBOX'}, list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_raw_email_imap_generic(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                imap_port=993,
+                message_id='9',
+                folder='inbox',
+                provider='custom',
+            )
+
+        self.assertEqual(result, raw_email)
+        self.assertEqual(mail.uid_fetch_calls, [('FETCH', ('9', '(RFC822)'))])
+        self.assertEqual(mail.sequence_fetch_calls, [('9', '(RFC822)')])
+        self.assertTrue(mail.logged_out)
+
+    def test_custom_imap_uses_exists_count_when_search_returns_empty(self):
+        raw_email = (
+            b"Subject: exists fallback\r\n"
+            b"From: sender@example.com\r\n"
+            b"To: user@example.com\r\n"
+            b"Date: Tue, 14 Apr 2026 08:20:50 +0000\r\n"
+            b"\r\n"
+            b"exists body\r\n"
+        )
+
+        class ExistsFallbackMail(FakeMail):
+            def select(self, name, readonly=True):
+                self.select_calls.append((name, readonly))
+                if name in {'INBOX', '"INBOX"'}:
+                    return 'OK', [b'1']
+                return 'NO', [b'folder not found']
+
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b'']
+                return super().uid(command, *args, **kwargs)
+
+            def search(self, *_args, **_kwargs):
+                raise web_outlook_app.imaplib.IMAP4.error("SEARCH command error")
+
+            def fetch(self, message_id, _query):
+                if str(message_id) == '1':
+                    return 'OK', [(
+                        b'1 (FLAGS () INTERNALDATE "14-Apr-2026 08:20:50 +0000" RFC822 {128}',
+                        raw_email,
+                    )]
+                return 'NO', [b'not found']
+
+        mail = ExistsFallbackMail(list_entries=[b'(\\HasNoChildren) "." "INBOX"'])
+
+        with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+            result = web_outlook_app.get_emails_imap_generic(
+                email_addr='user@example.com',
+                imap_password='secret',
+                imap_host='imap.example.com',
+                folder='inbox',
+                provider='custom',
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(len(result['emails']), 1)
+        self.assertEqual(result['emails'][0]['id'], '1')
+        self.assertEqual(result['emails'][0]['subject'], 'exists fallback')
+
+    def test_fetch_account_emails_all_fetches_in_parallel(self):
+        account = {
+            'email': 'user@outlook.com',
+            'account_type': 'oauth',
+        }
+        barrier = threading.Barrier(2, timeout=1)
+
+        def fake_fetch(target_account, folder, skip, top, proxy_url='', fallback_proxy_urls=None):
+            self.assertIs(target_account, account)
+            self.assertEqual(skip, 0)
+            self.assertEqual(top, 20)
+            self.assertEqual(proxy_url, 'socks5://primary')
+            self.assertEqual(fallback_proxy_urls, ['socks5://fallback'])
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError as exc:
+                raise AssertionError('folder=all 仍然是串行抓取') from exc
+            return {
+                'success': True,
+                'emails': [{
+                    'id': folder,
+                    'folder': folder,
+                    'date': '2026-01-01T00:00:00Z' if folder == 'inbox' else '2026-01-02T00:00:00Z',
+                }],
+                'method': f'method-{folder}',
+                'has_more': False,
+                'request_method': 'graph' if folder == 'inbox' else 'imap',
+            }
+
+        with patch.object(web_outlook_app, 'get_account_proxy_url', return_value='socks5://primary'):
+            with patch.object(web_outlook_app, 'get_account_proxy_failover_urls', return_value=['socks5://fallback']):
+                with patch.object(web_outlook_app, 'fetch_account_folder_emails', side_effect=fake_fetch):
+                    result = web_outlook_app.fetch_account_emails(account, 'all', 0, 20)
+
+        self.assertTrue(result['success'])
+        self.assertEqual([email['folder'] for email in result['emails']], ['junkemail', 'inbox'])
+        self.assertEqual(result['method'], 'method-inbox / method-junkemail')
+        self.assertEqual(
+            result['folder_summaries'],
+            {
+                'inbox': {
+                    'success': True,
+                    'fetched_count': 1,
+                    'has_more': False,
+                    'request_method': 'graph',
+                    'method': 'method-inbox',
+                },
+                'junkemail': {
+                    'success': True,
+                    'fetched_count': 1,
+                    'has_more': False,
+                    'request_method': 'imap',
+                    'method': 'method-junkemail',
+                },
+            }
+        )
+
+    def test_fetch_account_emails_all_includes_failed_folder_summary(self):
+        results = {
+            'inbox': {
+                'success': True,
+                'emails': [{'id': 'inbox-1', 'folder': 'inbox', 'date': '2026-01-01T00:00:00Z'}],
+                'method': 'Graph API',
+                'has_more': True,
+                'request_method': 'graph',
+            },
+            'junkemail': {
+                'success': False,
+                'error': {'message': 'junk failed'},
+            },
+        }
+
+        merged = web_outlook_app.merge_folder_results(results, 0, 40)
+
+        self.assertTrue(merged['success'])
+        self.assertTrue(merged['partial'])
+        self.assertEqual(merged['folder_summaries']['inbox']['fetched_count'], 1)
+        self.assertTrue(merged['folder_summaries']['inbox']['has_more'])
+        self.assertTrue(merged['folder_summaries']['inbox']['success'])
+        self.assertFalse(merged['folder_summaries']['junkemail']['success'])
+        self.assertEqual(merged['folder_summaries']['junkemail']['fetched_count'], 0)
+        self.assertFalse(merged['folder_summaries']['junkemail']['has_more'])
+        self.assertEqual(merged['folder_summaries']['junkemail']['error'], {'message': 'junk failed'})
+
+    def test_get_email_detail_imap_defaults_to_uid_fetch(self):
+        message = EmailMessage()
+        message['Subject'] = 'Default UID detail'
+        message['From'] = 'sender@example.com'
+        message['To'] = 'reader@example.com'
+        message.set_content('detail body')
+        raw_email = message.as_bytes()
+
+        class DetailMail:
+            def __init__(self):
+                self.uid_calls = []
+                self.fetch_calls = []
+
+            def authenticate(self, *_args, **_kwargs):
+                return 'OK', [b'authenticated']
+
+            def select(self, *_args, **_kwargs):
+                return 'OK', [b'1']
+
+            def uid(self, command, message_id, query):
+                self.uid_calls.append((command, message_id, query))
+                return 'OK', [(b'7 (RFC822 {128}', raw_email)]
+
+            def fetch(self, message_id, query):
+                self.fetch_calls.append((message_id, query))
+                return 'NO', []
+
+            def logout(self):
+                return 'BYE', [b'logout']
+
+        mail = DetailMail()
+        with patch.object(web_outlook_app, 'get_access_token_imap', return_value='access-token'), \
+             patch.object(web_outlook_app.imaplib, 'IMAP4_SSL', return_value=mail):
+            detail = web_outlook_app.get_email_detail_imap(
+                'reader@example.com',
+                'client-id',
+                'refresh-token',
+                '7',
+                'inbox',
+            )
+
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail['subject'], 'Default UID detail')
+        self.assertEqual(mail.uid_calls[0][0], 'FETCH')
+        self.assertEqual(mail.uid_calls[0][1], '7')
+        self.assertEqual(mail.fetch_calls, [])
+
+
+class ExternalAccountsApiTests(unittest.TestCase):
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM account_tags')
+            db.execute('DELETE FROM account_aliases')
+            db.execute('DELETE FROM account_refresh_logs')
+            db.execute('DELETE FROM accounts')
+            db.execute('DELETE FROM temp_email_tags')
+            db.execute('DELETE FROM temp_email_messages')
+            db.execute('DELETE FROM temp_emails')
+            db.execute('DELETE FROM cloudflare_channels')
+            db.execute('DELETE FROM tags')
+            db.execute("DELETE FROM groups WHERE name NOT IN ('默认分组', '临时邮箱')")
+            db.commit()
+
+            self.assertTrue(web_outlook_app.set_setting('external_api_key', 'test-external-key'))
+
+            tag_id = web_outlook_app.add_tag('核心', '#1a1a1a')
+            self.assertIsNotNone(tag_id)
+
+            added = web_outlook_app.add_account(
+                'user@outlook.com',
+                'password123',
+                '24d9a0ed-8787-4584-883c-2fd79308940a',
+                '0.AXEA_refresh',
+                group_id=1,
+                remark='主账号',
+                forward_enabled=True
+            )
+            self.assertTrue(added)
+
+            account = web_outlook_app.get_account_by_email('user@outlook.com')
+            self.assertIsNotNone(account)
+            self.account_id = account['id']
+
+            alias_ok, _, alias_errors = web_outlook_app.replace_account_aliases(
+                account['id'],
+                account['email'],
+                ['alias@example.com'],
+                db
+            )
+            self.assertTrue(alias_ok, alias_errors)
+            db.commit()
+
+            self.assertTrue(web_outlook_app.add_account_tag(account['id'], tag_id))
+            db.execute(
+                '''
+                INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message)
+                VALUES (?, ?, ?, ?, ?)
+                ''',
+                (account['id'], account['email'], 'manual', 'success', None)
+            )
+            db.execute(
+                '''
+                UPDATE accounts
+                SET last_refresh_status = 'success',
+                    last_refresh_error = NULL,
+                    last_refresh_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''',
+                (account['id'],),
+            )
+            db.commit()
+
+    def create_cloudflare_channel(self, name='cfmail-test'):
+        with self.app.app_context():
+            channel_id, error = web_outlook_app.create_cloudflare_channel(
+                name=name,
+                worker_domain=f'{name}.example.workers.dev',
+                email_domains=f'{name}.example.com',
+                admin_password=f'{name}-admin',
+                enabled=True,
+                is_default=True,
+            )
+            self.assertIsNone(error)
+            self.assertIsNotNone(channel_id)
+            return channel_id
+
+    def test_global_refresh_logs_clamps_invalid_and_large_pagination(self):
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM account_refresh_logs')
+            for index in range(3):
+                db.execute(
+                    """
+                    INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message, created_at)
+                    VALUES (?, ?, 'manual', 'success', NULL, datetime('now', ?))
+                    """,
+                    (self.account_id, f'user-{index}@outlook.com', f'-{index} minutes')
+                )
+            db.commit()
+
+        invalid_response = self.client.get('/api/accounts/refresh-logs?limit=abc&offset=bad')
+        self.assertEqual(invalid_response.status_code, 200)
+        invalid_payload = invalid_response.get_json()
+        self.assertTrue(invalid_payload['success'])
+        self.assertIn('logs', invalid_payload)
+
+        large_response = self.client.get('/api/accounts/refresh-logs?limit=999999&offset=0')
+        self.assertEqual(large_response.status_code, 200)
+        with patch.object(web_outlook_app, 'get_db') as db_mock:
+            db_mock.return_value.execute.return_value.fetchall.return_value = []
+            self.client.get('/api/accounts/refresh-logs?limit=999999&offset=-5')
+        execute_args = db_mock.return_value.execute.call_args.args
+        self.assertEqual(execute_args[1], (web_outlook_app.LOG_PAGINATION_MAX_LIMIT, 0))
+
+    def test_refresh_logs_prefer_current_account_email_over_log_email(self):
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+        current_email = 'current-user@outlook.com'
+        log_email = 'old-log-user@outlook.com'
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM account_refresh_logs')
+            db.execute(
+                'UPDATE accounts SET email = ? WHERE id = ?',
+                (current_email, self.account_id),
+            )
+            db.execute(
+                '''
+                INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message, created_at)
+                VALUES (?, ?, 'manual', 'success', NULL, '2026-05-28 10:00:00')
+                ''',
+                (self.account_id, log_email),
+            )
+            db.commit()
+
+        global_response = self.client.get('/api/accounts/refresh-logs')
+        self.assertEqual(global_response.status_code, 200)
+        global_payload = global_response.get_json()
+        self.assertTrue(global_payload['success'])
+        self.assertEqual(global_payload['logs'][0]['account_email'], current_email)
+        self.assertEqual(global_payload['logs'][0]['account_id'], self.account_id)
+        self.assertEqual(global_payload['logs'][0]['refresh_type'], 'manual')
+        self.assertEqual(global_payload['logs'][0]['status'], 'success')
+        self.assertIn('created_at', global_payload['logs'][0])
+
+        account_response = self.client.get(f'/api/accounts/{self.account_id}/refresh-logs')
+        self.assertEqual(account_response.status_code, 200)
+        account_payload = account_response.get_json()
+        self.assertTrue(account_payload['success'])
+        self.assertEqual(account_payload['logs'][0]['account_email'], current_email)
+
+    def test_refresh_logs_fall_back_to_log_email_when_account_missing(self):
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+        log_email = 'deleted-account-log@outlook.com'
+        missing_account_id = self.account_id + 1000
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM account_refresh_logs')
+            db.commit()
+            db.execute('PRAGMA foreign_keys = OFF')
+            db.execute(
+                '''
+                INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message, created_at)
+                VALUES (?, ?, 'manual', 'failed', 'gone', '2026-05-28 10:00:00')
+                ''',
+                (missing_account_id, log_email),
+            )
+            db.commit()
+            db.execute('PRAGMA foreign_keys = ON')
+
+        response = self.client.get('/api/accounts/refresh-logs')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['logs'][0]['account_email'], log_email)
+        self.assertEqual(payload['logs'][0]['account_id'], missing_account_id)
+        self.assertEqual(payload['logs'][0]['error_message'], 'gone')
+
+    def test_account_refresh_logs_clamps_invalid_and_large_pagination(self):
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+        invalid_response = self.client.get(f'/api/accounts/{self.account_id}/refresh-logs?limit=abc&offset=bad')
+        self.assertEqual(invalid_response.status_code, 200)
+        payload = invalid_response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertIn('logs', payload)
+
+        with patch.object(web_outlook_app, 'get_db') as db_mock:
+            db_mock.return_value.execute.return_value.fetchall.return_value = []
+            self.client.get(f'/api/accounts/{self.account_id}/refresh-logs?limit=999999&offset=-5')
+        execute_args = db_mock.return_value.execute.call_args.args
+        self.assertEqual(execute_args[1], (self.account_id, web_outlook_app.LOG_PAGINATION_MAX_LIMIT, 0))
+
+    def test_failed_refresh_logs_keep_json_shape_with_ignored_pagination_inputs(self):
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute(
+                """
+                UPDATE accounts
+                SET last_refresh_status = 'failed',
+                    last_refresh_error = 'expired token',
+                    last_refresh_at = '2026-04-27 11:00:00'
+                WHERE id = ?
+                """,
+                (self.account_id,),
+            )
+            db.commit()
+
+        response = self.client.get('/api/accounts/refresh-logs/failed?limit=abc&offset=bad')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertIn('logs', payload)
+        self.assertTrue(payload['logs'])
+        self.assertIn('account_email', payload['logs'][0])
+        self.assertIn('refresh_type', payload['logs'][0])
+
+    def test_global_forwarding_logs_clamps_invalid_and_large_pagination(self):
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM forwarding_logs')
+            for index in range(3):
+                db.execute(
+                    """
+                    INSERT INTO forwarding_logs (account_id, account_email, message_id, channel, status, error_message, created_at)
+                    VALUES (?, ?, ?, 'smtp', 'success', NULL, datetime('now', ?))
+                    """,
+                    (self.account_id, 'user@outlook.com', f'msg-{index}', f'-{index} minutes')
+                )
+            db.commit()
+
+        invalid_response = self.client.get('/api/accounts/forwarding-logs?limit=abc&offset=bad')
+        self.assertEqual(invalid_response.status_code, 200)
+        invalid_payload = invalid_response.get_json()
+        self.assertTrue(invalid_payload['success'])
+        self.assertIn('logs', invalid_payload)
+
+        with patch.object(web_outlook_app, 'get_db') as db_mock:
+            db_mock.return_value.execute.return_value.fetchall.return_value = []
+            self.client.get('/api/accounts/forwarding-logs?limit=999999&offset=-5')
+        execute_args = db_mock.return_value.execute.call_args.args
+        self.assertEqual(execute_args[1], (web_outlook_app.LOG_PAGINATION_MAX_LIMIT, 0))
+
+    def test_failed_forwarding_logs_clamps_invalid_and_large_pagination(self):
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+        invalid_response = self.client.get('/api/accounts/forwarding-logs/failed?limit=abc&offset=bad')
+        self.assertEqual(invalid_response.status_code, 200)
+        payload = invalid_response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertIn('logs', payload)
+
+        with patch.object(web_outlook_app, 'get_db') as db_mock:
+            db_mock.return_value.execute.return_value.fetchall.return_value = []
+            self.client.get('/api/accounts/forwarding-logs/failed?limit=999999&offset=-5')
+        execute_args = db_mock.return_value.execute.call_args.args
+        self.assertEqual(execute_args[1], (web_outlook_app.LOG_PAGINATION_MAX_LIMIT, 0))
+
+    def test_account_forwarding_logs_clamps_and_filters_by_account(self):
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM forwarding_logs')
+            db.execute(
+                """
+                INSERT INTO forwarding_logs (account_id, account_email, message_id, channel, status, error_message, created_at)
+                VALUES (?, ?, 'target-msg', 'smtp', 'failed', 'boom', datetime('now'))
+                """,
+                (self.account_id, 'user@outlook.com')
+            )
+            self.assertTrue(web_outlook_app.add_account(
+                'other@outlook.com',
+                'password123',
+                'other-client-id',
+                'other-refresh-token',
+                group_id=1,
+            ))
+            other_account = web_outlook_app.get_account_by_email('other@outlook.com')
+            self.assertIsNotNone(other_account)
+            db.execute(
+                """
+                INSERT INTO forwarding_logs (account_id, account_email, message_id, channel, status, error_message, created_at)
+                VALUES (?, ?, 'other-msg', 'smtp', 'failed', 'boom', datetime('now'))
+                """,
+                (other_account['id'], 'other@outlook.com')
+            )
+            db.commit()
+
+        invalid_response = self.client.get(f'/api/accounts/{self.account_id}/forwarding-logs?limit=abc&offset=bad')
+        self.assertEqual(invalid_response.status_code, 200)
+        payload = invalid_response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual([row['message_id'] for row in payload['logs']], ['target-msg'])
+        self.assertIn('account', payload)
+
+        with patch.object(web_outlook_app, 'get_db') as db_mock:
+            db_mock.return_value.execute.return_value.fetchall.return_value = []
+            with patch.object(web_outlook_app, 'get_account_by_id', return_value={
+                'id': self.account_id,
+                'email': 'user@outlook.com',
+                'status': 'active',
+                'forward_enabled': True,
+                'forward_last_checked_at': '',
+            }):
+                self.client.get(f'/api/accounts/{self.account_id}/forwarding-logs?limit=999999&offset=-5')
+        execute_args = db_mock.return_value.execute.call_args.args
+        self.assertEqual(execute_args[1], (self.account_id, web_outlook_app.LOG_PAGINATION_MAX_LIMIT, 0))
+
+    def test_external_accounts_requires_api_key(self):
+        response = self.client.get('/api/external/accounts')
+
+        self.assertEqual(response.status_code, 401)
+        payload = response.get_json()
+        self.assertFalse(payload['success'])
+        self.assertIn('API Key', payload['error'])
+
+    def test_external_emails_requires_api_key(self):
+        response = self.client.get('/api/external/emails?email=user@outlook.com&folder=inbox')
+
+        self.assertEqual(response.status_code, 401)
+        payload = response.get_json()
+        self.assertFalse(payload['success'])
+        self.assertIn('API Key', payload['error'])
+
+    def test_external_accounts_rejects_mismatched_api_key(self):
+        response = self.client.get(
+            '/api/external/accounts',
+            headers={'X-API-Key': 'wrong-external-key'}
+        )
+
+        self.assertEqual(response.status_code, 401)
+        payload = response.get_json()
+        self.assertFalse(payload['success'])
+        self.assertEqual(payload['error'], 'API Key 无效')
+
+    def test_external_accounts_uses_constant_time_api_key_compare(self):
+        original_compare_digest = web_outlook_app.secrets.compare_digest
+
+        with patch.object(
+            web_outlook_app.secrets,
+            'compare_digest',
+            wraps=original_compare_digest,
+        ) as compare_digest_mock:
+            response = self.client.get(
+                '/api/external/accounts?group_id=1',
+                headers={'X-API-Key': ' test-external-key '}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        compare_digest_mock.assert_called_once_with(
+            'test-external-key',
+            'test-external-key',
+        )
+
+    def test_internal_emails_requires_login(self):
+        response = self.client.get('/api/emails/user@outlook.com?folder=inbox')
+
+        self.assertEqual(response.status_code, 401)
+        payload = response.get_json()
+        self.assertFalse(payload['success'])
+        self.assertTrue(payload['need_login'])
+        self.assertEqual(payload['error'], '请先登录')
+
+    def test_internal_emails_does_not_update_last_refresh_time(self):
+        expected_result = {
+            'success': True,
+            'emails': [{'id': 'inbox-1', 'folder': 'inbox', 'date': '2026-01-01T00:00:00Z'}],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute(
+                '''
+                UPDATE accounts
+                SET last_refresh_at = ?
+                WHERE email = ?
+                ''',
+                ('2026-01-10 12:34:56', 'user@outlook.com')
+            )
+            db.commit()
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get('/api/emails/user@outlook.com?folder=inbox')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload, expected_result)
+        fetch_mock.assert_called_once()
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            row = db.execute(
+                'SELECT last_refresh_at FROM accounts WHERE email = ?',
+                ('user@outlook.com',)
+            ).fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row['last_refresh_at'], '2026-01-10 12:34:56')
+
+    def test_internal_emails_plus_address_falls_back_to_base_email(self):
+        expected_result = {
+            'success': True,
+            'emails': [{'id': 'inbox-1', 'folder': 'inbox', 'date': '2026-01-01T00:00:00Z'}],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get('/api/emails/user+verify@outlook.com?folder=inbox&skip=2')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['requested_email'], 'user+verify@outlook.com')
+        self.assertEqual(payload['resolved_email'], 'user@outlook.com')
+
+        called_account, called_folder, called_skip, called_top = fetch_mock.call_args.args
+        self.assertEqual(called_account['email'], 'user@outlook.com')
+        self.assertEqual(called_folder, 'inbox')
+        self.assertEqual(called_skip, 2)
+        self.assertEqual(called_top, 20)
+
+    def test_parse_non_negative_int_defaults_negative_and_invalid_values(self):
+        self.assertEqual(web_outlook_app.parse_non_negative_int('-3', 20), 0)
+        self.assertEqual(web_outlook_app.parse_non_negative_int('0', 20), 0)
+        self.assertEqual(web_outlook_app.parse_non_negative_int('abc', 20), 20)
+        self.assertEqual(web_outlook_app.parse_non_negative_int('999', 1, 50), 50)
+
+    def test_internal_emails_clamps_invalid_remote_pagination(self):
+        expected_result = {
+            'success': True,
+            'emails': [],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get('/api/emails/user@outlook.com?folder=inbox&skip=abc&top=-3')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        called_account, called_folder, called_skip, called_top = fetch_mock.call_args.args
+        self.assertEqual(called_account['email'], 'user@outlook.com')
+        self.assertEqual(called_folder, 'inbox')
+        self.assertEqual(called_skip, 0)
+        self.assertEqual(called_top, 0)
+
+    def test_internal_emails_clamps_large_remote_top(self):
+        expected_result = {
+            'success': True,
+            'emails': [],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get('/api/emails/user@outlook.com?folder=inbox&skip=-5&top=999')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        called_account, called_folder, called_skip, called_top = fetch_mock.call_args.args
+        self.assertEqual(called_account['email'], 'user@outlook.com')
+        self.assertEqual(called_folder, 'inbox')
+        self.assertEqual(called_skip, 0)
+        self.assertEqual(called_top, 50)
+
+    def test_internal_emails_plus_address_prefers_exact_match(self):
+        with self.app.app_context():
+            added = web_outlook_app.add_account(
+                'user+vip@outlook.com',
+                'password456',
+                'client-id-plus',
+                'refresh-token-plus',
+                group_id=1,
+                remark='plus 账号'
+            )
+            self.assertTrue(added)
+
+        expected_result = {
+            'success': True,
+            'emails': [{'id': 'inbox-plus', 'folder': 'inbox', 'date': '2026-01-03T00:00:00Z'}],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get('/api/emails/user+vip@outlook.com?folder=inbox')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['requested_email'], 'user+vip@outlook.com')
+        self.assertEqual(payload['resolved_email'], 'user+vip@outlook.com')
+
+        called_account, called_folder, called_skip, called_top = fetch_mock.call_args.args
+        self.assertEqual(called_account['email'], 'user+vip@outlook.com')
+        self.assertEqual(called_folder, 'inbox')
+        self.assertEqual(called_skip, 0)
+        self.assertEqual(called_top, 20)
+
+    def test_internal_emails_ignores_email_query_override(self):
+        expected_result = {
+            'success': True,
+            'emails': [{'id': 'path-email', 'folder': 'inbox', 'date': '2026-01-03T00:00:00Z'}],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get('/api/emails/user@outlook.com?email=user+verify@outlook.com&folder=inbox')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['requested_email'], 'user@outlook.com')
+        self.assertEqual(payload['resolved_email'], 'user@outlook.com')
+
+        called_account, called_folder, called_skip, called_top = fetch_mock.call_args.args
+        self.assertEqual(called_account['email'], 'user@outlook.com')
+        self.assertEqual(called_folder, 'inbox')
+        self.assertEqual(called_skip, 0)
+        self.assertEqual(called_top, 20)
+
+    def test_internal_emails_plus_address_falls_back_to_alias_with_plus(self):
+        with self.app.app_context():
+            account = web_outlook_app.get_account_by_email('user@outlook.com')
+            self.assertIsNotNone(account)
+            alias_ok, _, alias_errors = web_outlook_app.replace_account_aliases(
+                account['id'],
+                account['email'],
+                ['alias@example.com', 'alias+team@example.com'],
+                web_outlook_app.get_db()
+            )
+            self.assertTrue(alias_ok, alias_errors)
+            web_outlook_app.get_db().commit()
+
+        expected_result = {
+            'success': True,
+            'emails': [{'id': 'inbox-alias-plus', 'folder': 'inbox', 'date': '2026-01-04T00:00:00Z'}],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get('/api/emails/alias+team+notice@example.com?folder=inbox')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['requested_email'], 'alias+team+notice@example.com')
+        self.assertEqual(payload['resolved_email'], 'user@outlook.com')
+        self.assertEqual(payload['matched_alias'], 'alias+team@example.com')
+        self.assertTrue(payload['fallback_used'])
+        self.assertEqual(payload['fallback_email'], 'alias+team@example.com')
+        self.assertEqual(payload['resolved_query_email'], 'alias+team@example.com')
+
+        called_account, called_folder, called_skip, called_top = fetch_mock.call_args.args
+        self.assertEqual(called_account['email'], 'user@outlook.com')
+        self.assertEqual(called_account['matched_alias'], 'alias+team@example.com')
+        self.assertEqual(called_folder, 'inbox')
+        self.assertEqual(called_skip, 0)
+        self.assertEqual(called_top, 20)
+
+    def test_internal_emails_preserves_plus_in_filter_params(self):
+        expected_result = {
+            'success': True,
+            'emails': [
+                {'id': 'plus', 'subject': 'Reset+Code', 'from': 'no-reply@example.com', 'body_preview': ''},
+                {'id': 'space', 'subject': 'Reset Code', 'from': 'no-reply@example.com', 'body_preview': ''},
+            ],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result):
+            response = self.client.get('/api/emails/user@outlook.com?subject_contains=reset+code')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual([item['id'] for item in payload['emails']], ['plus'])
+
+    def test_update_account_requires_login(self):
+        response = self.client.put(
+            '/api/accounts/1',
+            json={'remark': 'updated without login'}
+        )
+
+        self.assertEqual(response.status_code, 401)
+        payload = response.get_json()
+        self.assertFalse(payload['success'])
+        self.assertTrue(payload['need_login'])
+        self.assertEqual(payload['error'], '请先登录')
+
+    def test_dynamic_endpoint_overrides_keep_required_guards(self):
+        self.assertTrue(getattr(self.app.view_functions['api_update_account'], '_requires_login', False))
+        self.assertTrue(getattr(self.app.view_functions['api_get_emails'], '_requires_login', False))
+        self.assertTrue(getattr(self.app.view_functions['api_external_get_emails'], '_requires_api_key', False))
+
+    def test_external_accounts_returns_sanitized_accounts(self):
+        with self.app.app_context():
+            group_id = web_outlook_app.add_group('代理组', '带代理的账号', '#123456')
+            self.assertIsNotNone(group_id)
+            added = web_outlook_app.add_account(
+                'other@example.com',
+                'password456',
+                '',
+                '',
+                group_id=group_id,
+                remark='次账号',
+                account_type='imap',
+                provider='custom',
+                imap_host='imap.example.com',
+                imap_port=993,
+                imap_password='imap-secret',
+                forward_enabled=False
+            )
+            self.assertTrue(added)
+
+        response = self.client.get(
+            '/api/external/accounts?group_id=1',
+            headers={'X-API-Key': 'test-external-key'}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['total'], 1)
+        self.assertEqual(len(payload['accounts']), 1)
+
+        account = payload['accounts'][0]
+        self.assertEqual(account['email'], 'user@outlook.com')
+        self.assertEqual(account['aliases'], ['alias@example.com'])
+        self.assertEqual(account['alias_count'], 1)
+        self.assertEqual(account['group_id'], 1)
+        self.assertEqual(account['group_name'], '默认分组')
+        self.assertEqual(account['remark'], '主账号')
+        self.assertEqual(account['status'], 'active')
+        self.assertEqual(account['provider'], 'outlook')
+        self.assertTrue(account['forward_enabled'])
+        self.assertEqual(account['last_refresh_status'], 'success')
+        self.assertIsNone(account['last_refresh_error'])
+        self.assertEqual(account['tags'][0]['name'], '核心')
+        self.assertNotIn('password', account)
+        self.assertNotIn('refresh_token', account)
+        self.assertNotIn('client_id', account)
+        self.assertNotIn('imap_host', account)
+        self.assertNotIn('imap_port', account)
+
+    def test_external_emails_supports_all_folder(self):
+        expected_result = {
+            'success': True,
+            'emails': [
+                {'id': 'junk-1', 'folder': 'junkemail', 'date': '2026-01-02T00:00:00Z'},
+                {'id': 'inbox-1', 'folder': 'inbox', 'date': '2026-01-01T00:00:00Z'},
+            ],
+            'method': 'Graph API / IMAP (New)',
+            'has_more': False,
+        }
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get(
+                '/api/external/emails?email=user@outlook.com&folder=all&skip=0&top=20',
+                headers={'X-API-Key': 'test-external-key'}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload, expected_result)
+
+        called_account, called_folder, called_skip, called_top = fetch_mock.call_args.args
+        self.assertEqual(called_account['email'], 'user@outlook.com')
+        self.assertEqual(called_folder, 'all')
+        self.assertEqual(called_skip, 0)
+        self.assertEqual(called_top, 20)
+
+    def test_external_emails_plus_address_falls_back_to_base_email(self):
+        expected_result = {
+            'success': True,
+            'emails': [{'id': 'inbox-1', 'folder': 'inbox', 'date': '2026-01-01T00:00:00Z'}],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get(
+                '/api/external/emails?email=user+verify@outlook.com&folder=inbox&top=1',
+                headers={'X-API-Key': 'test-external-key'}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['requested_email'], 'user+verify@outlook.com')
+        self.assertEqual(payload['resolved_email'], 'user@outlook.com')
+
+        called_account, called_folder, called_skip, called_top = fetch_mock.call_args.args
+        self.assertEqual(called_account['email'], 'user@outlook.com')
+        self.assertEqual(called_folder, 'inbox')
+        self.assertEqual(called_skip, 0)
+        self.assertEqual(called_top, 1)
+
+    def test_external_emails_plus_address_prefers_exact_match(self):
+        with self.app.app_context():
+            added = web_outlook_app.add_account(
+                'user+vip@outlook.com',
+                'password456',
+                'client-id-plus',
+                'refresh-token-plus',
+                group_id=1,
+                remark='plus 账号'
+            )
+            self.assertTrue(added)
+
+        expected_result = {
+            'success': True,
+            'emails': [{'id': 'inbox-plus', 'folder': 'inbox', 'date': '2026-01-03T00:00:00Z'}],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get(
+                '/api/external/emails?email=user+vip@outlook.com&folder=inbox&top=1',
+                headers={'X-API-Key': 'test-external-key'}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['requested_email'], 'user+vip@outlook.com')
+        self.assertEqual(payload['resolved_email'], 'user+vip@outlook.com')
+
+        called_account, called_folder, called_skip, called_top = fetch_mock.call_args.args
+        self.assertEqual(called_account['email'], 'user+vip@outlook.com')
+        self.assertEqual(called_folder, 'inbox')
+        self.assertEqual(called_skip, 0)
+        self.assertEqual(called_top, 1)
+
+    def test_external_emails_clamps_invalid_remote_pagination(self):
+        expected_result = {
+            'success': True,
+            'emails': [],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get(
+                '/api/external/emails?email=user@outlook.com&folder=inbox&skip=bad&top=999',
+                headers={'X-API-Key': 'test-external-key'}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        called_account, called_folder, called_skip, called_top = fetch_mock.call_args.args
+        self.assertEqual(called_account['email'], 'user@outlook.com')
+        self.assertEqual(called_folder, 'inbox')
+        self.assertEqual(called_skip, 0)
+        self.assertEqual(called_top, 50)
+
+    def test_legacy_external_emails_clamps_non_numeric_and_negative_pagination(self):
+        expected_result = {
+            'success': True,
+            'emails': [],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        original_view = self.app.view_functions['api_external_get_emails']
+        self.app.view_functions['api_external_get_emails'] = web_outlook_app.api_key_required(
+            web_outlook_app.api_external_get_emails
+        )
+        try:
+            with patch.object(web_outlook_app, 'get_emails_graph', return_value=expected_result) as graph_mock, \
+                    patch.object(web_outlook_app, 'get_emails_imap_with_server') as imap_mock:
+                response = self.client.get(
+                    '/api/external/emails?email=user@outlook.com&folder=inbox&skip=abc&top=-3',
+                    headers={'X-API-Key': 'test-external-key'},
+                )
+        finally:
+            self.app.view_functions['api_external_get_emails'] = original_view
+
+        status_code = response.status_code
+        self.assertNotEqual(status_code, 500)
+        self.assertEqual(status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['method'], 'Graph API')
+        self.assertIn('emails', payload)
+        self.assertIn('has_more', payload)
+        imap_mock.assert_not_called()
+
+        graph_args = graph_mock.call_args.args
+        self.assertEqual(graph_args[0], '24d9a0ed-8787-4584-883c-2fd79308940a')
+        self.assertEqual(graph_args[2], 'inbox')
+        self.assertEqual(graph_args[3], 0)
+        self.assertEqual(graph_args[4], 0)
+
+    def test_legacy_external_emails_keeps_valid_pagination_contract(self):
+        graph_result = {
+            'success': True,
+            'emails': [
+                {'id': 'legacy-1'},
+                {'id': 'legacy-2'},
+            ],
+        }
+
+        original_view = self.app.view_functions['api_external_get_emails']
+        self.app.view_functions['api_external_get_emails'] = web_outlook_app.api_key_required(
+            web_outlook_app.api_external_get_emails
+        )
+        try:
+            with patch.object(web_outlook_app, 'get_emails_graph', return_value=graph_result) as graph_mock:
+                response = self.client.get(
+                    '/api/external/emails?email=user@outlook.com&folder=inbox&skip=2&top=3',
+                    headers={'X-API-Key': 'test-external-key'},
+                )
+        finally:
+            self.app.view_functions['api_external_get_emails'] = original_view
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['method'], 'Graph API')
+        self.assertFalse(payload['has_more'])
+        self.assertEqual([item['id'] for item in payload['emails']], ['legacy-1', 'legacy-2'])
+
+        graph_args = graph_mock.call_args.args
+        self.assertEqual(graph_args[2], 'inbox')
+        self.assertEqual(graph_args[3], 2)
+        self.assertEqual(graph_args[4], 3)
+
+    def test_external_emails_plus_address_falls_back_to_alias_with_plus(self):
+        with self.app.app_context():
+            account = web_outlook_app.get_account_by_email('user@outlook.com')
+            self.assertIsNotNone(account)
+            alias_ok, _, alias_errors = web_outlook_app.replace_account_aliases(
+                account['id'],
+                account['email'],
+                ['alias@example.com', 'alias+team@example.com'],
+                web_outlook_app.get_db()
+            )
+            self.assertTrue(alias_ok, alias_errors)
+            web_outlook_app.get_db().commit()
+
+        expected_result = {
+            'success': True,
+            'emails': [{'id': 'inbox-alias-plus', 'folder': 'inbox', 'date': '2026-01-04T00:00:00Z'}],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get(
+                '/api/external/emails?email=alias+team+notice@example.com&folder=inbox&top=1',
+                headers={'X-API-Key': 'test-external-key'}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['requested_email'], 'alias+team+notice@example.com')
+        self.assertEqual(payload['resolved_email'], 'user@outlook.com')
+        self.assertEqual(payload['matched_alias'], 'alias+team@example.com')
+        self.assertTrue(payload['fallback_used'])
+        self.assertEqual(payload['fallback_email'], 'alias+team@example.com')
+        self.assertEqual(payload['resolved_query_email'], 'alias+team@example.com')
+
+        called_account, called_folder, called_skip, called_top = fetch_mock.call_args.args
+        self.assertEqual(called_account['email'], 'user@outlook.com')
+        self.assertEqual(called_account['matched_alias'], 'alias+team@example.com')
+        self.assertEqual(called_folder, 'inbox')
+        self.assertEqual(called_skip, 0)
+        self.assertEqual(called_top, 1)
+
+    def test_external_emails_gmail_suffix_falls_back_to_googlemail_account(self):
+        with self.app.app_context():
+            added = web_outlook_app.add_account(
+                'person@googlemail.com',
+                'password123',
+                '24d9a0ed-8787-4584-883c-2fd79308940b',
+                '0.AXEA_googlemail_refresh',
+                group_id=1,
+                remark='googlemail account',
+            )
+            self.assertTrue(added)
+
+        expected_result = {
+            'success': True,
+            'emails': [{'id': 'gmail-fallback', 'folder': 'inbox', 'date': '2026-01-05T00:00:00Z'}],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get(
+                '/api/external/emails?email=person@gmail.com&folder=inbox&top=1',
+                headers={'X-API-Key': 'test-external-key'}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['requested_email'], 'person@gmail.com')
+        self.assertEqual(payload['resolved_email'], 'person@googlemail.com')
+        self.assertTrue(payload['fallback_used'])
+        self.assertEqual(payload['fallback_email'], 'person@googlemail.com')
+        self.assertEqual(payload['resolved_query_email'], 'person@googlemail.com')
+
+        called_account = fetch_mock.call_args.args[0]
+        self.assertEqual(called_account['email'], 'person@googlemail.com')
+
+    def test_cloudflare_global_messages_lists_without_address_filter(self):
+        raw_message = (
+            "From: Sender <sender@example.com>\r\n"
+            "To: target@example.com\r\n"
+            "Subject: Cloudflare code\r\n"
+            "Date: Tue, 14 Apr 2026 08:20:50 +0000\r\n"
+            "\r\n"
+            "Your code is 123456"
+        )
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+        channel_id = self.create_cloudflare_channel()
+
+        with patch.object(web_outlook_app, 'cloudflare_get_admin_messages', return_value={
+            'success': True,
+            'messages': [{
+                'id': 123,
+                'address': 'target@example.com',
+                'source': 'sender@example.com',
+                'raw': raw_message,
+                'created_at': '2026-04-14T08:20:50Z',
+            }],
+            'count': 1,
+        }) as cloudflare_mock:
+            response = self.client.get(f'/api/cloudflare/messages?channel_id={channel_id}&limit=200&offset=0')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['limit'], 100)
+        self.assertEqual(payload['queried_email'], '')
+        self.assertFalse(payload['fallback_used'])
+        self.assertEqual(payload['count'], 1)
+        self.assertEqual(payload['emails'][0]['to'], 'target@example.com')
+        self.assertEqual(payload['emails'][0]['subject'], 'Cloudflare code')
+        self.assertEqual(cloudflare_mock.call_args.kwargs['limit'], 100)
+        self.assertEqual(cloudflare_mock.call_args.kwargs['offset'], 0)
+        self.assertEqual(cloudflare_mock.call_args.kwargs['address'], '')
+        self.assertEqual(cloudflare_mock.call_args.kwargs['channel']['id'], channel_id)
+
+    def test_cloudflare_global_messages_falls_back_between_gmail_suffixes(self):
+        raw_message = (
+            "From: Sender <sender@example.com>\r\n"
+            "To: user@googlemail.com\r\n"
+            "Subject: Googlemail code\r\n"
+            "Date: Tue, 14 Apr 2026 08:20:50 +0000\r\n"
+            "\r\n"
+            "Your code is 654321"
+        )
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+        channel_id = self.create_cloudflare_channel()
+
+        with patch.object(web_outlook_app, 'cloudflare_get_admin_messages', side_effect=[
+            {'success': True, 'messages': [], 'count': 0},
+            {
+                'success': True,
+                'messages': [{
+                    'id': 456,
+                    'address': 'user@googlemail.com',
+                    'source': 'sender@example.com',
+                    'raw': raw_message,
+                    'created_at': '2026-04-14T08:20:50Z',
+                }],
+                'count': 1,
+            },
+        ]) as cloudflare_mock:
+            response = self.client.get(
+                f'/api/cloudflare/messages?channel_id={channel_id}&address=user@gmail.com&limit=20&offset=0'
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['requested_email'], 'user@gmail.com')
+        self.assertEqual(payload['queried_email'], 'user@googlemail.com')
+        self.assertTrue(payload['fallback_used'])
+        self.assertTrue(payload['fallback_attempted'])
+        self.assertEqual(payload['emails'][0]['to'], 'user@googlemail.com')
+        self.assertEqual(
+            [call.kwargs['address'] for call in cloudflare_mock.call_args_list],
+            ['user@gmail.com', 'user@googlemail.com']
+        )
+        self.assertEqual(
+            [call.kwargs['channel']['id'] for call in cloudflare_mock.call_args_list],
+            [channel_id, channel_id]
+        )
+
+    def test_cloudflare_global_messages_do_not_write_temp_tables(self):
+        raw_message = (
+            "From: Sender <sender@example.com>\r\n"
+            "To: imported-nowhere@example.com\r\n"
+            "Subject: No local temp mailbox\r\n"
+            "\r\n"
+            "Body"
+        )
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM temp_email_tags')
+            db.execute('DELETE FROM temp_email_messages')
+            db.execute('DELETE FROM temp_emails')
+            db.commit()
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+        channel_id = self.create_cloudflare_channel()
+
+        with patch.object(web_outlook_app, 'cloudflare_get_admin_messages', return_value={
+            'success': True,
+            'messages': [{
+                'id': 789,
+                'address': 'imported-nowhere@example.com',
+                'raw': raw_message,
+            }],
+            'count': 1,
+        }):
+            response = self.client.get(f'/api/cloudflare/messages?channel_id={channel_id}')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['emails'][0]['to'], 'imported-nowhere@example.com')
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            temp_email_count = db.execute('SELECT COUNT(*) AS count FROM temp_emails').fetchone()['count']
+            temp_message_count = db.execute('SELECT COUNT(*) AS count FROM temp_email_messages').fetchone()['count']
+        self.assertEqual(temp_email_count, 0)
+        self.assertEqual(temp_message_count, 0)
+
+
+class BatchForwardingApiTests(unittest.TestCase):
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM account_tags')
+            db.execute('DELETE FROM account_aliases')
+            db.execute('DELETE FROM account_refresh_logs')
+            db.execute('DELETE FROM accounts')
+            db.execute('DELETE FROM tags')
+            db.execute("DELETE FROM groups WHERE name NOT IN ('默认分组', '临时邮箱')")
+            db.commit()
+
+            self.assertTrue(web_outlook_app.add_account(
+                'disabled-forward@outlook.com',
+                'password123',
+                'client-id-disabled',
+                'refresh-token-disabled',
+                group_id=1,
+                forward_enabled=False
+            ))
+            self.assertTrue(web_outlook_app.add_account(
+                'enabled-forward@outlook.com',
+                'password123',
+                'client-id-enabled',
+                'refresh-token-enabled',
+                group_id=1,
+                forward_enabled=True
+            ))
+
+            disabled_account = web_outlook_app.get_account_by_email('disabled-forward@outlook.com')
+            enabled_account = web_outlook_app.get_account_by_email('enabled-forward@outlook.com')
+            self.assertIsNotNone(disabled_account)
+            self.assertIsNotNone(enabled_account)
+
+            self.disabled_account_id = disabled_account['id']
+            self.enabled_account_id = enabled_account['id']
+            self.disabled_cursor_before = disabled_account.get('forward_last_checked_at')
+            self.enabled_cursor_before = enabled_account.get('forward_last_checked_at')
+
+    def test_batch_enable_forwarding_only_updates_disabled_accounts(self):
+        response = self.client.post(
+            '/api/accounts/batch-update-forwarding',
+            json={
+                'account_ids': [self.disabled_account_id, self.enabled_account_id],
+                'forward_enabled': True,
+            }
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['updated_count'], 1)
+        self.assertEqual(payload['unchanged_count'], 1)
+
+        with self.app.app_context():
+            disabled_account = web_outlook_app.get_account_by_id(self.disabled_account_id)
+            enabled_account = web_outlook_app.get_account_by_id(self.enabled_account_id)
+
+        self.assertTrue(disabled_account['forward_enabled'])
+        self.assertTrue(disabled_account['forward_last_checked_at'])
+        self.assertEqual(enabled_account['forward_last_checked_at'], self.enabled_cursor_before)
+
+    def test_batch_disable_forwarding_only_updates_enabled_accounts(self):
+        response = self.client.post(
+            '/api/accounts/batch-update-forwarding',
+            json={
+                'account_ids': [self.disabled_account_id, self.enabled_account_id],
+                'forward_enabled': False,
+            }
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['updated_count'], 1)
+        self.assertEqual(payload['unchanged_count'], 1)
+
+        with self.app.app_context():
+            disabled_account = web_outlook_app.get_account_by_id(self.disabled_account_id)
+            enabled_account = web_outlook_app.get_account_by_id(self.enabled_account_id)
+
+        self.assertFalse(disabled_account['forward_enabled'])
+        self.assertEqual(disabled_account['forward_last_checked_at'], self.disabled_cursor_before)
+        self.assertFalse(enabled_account['forward_enabled'])
+        self.assertEqual(enabled_account['forward_last_checked_at'], self.enabled_cursor_before)
+
+
+class TempEmailTagsApiTests(unittest.TestCase):
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM temp_email_tags')
+            db.execute('DELETE FROM temp_email_messages')
+            db.execute('DELETE FROM temp_emails')
+            db.execute('DELETE FROM account_tags')
+            db.execute('DELETE FROM tags')
+            db.commit()
+
+            self.primary_tag_id = web_outlook_app.add_tag('临时重点', '#111111')
+            self.secondary_tag_id = web_outlook_app.add_tag('待清理', '#ff6600')
+            self.assertTrue(web_outlook_app.add_temp_email('case-one@example.com', provider='gptmail'))
+            self.assertTrue(web_outlook_app.add_temp_email('case-two@example.com', provider='duckmail'))
+
+            self.temp_email_one = web_outlook_app.get_temp_email_by_address('case-one@example.com')
+            self.temp_email_two = web_outlook_app.get_temp_email_by_address('case-two@example.com')
+            self.assertIsNotNone(self.temp_email_one)
+            self.assertIsNotNone(self.temp_email_two)
+
+    def test_get_temp_emails_returns_tags(self):
+        with self.app.app_context():
+            self.assertTrue(web_outlook_app.add_temp_email_tag(self.temp_email_one['id'], self.primary_tag_id))
+
+        response = self.client.get('/api/temp-emails')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        email_map = {item['email']: item for item in payload['emails']}
+        self.assertIn('case-one@example.com', email_map)
+        self.assertEqual(email_map['case-one@example.com']['tags'][0]['name'], '临时重点')
+        self.assertEqual(email_map['case-two@example.com']['tags'], [])
+
+    def test_batch_manage_temp_email_tags_add_and_remove(self):
+        add_response = self.client.post(
+            '/api/temp-emails/tags',
+            json={
+                'temp_email_ids': [self.temp_email_one['id'], self.temp_email_two['id']],
+                'tag_id': self.secondary_tag_id,
+                'action': 'add',
+            }
+        )
+
+        self.assertEqual(add_response.status_code, 200)
+        add_payload = add_response.get_json()
+        self.assertTrue(add_payload['success'])
+
+        with self.app.app_context():
+            first_tags = web_outlook_app.get_temp_email_tags(self.temp_email_one['id'])
+            second_tags = web_outlook_app.get_temp_email_tags(self.temp_email_two['id'])
+
+        self.assertEqual([tag['name'] for tag in first_tags], ['待清理'])
+        self.assertEqual([tag['name'] for tag in second_tags], ['待清理'])
+
+        remove_response = self.client.post(
+            '/api/temp-emails/tags',
+            json={
+                'temp_email_ids': [self.temp_email_one['id']],
+                'tag_id': self.secondary_tag_id,
+                'action': 'remove',
+            }
+        )
+
+        self.assertEqual(remove_response.status_code, 200)
+        remove_payload = remove_response.get_json()
+        self.assertTrue(remove_payload['success'])
+
+        with self.app.app_context():
+            first_tags = web_outlook_app.get_temp_email_tags(self.temp_email_one['id'])
+            second_tags = web_outlook_app.get_temp_email_tags(self.temp_email_two['id'])
+
+        self.assertEqual(first_tags, [])
+        self.assertEqual([tag['name'] for tag in second_tags], ['待清理'])
+
+
+class AssetRenderingTests(unittest.TestCase):
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.client = self.app.test_client()
+
+    def test_index_uses_bundled_stylesheet_route(self):
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+
+        response = self.client.get('/')
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertRegex(html, r'href="/assets/index\.css\?v=[0-9a-f]{16}"')
+        self.assertNotIn('href="/static/index.css"', html)
+
+    def test_bundled_stylesheet_contains_combined_css_without_imports(self):
+        response = self.client.get('/assets/index.css')
+        css = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, 'text/css')
+        self.assertNotIn('@import', css)
+        self.assertIn('.toast', css)
+        self.assertIn('.group-panel', css)
+        self.assertIn('.account-panel', css)
+
+
+class RefreshTokenProxyFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM account_refresh_logs')
+            db.execute('DELETE FROM accounts')
+            db.execute("DELETE FROM groups WHERE name NOT IN ('默认分组', '临时邮箱')")
+            db.commit()
+
+            group_id = web_outlook_app.add_group(
+                '代理刷新组',
+                '测试代理失败后直连重试',
+                '#225588',
+                'socks5://127.0.0.1:1080',
+                'http://127.0.0.1:7891',
+                'direct',
+            )
+            self.assertIsNotNone(group_id)
+            self.group_id = group_id
+
+            added = web_outlook_app.add_account(
+                'proxy-refresh@outlook.com',
+                'password123',
+                '24d9a0ed-8787-4584-883c-2fd79308940a',
+                '0.AXEA_refresh',
+                group_id=group_id,
+                remark='代理刷新测试账号',
+                forward_enabled=False,
+            )
+            self.assertTrue(added)
+
+            account = web_outlook_app.get_account_by_email('proxy-refresh@outlook.com')
+            self.assertIsNotNone(account)
+            self.account_id = account['id']
+
+    def test_refresh_account_retries_with_fallback_proxies_in_order(self):
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {'access_token': 'access-token'}
+
+        proxy_error = web_outlook_app.requests.exceptions.ConnectionError(
+            'SOCKSHTTPSConnectionPool(host=\'login.microsoftonline.com\', port=443): '
+            'Max retries exceeded with url: /common/oauth2/v2.0/token '
+            '(Caused by NewConnectionError("SOCKSHTTPSConnection(host=\'login.microsoftonline.com\', '
+            'port=443): Failed to establish a new connection: 0x04: Host unreachable"))'
+        )
+
+        http_proxy_error = web_outlook_app.requests.exceptions.ProxyError(
+            'HTTPSConnectionPool(host=\'login.microsoftonline.com\', port=443): '
+            'Max retries exceeded with url: /common/oauth2/v2.0/token '
+            '(Caused by ProxyError(\'Unable to connect to proxy\', OSError(\'proxy connect failed\')))'
+        )
+
+        with patch.object(web_outlook_app.requests, 'request', side_effect=[proxy_error, http_proxy_error, FakeResponse()]) as mocked_request:
+            response = self.client.post(f'/api/accounts/{self.account_id}/refresh')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['message'], 'Token 刷新成功')
+        self.assertEqual(mocked_request.call_count, 3)
+        self.assertEqual(
+            mocked_request.call_args_list[0].kwargs['proxies'],
+            {'http': 'socks5://127.0.0.1:1080', 'https': 'socks5://127.0.0.1:1080'},
+        )
+        self.assertEqual(
+            mocked_request.call_args_list[1].kwargs['proxies'],
+            {'http': 'http://127.0.0.1:7891', 'https': 'http://127.0.0.1:7891'},
+        )
+        self.assertEqual(
+            mocked_request.call_args_list[2].kwargs['proxies'],
+            {'http': None, 'https': None, 'all': None},
+        )
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            log_row = db.execute(
+                '''
+                SELECT status, error_message
+                FROM account_refresh_logs
+                WHERE account_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                ''',
+                (self.account_id,),
+            ).fetchone()
+
+        self.assertIsNotNone(log_row)
+        self.assertEqual(log_row['status'], 'success')
+        self.assertIsNone(log_row['error_message'])
+
+    def test_account_proxy_config_overrides_group_proxy(self):
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute(
+                '''
+                UPDATE accounts
+                SET proxy_url = ?,
+                    fallback_proxy_url_1 = ?,
+                    fallback_proxy_url_2 = ?
+                WHERE id = ?
+                ''',
+                (
+                    'http://account-primary:7890',
+                    'socks5://account-fallback:1080',
+                    'direct',
+                    self.account_id,
+                ),
+            )
+            db.commit()
+
+            account = web_outlook_app.get_account_by_id(self.account_id)
+            self.assertEqual(web_outlook_app.get_account_proxy_url(account), 'http://account-primary:7890')
+            self.assertEqual(
+                web_outlook_app.get_account_proxy_failover_urls(account),
+                ['socks5://account-fallback:1080', 'direct'],
+            )
+
+            db.execute(
+                '''
+                UPDATE accounts
+                SET proxy_url = '',
+                    fallback_proxy_url_1 = '',
+                    fallback_proxy_url_2 = ''
+                WHERE id = ?
+                ''',
+                (self.account_id,),
+            )
+            db.commit()
+
+            inherited_account = web_outlook_app.get_account_by_id(self.account_id)
+            self.assertEqual(web_outlook_app.get_account_proxy_url(inherited_account), 'socks5://127.0.0.1:1080')
+            self.assertEqual(
+                web_outlook_app.get_account_proxy_failover_urls(inherited_account),
+                ['http://127.0.0.1:7891', 'direct'],
+            )
+
+    def test_account_api_persists_proxy_fields(self):
+        response = self.client.put(
+            f'/api/accounts/{self.account_id}',
+            json={
+                'email': 'proxy-refresh@outlook.com',
+                'password': 'password123',
+                'client_id': '24d9a0ed-8787-4584-883c-2fd79308940a',
+                'refresh_token': '0.AXEA_refresh',
+                'group_id': self.group_id,
+                'remark': '代理刷新测试账号',
+                'status': 'active',
+                'account_type': 'outlook',
+                'provider': 'outlook',
+                'forward_enabled': False,
+                'proxy_url': 'socks5://account-api:1080',
+                'fallback_proxy_url_1': 'http://account-api-fallback:7890',
+                'fallback_proxy_url_2': '直连',
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        response = self.client.get(f'/api/accounts/{self.account_id}')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['account']['proxy_url'], 'socks5://account-api:1080')
+        self.assertEqual(payload['account']['fallback_proxy_url_1'], 'http://account-api-fallback:7890')
+        self.assertEqual(payload['account']['fallback_proxy_url_2'], '直连')
+        self.assertTrue(payload['account']['proxy_override_enabled'])
+
+        response = self.client.put(
+            f'/api/accounts/{self.account_id}',
+            json={
+                'email': 'proxy-refresh@outlook.com',
+                'password': 'password123',
+                'client_id': '24d9a0ed-8787-4584-883c-2fd79308940a',
+                'refresh_token': '0.AXEA_refresh',
+                'group_id': self.group_id,
+                'remark': '代理刷新测试账号-未传代理字段',
+                'status': 'active',
+                'account_type': 'outlook',
+                'provider': 'outlook',
+                'forward_enabled': False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        response = self.client.get(f'/api/accounts/{self.account_id}')
+        payload = response.get_json()
+        self.assertEqual(payload['account']['proxy_url'], 'socks5://account-api:1080')
+        self.assertEqual(payload['account']['fallback_proxy_url_1'], 'http://account-api-fallback:7890')
+        self.assertEqual(payload['account']['fallback_proxy_url_2'], '直连')
+
+    def test_batch_update_account_proxy_sets_and_clears_override(self):
+        with self.app.app_context():
+            added = web_outlook_app.add_account(
+                'proxy-refresh-batch@outlook.com',
+                'password123',
+                '24d9a0ed-8787-4584-883c-2fd79308940a',
+                '0.AXEA_refresh_batch',
+                group_id=self.group_id,
+            )
+            self.assertTrue(added)
+            second_account = web_outlook_app.get_account_by_email('proxy-refresh-batch@outlook.com')
+            self.assertIsNotNone(second_account)
+            second_account_id = second_account['id']
+
+        response = self.client.post(
+            '/api/accounts/batch-update-proxy',
+            json={
+                'account_ids': [self.account_id, second_account_id],
+                'proxy_url': 'http://batch-primary:7890',
+                'fallback_proxy_url_1': 'socks5://batch-fallback:1080',
+                'fallback_proxy_url_2': 'direct',
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['updated_count'], 2)
+
+        with self.app.app_context():
+            first_account = web_outlook_app.get_account_by_id(self.account_id)
+            second_account = web_outlook_app.get_account_by_id(second_account_id)
+            for account in (first_account, second_account):
+                self.assertEqual(web_outlook_app.get_account_proxy_url(account), 'http://batch-primary:7890')
+                self.assertEqual(
+                    web_outlook_app.get_account_proxy_failover_urls(account),
+                    ['socks5://batch-fallback:1080', 'direct'],
+                )
+
+        response = self.client.post(
+            '/api/accounts/batch-update-proxy',
+            json={
+                'account_ids': [self.account_id, second_account_id],
+                'proxy_url': '',
+                'fallback_proxy_url_1': '',
+                'fallback_proxy_url_2': '',
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['updated_count'], 2)
+
+        with self.app.app_context():
+            first_account = web_outlook_app.get_account_by_id(self.account_id)
+            second_account = web_outlook_app.get_account_by_id(second_account_id)
+            for account in (first_account, second_account):
+                self.assertFalse(web_outlook_app.account_has_proxy_override(account))
+                self.assertEqual(web_outlook_app.get_account_proxy_url(account), 'socks5://127.0.0.1:1080')
+
+    def test_refresh_account_uses_delegated_graph_scope_before_default_scope(self):
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {'access_token': 'access-token'}
+
+        with patch.object(web_outlook_app.requests, 'request', return_value=FakeResponse()) as mocked_request:
+            response = self.client.post(f'/api/accounts/{self.account_id}/refresh')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        request_data = mocked_request.call_args.kwargs['data']
+        self.assertIn('https://graph.microsoft.com/Mail.Read', request_data['scope'])
+        self.assertIn('https://graph.microsoft.com/Mail.ReadWrite', request_data['scope'])
+        self.assertIn('offline_access', request_data['scope'])
+        self.assertNotEqual(request_data['scope'], 'https://graph.microsoft.com/.default')
+
+    def test_refresh_account_falls_back_to_original_scope_after_aadsts90023(self):
+        class FakeResponse:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        no_permissions_response = FakeResponse(400, {
+            'error': 'invalid_request',
+            'error_description': 'AADSTS90023: No applicable permissions were found for this user.',
+        })
+        success_response = FakeResponse(200, {
+            'access_token': 'access-token',
+            'refresh_token': 'M.C556_SN1.0.U.rotated',
+        })
+
+        with patch.object(
+            web_outlook_app.requests,
+            'request',
+            side_effect=[
+                no_permissions_response,
+                no_permissions_response,
+                no_permissions_response,
+                success_response,
+            ],
+        ) as mocked_request:
+            response = self.client.post(f'/api/accounts/{self.account_id}/refresh')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        request_data = [call.kwargs['data'] for call in mocked_request.call_args_list]
+        self.assertIn('scope', request_data[0])
+        self.assertIn('scope', request_data[1])
+        self.assertEqual(request_data[2]['scope'], 'https://graph.microsoft.com/.default')
+        self.assertNotIn('scope', request_data[3])
+
+        with self.app.app_context():
+            refreshed = web_outlook_app.get_account_by_id(self.account_id)
+
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed['refresh_token'], 'M.C556_SN1.0.U.rotated')
+
+    def test_refresh_account_falls_back_to_default_scope_after_aadsts70000(self):
+        class FakeResponse:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        unauthorized_scope_response = FakeResponse(400, {
+            'error': 'invalid_grant',
+            'error_description': (
+                'AADSTS70000: The request was denied because one or more scopes requested '
+                'are unauthorized or expired. The user must first sign in and grant the '
+                'client application access to the requested scope.'
+            ),
+        })
+        success_response = FakeResponse(200, {
+            'access_token': 'access-token',
+            'refresh_token': 'M.C556_SN1.0.U.default-rotated',
+        })
+
+        with patch.object(
+            web_outlook_app.requests,
+            'request',
+            side_effect=[
+                unauthorized_scope_response,
+                unauthorized_scope_response,
+                success_response,
+            ],
+        ) as mocked_request:
+            response = self.client.post(f'/api/accounts/{self.account_id}/refresh')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        request_data = [call.kwargs['data'] for call in mocked_request.call_args_list]
+        self.assertIn('https://graph.microsoft.com/Mail.ReadWrite', request_data[0]['scope'])
+        self.assertNotIn('https://graph.microsoft.com/Mail.ReadWrite', request_data[1]['scope'])
+        self.assertEqual(request_data[2]['scope'], 'https://graph.microsoft.com/.default')
+
+        with self.app.app_context():
+            refreshed = web_outlook_app.get_account_by_id(self.account_id)
+
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed['refresh_token'], 'M.C556_SN1.0.U.default-rotated')
+
+    def test_refresh_account_falls_back_to_imap_after_graph_refresh_fails(self):
+        class FakeResponse:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        graph_failure = FakeResponse(400, {
+            'error': 'invalid_grant',
+            'error_description': (
+                'AADSTS70000: The request was denied because one or more scopes requested '
+                'are unauthorized or expired.'
+            ),
+        })
+        imap_success = FakeResponse(200, {
+            'access_token': 'imap-access-token',
+            'refresh_token': 'M.C556_SN1.0.U.imap-rotated',
+        })
+
+        with patch.object(
+            web_outlook_app.requests,
+            'request',
+            side_effect=[
+                graph_failure,
+                graph_failure,
+                graph_failure,
+                graph_failure,
+                imap_success,
+            ],
+        ) as mocked_request:
+            response = self.client.post(f'/api/accounts/{self.account_id}/refresh')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        request_urls = [call.args[1] for call in mocked_request.call_args_list]
+        self.assertEqual(request_urls[:4], [web_outlook_app.TOKEN_URL_GRAPH] * 4)
+        self.assertEqual(request_urls[4], web_outlook_app.TOKEN_URL_IMAP)
+
+        imap_request_data = mocked_request.call_args_list[4].kwargs['data']
+        self.assertEqual(imap_request_data['scope'], web_outlook_app.IMAP_TOKEN_SCOPE)
+
+        with self.app.app_context():
+            refreshed = web_outlook_app.get_account_by_id(self.account_id)
+
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed['refresh_token'], 'M.C556_SN1.0.U.imap-rotated')
+
+    def test_graph_access_token_uses_delegated_scope_before_default_scope(self):
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {'access_token': 'access-token'}
+
+        with patch.object(web_outlook_app.requests, 'request', return_value=FakeResponse()) as mocked_request:
+            result = web_outlook_app.get_access_token_graph_result('client-id', 'refresh-token')
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['access_token'], 'access-token')
+        request_data = mocked_request.call_args.kwargs['data']
+        self.assertIn('https://graph.microsoft.com/Mail.Read', request_data['scope'])
+        self.assertIn('https://graph.microsoft.com/Mail.ReadWrite', request_data['scope'])
+        self.assertNotEqual(request_data['scope'], 'https://graph.microsoft.com/.default')
+
+    def test_refresh_account_persists_rotated_refresh_token(self):
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    'access_token': 'access-token',
+                    'refresh_token': '0.AXEA_rotated_manual',
+                }
+
+        with patch.object(web_outlook_app.requests, 'request', return_value=FakeResponse()):
+            response = self.client.post(f'/api/accounts/{self.account_id}/refresh')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        with self.app.app_context():
+            refreshed = web_outlook_app.get_account_by_id(self.account_id)
+
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed['refresh_token'], '0.AXEA_rotated_manual')
+
+    def test_trigger_refresh_internal_persists_rotated_refresh_token(self):
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    'access_token': 'access-token',
+                    'refresh_token': '0.AXEA_rotated_scheduled',
+                }
+
+        with patch.object(web_outlook_app.requests, 'request', return_value=FakeResponse()):
+            web_outlook_app.trigger_refresh_internal()
+
+        with self.app.app_context():
+            refreshed = web_outlook_app.get_account_by_id(self.account_id)
+
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed['refresh_token'], '0.AXEA_rotated_scheduled')
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            account_row = db.execute(
+                '''
+                SELECT last_refresh_status, last_refresh_error, last_refresh_at, refresh_token_updated_at
+                FROM accounts
+                WHERE id = ?
+                ''',
+                (self.account_id,),
+            ).fetchone()
+            snapshot_row = db.execute(
+                '''
+                SELECT trigger_type, status, total_count, success_count, failed_count, finished_at
+                FROM token_refresh_state
+                WHERE scope_key = 'all_outlook'
+                '''
+            ).fetchone()
+
+        self.assertEqual(account_row['last_refresh_status'], 'success')
+        self.assertIsNone(account_row['last_refresh_error'])
+        self.assertIsNotNone(account_row['last_refresh_at'])
+        self.assertIsNotNone(account_row['refresh_token_updated_at'])
+        self.assertEqual(snapshot_row['trigger_type'], 'scheduled')
+        self.assertEqual(snapshot_row['status'], 'success')
+        self.assertEqual(snapshot_row['total_count'], 1)
+        self.assertEqual(snapshot_row['success_count'], 1)
+        self.assertEqual(snapshot_row['failed_count'], 0)
+        self.assertIsNotNone(snapshot_row['finished_at'])
+
+    def test_run_full_refresh_marks_failed_snapshot_on_unexpected_exception(self):
+        with self.assertRaises(RuntimeError):
+            with patch.object(web_outlook_app, 'refresh_outlook_account_token', side_effect=RuntimeError('boom')):
+                web_outlook_app.run_full_refresh('scheduled', 'scheduled')
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            account_row = db.execute(
+                '''
+                SELECT last_refresh_status, last_refresh_error
+                FROM accounts
+                WHERE id = ?
+                ''',
+                (self.account_id,),
+            ).fetchone()
+            snapshot_row = db.execute(
+                '''
+                SELECT status, total_count, success_count, failed_count, error_summary
+                FROM token_refresh_state
+                WHERE scope_key = 'all_outlook'
+                '''
+            ).fetchone()
+
+        self.assertEqual(account_row['last_refresh_status'], 'failed')
+        self.assertEqual(account_row['last_refresh_error'], 'boom')
+        self.assertEqual(snapshot_row['status'], 'failed')
+        self.assertEqual(snapshot_row['total_count'], 1)
+        self.assertEqual(snapshot_row['success_count'], 0)
+        self.assertEqual(snapshot_row['failed_count'], 1)
+        self.assertIn('boom', snapshot_row['error_summary'])
+
+    def test_run_full_refresh_rejects_when_another_full_refresh_is_running(self):
+        web_outlook_app.token_refresh_run_lock.acquire()
+        try:
+            with self.assertRaises(web_outlook_app.TokenRefreshInProgressError):
+                web_outlook_app.run_full_refresh('scheduled', 'scheduled')
+        finally:
+            web_outlook_app.token_refresh_run_lock.release()
+
+    def test_stream_full_refresh_events_yields_conflict_when_locked(self):
+        web_outlook_app.token_refresh_run_lock.acquire()
+        stream = web_outlook_app.stream_full_refresh_events('manual_all', 'manual')
+        try:
+            first_event = next(stream)
+        finally:
+            stream.close()
+            web_outlook_app.token_refresh_run_lock.release()
+
+        payload = json.loads(first_event.removeprefix('data: ').strip())
+        self.assertEqual(payload['type'], 'conflict')
+        self.assertIn('已有 Token 全量刷新任务在执行', payload['message'])
+
+    def test_stop_full_refresh_requests_stop_when_running(self):
+        web_outlook_app.clear_token_refresh_stop_request()
+        web_outlook_app.token_refresh_run_lock.acquire()
+        try:
+            response = self.client.post('/api/accounts/stop-full-refresh')
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertTrue(payload['success'])
+            self.assertTrue(web_outlook_app.is_token_refresh_stop_requested())
+        finally:
+            web_outlook_app.clear_token_refresh_stop_request()
+            web_outlook_app.token_refresh_run_lock.release()
+
+    def test_stream_full_refresh_events_yields_stopped_when_stop_requested(self):
+        with self.app.app_context():
+            self.assertTrue(
+                web_outlook_app.add_account(
+                    'proxy-refresh-2@outlook.com',
+                    'password123',
+                    '24d9a0ed-8787-4584-883c-2fd79308940a',
+                    '0.AXEA_refresh_2',
+                    group_id=self.group_id,
+                    remark='第二个刷新账号',
+                    forward_enabled=False,
+                )
+            )
+
+        processed_emails = []
+
+        def fake_refresh(account, *_args, **_kwargs):
+            processed_emails.append(account['email'])
+            if len(processed_emails) == 1:
+                web_outlook_app.request_token_refresh_stop()
+            return {'success': True, 'message': 'Token 刷新成功'}
+
+        with patch.object(web_outlook_app, 'refresh_outlook_account_token', side_effect=fake_refresh):
+            stream = web_outlook_app.stream_full_refresh_events('manual_all', 'manual')
+            try:
+                events = list(stream)
+            finally:
+                stream.close()
+
+        payloads = [json.loads(item.removeprefix('data: ').strip()) for item in events]
+        self.assertEqual(payloads[-1]['type'], 'stopped')
+        self.assertEqual(payloads[-1]['processed_count'], 1)
+        self.assertEqual(len(processed_emails), 1)
+
+        with self.app.app_context():
+            snapshot_row = web_outlook_app.get_db().execute(
+                '''
+                SELECT status, total_count, success_count, failed_count, error_summary
+                FROM token_refresh_state
+                WHERE scope_key = 'all_outlook'
+                '''
+            ).fetchone()
+
+        self.assertEqual(snapshot_row['status'], 'partial_failed')
+        self.assertEqual(snapshot_row['total_count'], 2)
+        self.assertEqual(snapshot_row['success_count'], 1)
+        self.assertEqual(snapshot_row['failed_count'], 0)
+        self.assertIn('手动停止', snapshot_row['error_summary'])
+
+    def test_stream_failed_refresh_events_yields_complete_and_reads_delay(self):
+        with self.app.app_context():
+            self.assertTrue(
+                web_outlook_app.add_account(
+                    'proxy-refresh-2@outlook.com',
+                    'password123',
+                    '24d9a0ed-8787-4584-883c-2fd79308940a',
+                    '0.AXEA_refresh_2',
+                    group_id=self.group_id,
+                    remark='第二个失败重试账号',
+                    forward_enabled=False,
+                )
+            )
+            db = web_outlook_app.get_db()
+            db.execute(
+                '''
+                UPDATE accounts
+                SET last_refresh_status = 'failed',
+                    last_refresh_error = 'proxy timeout',
+                    last_refresh_at = '2026-04-27 10:00:00'
+                WHERE id = ?
+                ''',
+                (self.account_id,),
+            )
+            db.execute(
+                '''
+                UPDATE accounts
+                SET last_refresh_status = 'failed',
+                    last_refresh_error = 'expired token',
+                    last_refresh_at = '2026-04-27 11:00:00'
+                WHERE email = ?
+                ''',
+                ('proxy-refresh-2@outlook.com',),
+            )
+            db.commit()
+            self.assertTrue(web_outlook_app.set_setting('refresh_delay_seconds', '7'))
+
+        wait_calls = []
+
+        def fake_wait(delay_seconds):
+            wait_calls.append(delay_seconds)
+            return True
+
+        with patch.object(
+            web_outlook_app,
+            'refresh_outlook_account_token',
+            side_effect=[
+                {'success': False, 'error_message': 'still failing'},
+                {'success': True, 'message': 'Token 刷新成功'},
+            ],
+        ), patch.object(web_outlook_app, 'wait_refresh_delay', side_effect=fake_wait):
+            stream = web_outlook_app.stream_failed_refresh_events()
+            try:
+                events = list(stream)
+            finally:
+                stream.close()
+
+        payloads = [json.loads(item.removeprefix('data: ').strip()) for item in events]
+        self.assertEqual(payloads[0]['type'], 'start')
+        self.assertEqual(payloads[0]['delay_seconds'], 7)
+        self.assertEqual(payloads[0]['refresh_type'], 'retry_failed')
+        self.assertEqual([item['seconds'] for item in payloads if item['type'] == 'delay'], [7])
+        self.assertEqual(wait_calls, [7])
+        self.assertEqual(payloads[-1]['type'], 'complete')
+        self.assertEqual(payloads[-1]['success_count'], 1)
+        self.assertEqual(payloads[-1]['failed_count'], 1)
+        self.assertEqual(payloads[-1]['refresh_type'], 'retry_failed')
+
+    def test_stream_failed_refresh_events_yields_stopped_when_stop_requested(self):
+        with self.app.app_context():
+            self.assertTrue(
+                web_outlook_app.add_account(
+                    'proxy-refresh-2@outlook.com',
+                    'password123',
+                    '24d9a0ed-8787-4584-883c-2fd79308940a',
+                    '0.AXEA_refresh_2',
+                    group_id=self.group_id,
+                    remark='第二个失败重试账号',
+                    forward_enabled=False,
+                )
+            )
+            db = web_outlook_app.get_db()
+            db.execute(
+                '''
+                UPDATE accounts
+                SET last_refresh_status = 'failed',
+                    last_refresh_error = 'proxy timeout',
+                    last_refresh_at = '2026-04-27 10:00:00'
+                WHERE id = ?
+                ''',
+                (self.account_id,),
+            )
+            db.execute(
+                '''
+                UPDATE accounts
+                SET last_refresh_status = 'failed',
+                    last_refresh_error = 'expired token',
+                    last_refresh_at = '2026-04-27 11:00:00'
+                WHERE email = ?
+                ''',
+                ('proxy-refresh-2@outlook.com',),
+            )
+            db.commit()
+
+        processed_emails = []
+
+        def fake_refresh(account, *_args, **_kwargs):
+            processed_emails.append(account['email'])
+            if len(processed_emails) == 1:
+                web_outlook_app.request_token_refresh_stop()
+            return {'success': True, 'message': 'Token 刷新成功'}
+
+        with patch.object(web_outlook_app, 'refresh_outlook_account_token', side_effect=fake_refresh):
+            stream = web_outlook_app.stream_failed_refresh_events()
+            try:
+                events = list(stream)
+            finally:
+                stream.close()
+
+        payloads = [json.loads(item.removeprefix('data: ').strip()) for item in events]
+        self.assertEqual(payloads[-1]['type'], 'stopped')
+        self.assertEqual(payloads[-1]['processed_count'], 1)
+        self.assertEqual(payloads[-1]['refresh_type'], 'retry_failed')
+        self.assertEqual(len(processed_emails), 1)
+
+    def test_cleanup_refresh_logs_removes_entries_older_than_six_months(self):
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM account_refresh_logs')
+            db.execute(
+                '''
+                INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message, created_at)
+                VALUES (?, ?, ?, ?, ?, datetime('now', '-8 months'))
+                ''',
+                (self.account_id, 'proxy-refresh@outlook.com', 'manual', 'failed', 'old failure')
+            )
+            db.execute(
+                '''
+                INSERT INTO account_refresh_logs (account_id, account_email, refresh_type, status, error_message, created_at)
+                VALUES (?, ?, ?, ?, ?, datetime('now', '-2 months'))
+                ''',
+                (self.account_id, 'proxy-refresh@outlook.com', 'manual', 'success', None)
+            )
+            db.commit()
+
+            deleted_count = web_outlook_app.cleanup_refresh_logs()
+
+            remaining_rows = db.execute(
+                '''
+                SELECT status, error_message
+                FROM account_refresh_logs
+                ORDER BY created_at ASC, id ASC
+                '''
+            ).fetchall()
+
+        self.assertEqual(deleted_count, 1)
+        self.assertEqual(len(remaining_rows), 1)
+        self.assertEqual(remaining_rows[0]['status'], 'success')
+        self.assertIsNone(remaining_rows[0]['error_message'])
+
+    def test_refresh_status_list_filters_by_latest_status(self):
+        with self.app.app_context():
+            self.assertTrue(
+                web_outlook_app.add_account(
+                    'success-status@example.com',
+                    'password123',
+                    '24d9a0ed-8787-4584-883c-2fd79308940a',
+                    '0.AXEA_success',
+                    group_id=self.group_id,
+                    remark='成功账号',
+                    forward_enabled=False,
+                )
+            )
+            self.assertTrue(
+                web_outlook_app.add_account(
+                    'never-status@example.com',
+                    'password123',
+                    '24d9a0ed-8787-4584-883c-2fd79308940a',
+                    '0.AXEA_never',
+                    group_id=self.group_id,
+                    remark='从未刷新账号',
+                    forward_enabled=False,
+                )
+            )
+            self.assertTrue(
+                web_outlook_app.add_account(
+                    'imap-hidden@example.com',
+                    'password123',
+                    '',
+                    '',
+                    group_id=self.group_id,
+                    remark='不应出现在刷新列表',
+                    account_type='imap',
+                    provider='custom',
+                    imap_host='imap.example.com',
+                    imap_port=993,
+                    imap_password='imap-secret',
+                    forward_enabled=False,
+                )
+            )
+
+            db = web_outlook_app.get_db()
+            db.execute(
+                '''
+                UPDATE accounts
+                SET last_refresh_status = 'failed',
+                    last_refresh_error = 'proxy timeout',
+                    last_refresh_at = '2026-04-27 10:00:00'
+                WHERE id = ?
+                ''',
+                (self.account_id,),
+            )
+            db.execute(
+                '''
+                UPDATE accounts
+                SET last_refresh_status = 'success',
+                    last_refresh_error = NULL,
+                    last_refresh_at = '2026-04-27 11:00:00'
+                WHERE email = ?
+                ''',
+                ('success-status@example.com',),
+            )
+            db.execute(
+                '''
+                UPDATE token_refresh_state
+                SET trigger_type = 'manual_all',
+                    status = 'partial_failed',
+                    finished_at = '2026-04-27 11:30:00',
+                    total_count = 3,
+                    success_count = 1,
+                    failed_count = 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE scope_key = 'all_outlook'
+                '''
+            )
+            db.commit()
+
+        response = self.client.get('/api/accounts/refresh-status-list?status=failed&q=proxy&page=1&page_size=20')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['total'], 1)
+        self.assertEqual(len(payload['items']), 1)
+        self.assertEqual(payload['items'][0]['email'], 'proxy-refresh@outlook.com')
+        self.assertEqual(payload['items'][0]['last_refresh_status'], 'failed')
+        self.assertEqual(payload['items'][0]['last_refresh_error'], 'proxy timeout')
+        self.assertEqual(payload['stats']['total'], 3)
+        self.assertEqual(payload['stats']['success_count'], 1)
+        self.assertEqual(payload['stats']['failed_count'], 1)
+        self.assertEqual(payload['stats']['never_count'], 1)
+        self.assertEqual(payload['stats']['last_refresh_status'], 'partial_failed')
+        self.assertEqual(payload['stats']['last_refresh_time'], '2026-04-27 11:30:00')
+
+    def test_refresh_status_list_uses_page_and_page_size_parameters(self):
+        with self.app.app_context():
+            self.assertTrue(web_outlook_app.add_account(
+                'refresh-page-a@example.com',
+                'password123',
+                'client-id-page-a',
+                'refresh-token-page-a',
+                group_id=self.group_id,
+                forward_enabled=False,
+            ))
+            self.assertTrue(web_outlook_app.add_account(
+                'refresh-page-b@example.com',
+                'password123',
+                'client-id-page-b',
+                'refresh-token-page-b',
+                group_id=self.group_id,
+                forward_enabled=False,
+            ))
+            web_outlook_app.get_db().commit()
+
+        first_response = self.client.get('/api/accounts/refresh-status-list?page=1&page_size=1')
+        second_response = self.client.get('/api/accounts/refresh-status-list?page=2&page_size=1')
+        clamped_response = self.client.get('/api/accounts/refresh-status-list?page=0&page_size=20000')
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(clamped_response.status_code, 200)
+
+        first_payload = first_response.get_json()
+        second_payload = second_response.get_json()
+        clamped_payload = clamped_response.get_json()
+
+        self.assertTrue(first_payload['success'])
+        self.assertEqual(first_payload['page'], 1)
+        self.assertEqual(first_payload['page_size'], 1)
+        self.assertEqual(len(first_payload['items']), 1)
+        self.assertGreaterEqual(first_payload['total'], 3)
+
+        self.assertTrue(second_payload['success'])
+        self.assertEqual(second_payload['page'], 2)
+        self.assertEqual(second_payload['page_size'], 1)
+        self.assertEqual(len(second_payload['items']), 1)
+        self.assertNotEqual(first_payload['items'][0]['id'], second_payload['items'][0]['id'])
+
+        self.assertTrue(clamped_payload['success'])
+        self.assertEqual(clamped_payload['page'], 1)
+        self.assertEqual(clamped_payload['page_size'], 10000)
+
+    def test_refresh_status_search_escapes_like_literals(self):
+        with self.app.app_context():
+            self.assertTrue(web_outlook_app.add_account(
+                'literal-percent@example.com',
+                'password123',
+                'client-id-percent',
+                'refresh-token-percent',
+                group_id=self.group_id,
+                remark='literal 100% ready',
+                forward_enabled=False,
+            ))
+            self.assertTrue(web_outlook_app.add_account(
+                'literal-underscore@example.com',
+                'password123',
+                'client-id-underscore',
+                'refresh-token-underscore',
+                group_id=self.group_id,
+                remark='literal under_score ready',
+                forward_enabled=False,
+            ))
+            db = web_outlook_app.get_db()
+            db.execute(
+                """
+                UPDATE accounts
+                SET remark = 'literal 100X ready', email = 'proxy-refresh-renamed@example.com'
+                WHERE email = ?
+                """,
+                ('proxy-refresh@outlook.com',),
+            )
+            db.commit()
+
+            percent_payload = web_outlook_app.query_refreshable_accounts(search='100%', page=1, page_size=20)
+            underscore_payload = web_outlook_app.query_refreshable_accounts(search='under_score', page=1, page_size=20)
+            ordinary_payload = web_outlook_app.query_refreshable_accounts(search='literal', page=1, page_size=20)
+
+        self.assertEqual([item['email'] for item in percent_payload['items']], ['literal-percent@example.com'])
+        self.assertEqual([item['email'] for item in underscore_payload['items']], ['literal-underscore@example.com'])
+        self.assertIn('literal-percent@example.com', [item['email'] for item in ordinary_payload['items']])
+        self.assertIn('literal-underscore@example.com', [item['email'] for item in ordinary_payload['items']])
+
+    def test_refresh_status_list_loads_account_tags_in_one_batch(self):
+        with self.app.app_context():
+            tag_id = web_outlook_app.add_tag('刷新标签', '#336699')
+            self.assertIsNotNone(tag_id)
+            self.assertTrue(web_outlook_app.add_account(
+                'tagged-refresh@example.com',
+                'password123',
+                'client-id-tagged',
+                'refresh-token-tagged',
+                group_id=self.group_id,
+                remark='带标签刷新账号',
+                forward_enabled=False,
+            ))
+            tagged_account = web_outlook_app.get_account_by_email('tagged-refresh@example.com')
+            self.assertIsNotNone(tagged_account)
+            self.assertTrue(web_outlook_app.add_account_tag(tagged_account['id'], tag_id))
+            alias_ok, cleaned_aliases, alias_errors = web_outlook_app.replace_account_aliases(
+                tagged_account['id'],
+                tagged_account['email'],
+                ['tagged-refresh-alias@example.com'],
+            )
+            self.assertTrue(alias_ok, alias_errors)
+            self.assertEqual(cleaned_aliases, ['tagged-refresh-alias@example.com'])
+            web_outlook_app.get_db().commit()
+
+        with self.app.app_context():
+            with patch.object(web_outlook_app, 'get_account_tags', side_effect=AssertionError('unexpected per-account tag load')):
+                payload = web_outlook_app.query_refreshable_accounts(search='refresh', page=1, page_size=20)
+
+        tagged_items = [item for item in payload['items'] if item['email'] == 'tagged-refresh@example.com']
+        self.assertEqual(len(tagged_items), 1)
+        tagged_item = tagged_items[0]
+        self.assertEqual([tag['name'] for tag in tagged_item['tags']], ['刷新标签'])
+        self.assertEqual(tagged_item['aliases'], ['tagged-refresh-alias@example.com'])
+        self.assertEqual(tagged_item['alias_count'], 1)
+        self.assertEqual(tagged_item['account_type'], 'outlook')
+        self.assertEqual(tagged_item['provider'], 'outlook')
+        self.assertFalse(tagged_item['forward_enabled'])
+        self.assertEqual(tagged_item['group_id'], self.group_id)
+        self.assertEqual(tagged_item['group_name'], '代理刷新组')
+        self.assertEqual(tagged_item['group_color'], '#225588')
+
+    def test_group_api_persists_proxy_failover_fields(self):
+        response = self.client.put(
+            f'/api/groups/{self.group_id}',
+            json={
+                'name': '代理刷新组',
+                'description': '测试代理失败后直连重试',
+                'color': '#225588',
+                'proxy_url': 'socks5://127.0.0.1:1080',
+                'fallback_proxy_url_1': 'socks5://127.0.0.1:2080',
+                'fallback_proxy_url_2': '直连',
+                'sort_position': 1,
+            }
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        response = self.client.get(f'/api/groups/{self.group_id}')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['group']['fallback_proxy_url_1'], 'socks5://127.0.0.1:2080')
+        self.assertEqual(payload['group']['fallback_proxy_url_2'], '直连')
+
+
+class TelegramForwardingProxySettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+
+    def test_settings_api_persists_telegram_proxy_url(self):
+        response = self.client.put(
+            '/api/settings',
+            json={
+                'telegram_bot_token': '123456:abcdef',
+                'telegram_chat_id': '-1001234567890',
+                'telegram_proxy_url': 'socks5://127.0.0.1:1080',
+            }
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        response = self.client.get('/api/settings')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['settings']['telegram_proxy_url'], 'socks5://127.0.0.1:1080')
+
+    def test_send_forward_telegram_uses_configured_proxy(self):
+        class FakeResponse:
+            ok = True
+
+        with self.app.app_context():
+            self.assertTrue(web_outlook_app.set_setting_encrypted('telegram_bot_token', '123456:abcdef'))
+            self.assertTrue(web_outlook_app.set_setting('telegram_chat_id', '-1001234567890'))
+            self.assertTrue(web_outlook_app.set_setting('telegram_proxy_url', 'socks5://127.0.0.1:1080'))
+
+        with self.app.app_context():
+            with patch.object(web_outlook_app.requests, 'request', return_value=FakeResponse()) as mocked_request:
+                success = web_outlook_app.send_forward_telegram('telegram proxy test')
+
+        self.assertTrue(success)
+        self.assertEqual(mocked_request.call_count, 1)
+        self.assertEqual(mocked_request.call_args.args[:2], ('post', 'https://api.telegram.org/bot123456:abcdef/sendMessage'))
+        self.assertEqual(
+            mocked_request.call_args.kwargs['proxies'],
+            {'http': 'socks5://127.0.0.1:1080', 'https': 'socks5://127.0.0.1:1080'},
+        )
+
+    def test_settings_api_persists_wecom_webhook_url(self):
+        response = self.client.put(
+            '/api/settings',
+            json={
+                'wecom_webhook_url': 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key',
+            }
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        response = self.client.get('/api/settings')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(
+            payload['settings']['wecom_webhook_url'],
+            'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key',
+        )
+
+    def test_send_forward_wecom_uses_configured_webhook(self):
+        class FakeResponse:
+            ok = True
+
+        with self.app.app_context():
+            self.assertTrue(
+                web_outlook_app.set_setting_encrypted(
+                    'wecom_webhook_url',
+                    'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key',
+                )
+            )
+
+        with self.app.app_context():
+            with patch.object(web_outlook_app.requests, 'request', return_value=FakeResponse()) as mocked_request:
+                success = web_outlook_app.send_forward_wecom('wecom webhook test')
+
+        self.assertTrue(success)
+        self.assertEqual(mocked_request.call_count, 1)
+        self.assertEqual(
+            mocked_request.call_args.args[:2],
+            ('post', 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test-key'),
+        )
+        self.assertEqual(
+            mocked_request.call_args.kwargs['json'],
+            {'msgtype': 'text', 'text': {'content': 'wecom webhook test'}},
+        )
+
+
+class AppTimezoneSettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+
+    def test_settings_api_persists_app_timezone(self):
+        response = self.client.put(
+            '/api/settings',
+            json={'app_timezone': 'America/Los_Angeles'}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        response = self.client.get('/api/settings')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['settings']['app_timezone'], 'America/Los_Angeles')
+
+    def test_settings_api_rejects_invalid_app_timezone(self):
+        response = self.client.put(
+            '/api/settings',
+            json={'app_timezone': 'Mars/Olympus_Mons'}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertFalse(payload['success'])
+        self.assertIn('Invalid time zone', payload['error'])
+
+    def test_settings_api_persists_show_account_created_at(self):
+        response = self.client.put(
+            '/api/settings',
+            json={'show_account_created_at': False}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        response = self.client.get('/api/settings')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['settings']['show_account_created_at'], 'false')
+
+    def test_settings_api_persists_show_group_id(self):
+        response = self.client.put(
+            '/api/settings',
+            json={'show_group_id': False}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        response = self.client.get('/api/settings')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['settings']['show_group_id'], 'false')
+
+    def test_settings_api_persists_forward_account_delay_seconds(self):
+        response = self.client.put(
+            '/api/settings',
+            json={'forward_account_delay_seconds': 7}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        response = self.client.get('/api/settings')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['settings']['forward_account_delay_seconds'], '7')
+
+    def test_settings_api_persists_forward_latency_controls(self):
+        response = self.client.put(
+            '/api/settings',
+            json={
+                'forward_check_interval_seconds': 20,
+                'forward_execution_mode': 'parallel',
+                'forward_parallel_workers': 3,
+                'forward_account_delay_seconds': 9,
+            }
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        response = self.client.get('/api/settings')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['settings']['forward_check_interval_seconds'], '20')
+        self.assertEqual(payload['settings']['forward_execution_mode'], 'parallel')
+        self.assertEqual(payload['settings']['forward_parallel_workers'], '3')
+        self.assertEqual(payload['settings']['forward_account_delay_seconds'], '0')
+
+    def test_settings_api_legacy_forward_minutes_updates_seconds(self):
+        response = self.client.put(
+            '/api/settings',
+            json={'forward_check_interval_minutes': 2}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        response = self.client.get('/api/settings')
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['settings']['forward_check_interval_seconds'], '120')
+
+    def test_settings_api_rejects_invalid_forward_latency_controls(self):
+        with self.app.app_context():
+            self.assertTrue(web_outlook_app.set_setting('forward_check_interval_seconds', '300'))
+
+        response = self.client.put(
+            '/api/settings',
+            json={'forward_check_interval_seconds': 10}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertFalse(payload['success'])
+        self.assertIn('转发轮询间隔必须在 20-3600 秒之间', payload['error'])
+
+        response = self.client.get('/api/settings')
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['settings']['forward_check_interval_seconds'], '300')
+
+    def test_validate_cron_uses_requested_timezone(self):
+        response = self.client.post(
+            '/api/settings/validate-cron',
+            json={
+                'cron_expression': '0 2 * * *',
+                'time_zone': 'UTC',
+            }
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertTrue(payload['valid'])
+        self.assertEqual(payload['time_zone'], 'UTC')
+        self.assertTrue(payload['next_run'].endswith('+00:00'))
+
+
+class MultiChannelForwardingTests(unittest.TestCase):
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM forward_logs')
+            db.execute('DELETE FROM forwarding_logs')
+            db.execute('DELETE FROM account_tags')
+            db.execute('DELETE FROM account_aliases')
+            db.execute('DELETE FROM account_refresh_logs')
+            db.execute('DELETE FROM accounts')
+            db.execute("DELETE FROM groups WHERE name NOT IN ('默认分组', '临时邮箱')")
+            db.commit()
+
+            self.assertTrue(web_outlook_app.set_setting('forward_channels', 'smtp,telegram'))
+            self.assertTrue(web_outlook_app.set_setting('forward_execution_mode', 'serial'))
+            self.assertTrue(web_outlook_app.set_setting('forward_parallel_workers', '4'))
+            self.assertTrue(web_outlook_app.set_setting('email_forward_recipient', 'main@example.com'))
+            self.assertTrue(web_outlook_app.set_setting('smtp_host', 'smtp.example.com'))
+            self.assertTrue(web_outlook_app.set_setting_encrypted('telegram_bot_token', '123456:abcdef'))
+            self.assertTrue(web_outlook_app.set_setting('telegram_chat_id', '-1001234567890'))
+
+            self.assertTrue(web_outlook_app.add_account(
+                'multi-channel@example.com',
+                'password123',
+                'client-id',
+                'refresh-token',
+                group_id=1,
+                forward_enabled=True
+            ))
+            account = web_outlook_app.get_account_by_email('multi-channel@example.com')
+            self.assertIsNotNone(account)
+            self.account_id = account['id']
+            db.execute(
+                'UPDATE accounts SET forward_last_checked_at = NULL WHERE id = ?',
+                (self.account_id,),
+            )
+            db.commit()
+
+    def test_process_forwarding_job_sends_to_all_enabled_channels(self):
+        email_item = {
+            'id': 'message-1',
+            'folder': 'inbox',
+            'date': '2026-04-15T07:00:00Z',
+        }
+        email_detail = {
+            'id': 'message-1',
+            'subject': 'test subject',
+            'from': 'sender@example.com',
+            'date': '2026-04-15T07:00:00Z',
+            'body': 'hello world',
+            'body_type': 'text',
+        }
+
+        with patch.object(web_outlook_app, 'fetch_forward_candidates', return_value={'success': True, 'emails': [email_item], 'error': ''}):
+            with patch.object(web_outlook_app, 'fetch_forward_detail', return_value=email_detail):
+                with patch.object(web_outlook_app, 'send_forward_email', return_value=True) as email_mock:
+                    with patch.object(web_outlook_app, 'send_forward_telegram', return_value=True) as tg_mock:
+                        web_outlook_app.process_forwarding_job()
+
+        self.assertEqual(email_mock.call_count, 1)
+        self.assertEqual(tg_mock.call_count, 1)
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            rows = db.execute(
+                '''
+                SELECT channel, status
+                FROM forwarding_logs
+                WHERE account_id = ? AND message_id = ?
+                ORDER BY channel
+                ''',
+                (self.account_id, 'message-1'),
+            ).fetchall()
+            forward_log_rows = db.execute(
+                '''
+                SELECT channel
+                FROM forward_logs
+                WHERE account_id = ? AND message_id = ?
+                ORDER BY channel
+                ''',
+                (self.account_id, 'message-1'),
+            ).fetchall()
+
+        self.assertEqual(
+            [(row['channel'], row['status']) for row in rows],
+            [('email', 'success'), ('telegram', 'success')],
+        )
+        self.assertEqual(
+            [row['channel'] for row in forward_log_rows],
+            ['email', 'telegram'],
+        )
+
+    def test_process_forwarding_job_keeps_retrying_missing_channel_when_other_channel_already_logged(self):
+        email_item = {
+            'id': 'message-2',
+            'folder': 'inbox',
+            'date': '2026-04-15T08:00:00Z',
+        }
+        email_detail = {
+            'id': 'message-2',
+            'subject': 'retry tg',
+            'from': 'sender@example.com',
+            'date': '2026-04-15T08:00:00Z',
+            'body': 'hello retry',
+            'body_type': 'text',
+        }
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute(
+                'INSERT OR IGNORE INTO forward_logs (account_id, message_id, channel) VALUES (?, ?, ?)',
+                (self.account_id, 'message-2', 'email'),
+            )
+            db.commit()
+
+        with patch.object(web_outlook_app, 'fetch_forward_candidates', return_value={'success': True, 'emails': [email_item], 'error': ''}):
+            with patch.object(web_outlook_app, 'fetch_forward_detail', return_value=email_detail):
+                with patch.object(web_outlook_app, 'send_forward_email', return_value=True) as email_mock:
+                    with patch.object(web_outlook_app, 'send_forward_telegram', return_value=True) as tg_mock:
+                        web_outlook_app.process_forwarding_job()
+
+        self.assertEqual(email_mock.call_count, 0)
+        self.assertEqual(tg_mock.call_count, 1)
+
+    def test_outlook_keyword_filter_matches_graph_detail_body(self):
+        account = {
+            'email': 'graph-forward@example.com',
+            'account_type': 'outlook',
+            'client_id': 'client-id',
+            'refresh_token': 'refresh-token',
+        }
+        item = {
+            'id': 'graph-message-1',
+            'folder': 'inbox',
+            'subject': 'regular subject',
+            'from': 'sender@example.com',
+            'body_preview': 'metadata preview without token',
+        }
+        detail = {
+            'body': {
+                'contentType': 'html',
+                'content': '<p>The Graph detail body contains unique-keyword-token.</p>',
+            }
+        }
+
+        with patch.object(web_outlook_app, 'get_account_proxy_url', return_value=''):
+            with patch.object(web_outlook_app, 'get_account_proxy_failover_urls', return_value=[]):
+                with patch.object(web_outlook_app, 'get_email_detail_graph', return_value=detail) as detail_mock:
+                    try:
+                        matched = web_outlook_app.email_matches_filters(
+                            account, item, keyword='unique-keyword-token'
+                        )
+                    except UnboundLocalError as exc:
+                        self.fail(f'Graph keyword body lookup raised UnboundLocalError: {exc}')
+
+        self.assertTrue(matched)
+        detail_mock.assert_called_once_with(
+            'client-id',
+            'refresh-token',
+            'graph-message-1',
+            '',
+            [],
+        )
+
+    def test_outlook_keyword_filter_matches_oauth_imap_detail_body_for_imap_ids(self):
+        account = {
+            'email': 'imap-forward@example.com',
+            'account_type': 'outlook',
+            'client_id': 'client-id',
+            'refresh_token': 'refresh-token',
+        }
+        item = {
+            'id': '42',
+            'id_mode': 'uid',
+            'folder': 'inbox',
+            'subject': 'regular subject',
+            'from': 'sender@example.com',
+            'body_preview': 'metadata preview without token',
+        }
+        detail = {
+            'body': '<p>The IMAP detail body contains unique-imap-token.</p>',
+            'body_type': 'html',
+        }
+
+        with patch.object(web_outlook_app, 'get_account_proxy_url', return_value='proxy-url'):
+            with patch.object(web_outlook_app, 'get_account_proxy_failover_urls', return_value=['fallback-proxy']):
+                with patch.object(web_outlook_app, 'get_email_detail_imap', return_value=detail) as imap_detail_mock:
+                    with patch.object(web_outlook_app, 'get_email_detail_graph') as graph_detail_mock:
+                        matched = web_outlook_app.email_matches_filters(
+                            account, item, keyword='unique-imap-token'
+                        )
+
+        self.assertTrue(matched)
+        imap_detail_mock.assert_called_once_with(
+            'imap-forward@example.com',
+            'client-id',
+            'refresh-token',
+            '42',
+            'inbox',
+            'proxy-url',
+            ['fallback-proxy'],
+            'uid',
+        )
+        graph_detail_mock.assert_not_called()
+
+    def test_process_forwarding_job_waits_between_accounts(self):
+        with self.app.app_context():
+            self.assertTrue(web_outlook_app.set_setting('forward_account_delay_seconds', '3'))
+            self.assertTrue(web_outlook_app.add_account(
+                'second-forward@example.com',
+                'password456',
+                'client-id-2',
+                'refresh-token-2',
+                group_id=1,
+                forward_enabled=True
+            ))
+            db = web_outlook_app.get_db()
+            db.execute(
+                'UPDATE accounts SET forward_last_checked_at = NULL WHERE email = ?',
+                ('second-forward@example.com',),
+            )
+            db.commit()
+
+        with patch.object(web_outlook_app, 'fetch_forward_candidates', return_value={'success': True, 'emails': [], 'error': ''}) as candidates_mock:
+            with patch.object(web_outlook_app.time, 'sleep') as sleep_mock:
+                web_outlook_app.process_forwarding_job()
+
+        self.assertEqual(candidates_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(3)
+
+    def test_process_forwarding_job_skips_when_run_lock_is_active(self):
+        self.assertTrue(web_outlook_app.forwarding_run_lock.acquire(blocking=False))
+        try:
+            with patch.object(web_outlook_app, 'fetch_forward_candidates') as candidates_mock:
+                result = web_outlook_app.process_forwarding_job()
+        finally:
+            web_outlook_app.forwarding_run_lock.release()
+
+        self.assertTrue(result['skipped'])
+        self.assertEqual(result['reason'], 'already_running')
+        candidates_mock.assert_not_called()
+
+    def test_parallel_forwarding_allows_other_accounts_while_one_is_slow(self):
+        with self.app.app_context():
+            self.assertTrue(web_outlook_app.set_setting('forward_execution_mode', 'parallel'))
+            self.assertTrue(web_outlook_app.set_setting('forward_parallel_workers', '2'))
+            self.assertTrue(web_outlook_app.add_account(
+                'parallel-second@example.com',
+                'password456',
+                'client-id-2',
+                'refresh-token-2',
+                group_id=1,
+                forward_enabled=True
+            ))
+            db = web_outlook_app.get_db()
+            db.execute(
+                'UPDATE accounts SET forward_last_checked_at = NULL WHERE email = ?',
+                ('parallel-second@example.com',),
+            )
+            db.commit()
+
+        first_started = threading.Event()
+        second_processed = threading.Event()
+        first_wait = {'released_by_second': False}
+
+        def fetch_candidates(account, _top=20, _folder='inbox'):
+            if account.get('email') == 'multi-channel@example.com':
+                first_started.set()
+                first_wait['released_by_second'] = second_processed.wait(timeout=0.5)
+                return {'success': True, 'emails': [], 'error': ''}
+            if account.get('email') == 'parallel-second@example.com':
+                first_started.wait(timeout=0.5)
+                second_processed.set()
+                return {'success': True, 'emails': [], 'error': ''}
+            return {'success': True, 'emails': [], 'error': ''}
+
+        with patch.object(web_outlook_app, 'fetch_forward_candidates', side_effect=fetch_candidates):
+            result = web_outlook_app.process_forwarding_job()
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['processed_count'], 2)
+        self.assertTrue(first_wait['released_by_second'])
+
+    def test_parallel_forwarding_ignores_account_delay_seconds(self):
+        with self.app.app_context():
+            self.assertTrue(web_outlook_app.set_setting('forward_execution_mode', 'parallel'))
+            self.assertTrue(web_outlook_app.set_setting('forward_parallel_workers', '2'))
+            self.assertTrue(web_outlook_app.set_setting('forward_account_delay_seconds', '3'))
+            self.assertTrue(web_outlook_app.add_account(
+                'parallel-delay-second@example.com',
+                'password456',
+                'client-id-2',
+                'refresh-token-2',
+                group_id=1,
+                forward_enabled=True
+            ))
+            db = web_outlook_app.get_db()
+            db.execute(
+                'UPDATE accounts SET forward_last_checked_at = NULL WHERE email = ?',
+                ('parallel-delay-second@example.com',),
+            )
+            db.commit()
+
+        with patch.object(web_outlook_app, 'fetch_forward_candidates', return_value={'success': True, 'emails': [], 'error': ''}) as candidates_mock:
+            with patch.object(web_outlook_app.time, 'sleep') as sleep_mock:
+                result = web_outlook_app.process_forwarding_job()
+
+        self.assertTrue(result['success'])
+        self.assertEqual(candidates_mock.call_count, 2)
+        sleep_mock.assert_not_called()
+
+    def test_extract_message_attachments_returns_metadata_and_content(self):
+        message = EmailMessage()
+        message['Subject'] = 'Attachment Test'
+        message['From'] = 'sender@example.com'
+        message['To'] = 'user@example.com'
+        message.set_content('body text')
+        message.add_attachment(
+            b'hello attachment',
+            maintype='text',
+            subtype='plain',
+            filename='report.txt',
+        )
+
+        parsed = web_outlook_app.email.message_from_bytes(message.as_bytes())
+        attachments = web_outlook_app.extract_message_attachments(parsed, include_content=True)
+
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]['id'], 'attachment-1')
+        self.assertEqual(attachments[0]['name'], 'report.txt')
+        self.assertEqual(attachments[0]['content_type'], 'text/plain')
+        self.assertEqual(attachments[0]['content'], b'hello attachment')
+
+
+if __name__ == '__main__':
+    unittest.main()

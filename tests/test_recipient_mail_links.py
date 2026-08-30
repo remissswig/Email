@@ -697,6 +697,39 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
             self.assertEqual(account["refresh_token"], "refresh-token")
         self.assertEqual(self.count_recipient_links(), 2)
 
+    def test_import_single_file_supports_icloud_imap_main_line(self):
+        response = self.import_links(
+            mode="single",
+            files=[
+                (
+                    "icloud-owner.txt",
+                    b"owner@icloud.com----app-password\nrecipient01@example.com\n",
+                )
+            ],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["summary"]["successful_files"], 1)
+        self.assertEqual(payload["summary"]["created_records"], 1)
+        group = payload["groups"][0]
+        self.assertEqual(group["main_email"], "owner@icloud.com")
+        self.assertEqual(group["account_created"], True)
+
+        with self.app_context():
+            account = self.module.get_account_by_email("owner@icloud.com")
+            self.assertIsNotNone(account)
+            self.assertEqual(account["account_type"], "imap")
+            self.assertEqual(account["provider"], "icloud")
+            self.assertEqual(account["imap_host"], "imap.mail.me.com")
+            self.assertEqual(account["imap_port"], 993)
+            self.assertEqual(account["imap_password"], "app-password")
+            self.assertEqual(account["password"], "")
+            self.assertEqual(account["client_id"], "")
+            self.assertEqual(account["refresh_token"], "")
+        self.assertEqual(self.count_recipient_links(), 1)
+
     def test_import_single_file_prefers_outlook_email_among_multiple_candidates(self):
         account_id = self.insert_account("owner@outlook.com")
 

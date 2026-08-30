@@ -615,6 +615,12 @@ MAIL_PROVIDERS = {
         "imap_port": 993,
         "account_type": "imap",
     },
+    "icloud": {
+        "label": "iCloud",
+        "imap_host": "imap.mail.me.com",
+        "imap_port": 993,
+        "account_type": "imap",
+    },
     "qq": {
         "label": "QQ邮箱",
         "imap_host": "imap.qq.com",
@@ -666,6 +672,7 @@ DOMAIN_PROVIDER_MAP = {
     "live.cn": "outlook",
     "gmail.com": "gmail",
     "googlemail.com": "gmail",
+    "icloud.com": "icloud",
     "qq.com": "qq",
     "foxmail.com": "qq",
     "163.com": "163",

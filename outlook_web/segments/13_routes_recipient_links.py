@@ -256,7 +256,7 @@ def _cleanup_recipient_import_savepoint(db, name: str) -> None:
 
 
 def _recipient_import_account_payload(main_email: str, main_line: str) -> dict[str, Any]:
-    parsed = parse_outlook_account_string(main_line)
+    parsed = parse_account_import(main_line, provider="auto") if main_line else None
     if not parsed:
         return {}
     parsed_email = str(parsed.get("email") or "").strip()
@@ -265,9 +265,92 @@ def _recipient_import_account_payload(main_email: str, main_line: str) -> dict[s
     return parsed
 
 
+def _recipient_import_account_insert_values(main_email: str, account_data: dict[str, Any]) -> tuple[Any, ...]:
+    provider = str(account_data.get("provider") or "").strip().lower()
+    provider = infer_account_import_provider(main_email, provider or "auto")
+    provider_meta = get_provider_meta(provider, main_email)
+    account_type = str(account_data.get("account_type") or provider_meta.get("account_type", "outlook")).strip().lower()
+
+    if account_type == "imap":
+        return build_account_insert_values(
+            main_email,
+            "",
+            "",
+            "",
+            1,
+            "",
+            "imap",
+            provider,
+            str(account_data.get("imap_host") or provider_meta.get("imap_host", "")).strip(),
+            int(account_data.get("imap_port") or provider_meta.get("imap_port", 993) or 993),
+            str(account_data.get("imap_password") or ""),
+            False,
+            None,
+            "active",
+            "",
+            "",
+            "",
+        )
+
+    return build_account_insert_values(
+        main_email,
+        str(account_data.get("password") or ""),
+        str(account_data.get("client_id") or ""),
+        str(account_data.get("refresh_token") or ""),
+        1,
+        "",
+        "outlook",
+        "outlook",
+        IMAP_SERVER_NEW,
+        IMAP_PORT,
+        "",
+        False,
+        None,
+        "active",
+        "",
+        "",
+        "",
+    )
+
+
 def _update_recipient_import_account_credentials(db, account_id: int, account_data: dict[str, Any]) -> None:
     if not account_data:
         return
+    provider = str(account_data.get("provider") or "").strip().lower()
+    provider = infer_account_import_provider(str(account_data.get("email") or ""), provider or "auto")
+    provider_meta = get_provider_meta(provider, str(account_data.get("email") or ""))
+    account_type = str(account_data.get("account_type") or provider_meta.get("account_type", "outlook")).strip().lower()
+
+    if account_type == "imap":
+        db.execute(
+            """
+            UPDATE accounts
+            SET password = ?,
+                client_id = ?,
+                refresh_token = ?,
+                account_type = ?,
+                provider = ?,
+                imap_host = ?,
+                imap_port = ?,
+                imap_password = ?,
+                refresh_token_updated_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                "",
+                "",
+                "",
+                "imap",
+                provider,
+                str(account_data.get("imap_host") or provider_meta.get("imap_host", "")).strip(),
+                int(account_data.get("imap_port") or provider_meta.get("imap_port", 993) or 993),
+                encrypt_data(str(account_data.get("imap_password") or "")),
+                int(account_id),
+            ),
+        )
+        return
+
     refresh_token = str(account_data.get("refresh_token") or "").strip()
     db.execute(
         """
@@ -311,25 +394,7 @@ def _ensure_recipient_import_account(main_email: str, main_line: str = "") -> tu
     db = get_db()
     db.execute(
         ACCOUNT_INSERT_SQL,
-        build_account_insert_values(
-            main_email,
-            str(account_data.get("password") or ""),
-            str(account_data.get("client_id") or ""),
-            str(account_data.get("refresh_token") or ""),
-            1,
-            "",
-            "outlook",
-            "outlook",
-            IMAP_SERVER_NEW,
-            IMAP_PORT,
-            "",
-            False,
-            None,
-            "active",
-            "",
-            "",
-            "",
-        ),
+        _recipient_import_account_insert_values(main_email, account_data),
     )
     return resolve_account_by_address(main_email), True
 

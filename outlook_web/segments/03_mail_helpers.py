@@ -1717,27 +1717,36 @@ def fetch_imap_message(mail, message_id: Any, query: str, preferred_mode: str = 
         modes.append('sequence')
 
     attempts: List[Dict[str, Any]] = []
-    for mode in modes:
-        try:
-            if mode == 'uid':
-                status, data = mail.uid('FETCH', message_id, query)
-            else:
-                status, data = mail.fetch(message_text, query)
-            payload_present = has_imap_fetch_payload(data)
-            attempts.append({
-                'mode': mode,
-                'status': str(status),
-                'response': sanitize_error_details(str(data or ''))[:200],
-                'payload_present': payload_present,
-            })
-            if status == 'OK' and payload_present:
-                return status, data, mode, attempts
-        except Exception as exc:
-            attempts.append({
-                'mode': mode,
-                'status': type(exc).__name__,
-                'response': sanitize_error_details(str(exc))[:200],
-            })
+    query_variants = [str(query or '').strip()]
+    if query_variants[0] and 'RFC822' in query_variants[0].upper():
+        alternate_query = re.sub(r'RFC822', 'BODY.PEEK[]', query_variants[0], flags=re.IGNORECASE)
+        if alternate_query and alternate_query not in query_variants:
+            query_variants.append(alternate_query)
+
+    for query_variant in query_variants:
+        for mode in modes:
+            try:
+                if mode == 'uid':
+                    status, data = mail.uid('FETCH', message_id, query_variant)
+                else:
+                    status, data = mail.fetch(message_text, query_variant)
+                payload_present = has_imap_fetch_payload(data)
+                attempts.append({
+                    'mode': mode,
+                    'query': query_variant,
+                    'status': str(status),
+                    'response': sanitize_error_details(str(data or ''))[:200],
+                    'payload_present': payload_present,
+                })
+                if status == 'OK' and payload_present:
+                    return status, data, mode, attempts
+            except Exception as exc:
+                attempts.append({
+                    'mode': mode,
+                    'query': query_variant,
+                    'status': type(exc).__name__,
+                    'response': sanitize_error_details(str(exc))[:200],
+                })
     return 'NO', None, '', attempts
 
 
