@@ -99,25 +99,25 @@
     .mail-list { display: grid; gap: 10px; }
     .mail-single {
       display: grid;
-      gap: 12px;
-    }
-    .mail-single-head {
-      display: grid;
-      gap: 10px;
-      padding: 12px;
-      border: 1px solid #edf0f2;
-      border-radius: 8px;
-      background: #fbfcfe;
+      gap: 14px;
+      padding: 2px 0 0;
     }
     .mail-single-title {
       margin: 0;
+      font-size: 28px;
+      line-height: 1.2;
+      font-weight: 700;
+      word-break: break-word;
+    }
+    .mail-single-subject {
+      margin: 0;
       font-size: 16px;
-      line-height: 1.4;
+      line-height: 1.5;
+      color: #293547;
       word-break: break-word;
     }
     .mail-single-meta {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 10px;
     }
     .mail-single-meta .mail-meta { margin: 0; }
@@ -229,8 +229,8 @@
     <header class="hero">
       <div>
         <p class="eyebrow">MAILBOX</p>
-        <h1>{{ recipient_email }}</h1>
-        <p class="lead">主邮箱：{{ main_email }}</p>
+        <h1>最新邮件</h1>
+        <p class="lead">{{ recipient_email }}<br>主邮箱：{{ main_email }}</p>
       </div>
       <div class="actions">
         <a class="button primary" href="{{ refresh_url }}">刷新</a>
@@ -290,36 +290,29 @@
         </div>
       </section>
     {% else %}
-      <section class="panel">
-        <div class="panel-head">
-          <h2>当前邮件</h2>
-          <span>已加载 {{ loaded_count }} 封</span>
-        </div>
-        <div class="panel-body">
-          {% if current_subject or current_body_srcdoc %}
-            <div class="mail-single">
-              <div class="mail-single-head">
-                <h3 class="mail-single-title">{{ current_subject or '无主题' }}</h3>
-                <div class="mail-single-meta">
-                  <div class="mail-meta"><strong>发件人</strong>{{ current_sender or '未知发件人' }}</div>
-                  <div class="mail-meta"><strong>时间</strong>{{ current_received_at or '未知时间' }}</div>
-                  <div class="mail-meta"><strong>收件人</strong>{{ recipient_email }}</div>
-                  <div class="mail-meta"><strong>主邮箱</strong>{{ main_email }}</div>
-                </div>
-              </div>
-              <iframe
-                class="mail-frame"
-                sandbox
-                referrerpolicy="no-referrer"
-                title="{{ current_subject or '邮件详情' }}"
-                srcdoc="{{ current_body_srcdoc|e }}"></iframe>
-              <div class="mail-caption">点击“查看更多”后，所有邮件会切换成折叠列表。</div>
-            </div>
-          {% else %}
+      {% if current_subject or current_body_srcdoc %}
+        <section class="mail-single">
+          <h2 class="mail-single-title">{{ current_subject or '无主题' }}</h2>
+          <div class="mail-single-meta">
+            <div class="mail-meta"><strong>发件人</strong>{{ current_sender or '未知发件人' }}</div>
+            <div class="mail-meta"><strong>收件人</strong>{{ recipient_email }}</div>
+            <div class="mail-meta"><strong>时间</strong>{{ current_received_at or '未知时间' }}</div>
+          </div>
+          <iframe
+            class="mail-frame"
+            sandbox
+            referrerpolicy="no-referrer"
+            title="{{ current_subject or '邮件详情' }}"
+            srcdoc="{{ current_body_srcdoc|e }}"></iframe>
+          <div class="mail-caption">点击“查看更多”后，所有邮件会切换成折叠列表。</div>
+        </section>
+      {% else %}
+        <section class="panel">
+          <div class="panel-body">
             <div class="empty">暂无邮件</div>
-          {% endif %}
-        </div>
-      </section>
+          </div>
+        </section>
+      {% endif %}
     {% endif %}
   </main>
 
