@@ -97,6 +97,30 @@
       color: #8b6200;
     }
     .mail-list { display: grid; gap: 10px; }
+    .mail-single {
+      display: grid;
+      gap: 12px;
+    }
+    .mail-single-head {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+      border: 1px solid #edf0f2;
+      border-radius: 8px;
+      background: #fbfcfe;
+    }
+    .mail-single-title {
+      margin: 0;
+      font-size: 16px;
+      line-height: 1.4;
+      word-break: break-word;
+    }
+    .mail-single-meta {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .mail-single-meta .mail-meta { margin: 0; }
     .mail-item {
       border: 1px solid #edf0f2;
       border-radius: 8px;
@@ -210,7 +234,14 @@
       </div>
       <div class="actions">
         <a class="button primary" href="{{ refresh_url }}">刷新</a>
-        {% if load_more_url %}
+        {% if show_all %}
+          {% if collapse_url %}
+            <a class="button" href="{{ collapse_url }}">收起邮件</a>
+          {% endif %}
+          {% if load_more_url %}
+            <a class="button" href="{{ load_more_url }}">查看更多</a>
+          {% endif %}
+        {% elif load_more_url %}
           <a class="button" href="{{ load_more_url }}">查看更多</a>
         {% endif %}
       </div>
@@ -220,48 +251,76 @@
       <div class="notice">{{ notice }}</div>
     {% endif %}
 
-    <section class="panel">
-      <div class="panel-head">
-        <h2>邮件列表</h2>
-        <span>已加载 {{ loaded_count }} 封</span>
-      </div>
-      <div class="panel-body">
-        {% if messages %}
-          <div class="mail-list">
-            {% for item in messages %}
-              <details class="mail-item">
-                <summary class="mail-title">
-                  <span class="mail-subject">{{ item.subject or '无主题' }}</span>
-                  <span class="mail-chevron" aria-hidden="true"></span>
-                </summary>
-                <div class="mail-detail">
-                  <div class="mail-meta-grid">
-                    <div class="mail-meta"><strong>发件人</strong>{{ item['from'] or '未知发件人' }}</div>
-                    <div class="mail-meta"><strong>时间</strong>{{ item.received_at or '未知时间' }}</div>
-                    <div class="mail-meta"><strong>收件人</strong>{{ item.to or recipient_email }}</div>
-                    <div class="mail-meta"><strong>邮件ID</strong>{{ item.id or '-' }}</div>
+    {% if show_all %}
+      <section class="panel">
+        <div class="panel-head">
+          <h2>邮件列表</h2>
+          <span>已加载 {{ loaded_count }} 封</span>
+        </div>
+        <div class="panel-body">
+          {% if messages %}
+            <div class="mail-list">
+              {% for item in messages %}
+                <details class="mail-item">
+                  <summary class="mail-title">
+                    <span class="mail-subject">{{ item.subject or '无主题' }}</span>
+                    <span class="mail-chevron" aria-hidden="true"></span>
+                  </summary>
+                  <div class="mail-detail">
+                    <div class="mail-meta-grid">
+                      <div class="mail-meta"><strong>发件人</strong>{{ item['from'] or '未知发件人' }}</div>
+                      <div class="mail-meta"><strong>时间</strong>{{ item.received_at or '未知时间' }}</div>
+                      <div class="mail-meta"><strong>收件人</strong>{{ item.to or recipient_email }}</div>
+                      <div class="mail-meta"><strong>邮件ID</strong>{{ item.id or '-' }}</div>
+                    </div>
+                    <iframe
+                      class="mail-frame"
+                      sandbox
+                      loading="lazy"
+                      referrerpolicy="no-referrer"
+                      title="{{ item.subject or '邮件详情' }}"
+                      data-srcdoc="{{ item.body_srcdoc|e }}"></iframe>
                   </div>
-                  <iframe
-                    class="mail-frame"
-                    sandbox
-                    loading="lazy"
-                    referrerpolicy="no-referrer"
-                    title="{{ item.subject or '邮件详情' }}"
-                    data-srcdoc="{{ item.body_srcdoc }}"></iframe>
-                </div>
-              </details>
-            {% endfor %}
-          </div>
-          {% if load_more_url %}
-            <div class="mail-footer">
-              <a class="button" href="{{ load_more_url }}">查看更多</a>
+                </details>
+              {% endfor %}
             </div>
+          {% else %}
+            <div class="empty">暂无邮件</div>
           {% endif %}
-        {% else %}
-          <div class="empty">暂无邮件</div>
-        {% endif %}
-      </div>
-    </section>
+        </div>
+      </section>
+    {% else %}
+      <section class="panel">
+        <div class="panel-head">
+          <h2>当前邮件</h2>
+          <span>已加载 {{ loaded_count }} 封</span>
+        </div>
+        <div class="panel-body">
+          {% if current_subject or current_body_srcdoc %}
+            <div class="mail-single">
+              <div class="mail-single-head">
+                <h3 class="mail-single-title">{{ current_subject or '无主题' }}</h3>
+                <div class="mail-single-meta">
+                  <div class="mail-meta"><strong>发件人</strong>{{ current_sender or '未知发件人' }}</div>
+                  <div class="mail-meta"><strong>时间</strong>{{ current_received_at or '未知时间' }}</div>
+                  <div class="mail-meta"><strong>收件人</strong>{{ recipient_email }}</div>
+                  <div class="mail-meta"><strong>主邮箱</strong>{{ main_email }}</div>
+                </div>
+              </div>
+              <iframe
+                class="mail-frame"
+                sandbox
+                referrerpolicy="no-referrer"
+                title="{{ current_subject or '邮件详情' }}"
+                srcdoc="{{ current_body_srcdoc|e }}"></iframe>
+              <div class="mail-caption">点击“查看更多”后，所有邮件会切换成折叠列表。</div>
+            </div>
+          {% else %}
+            <div class="empty">暂无邮件</div>
+          {% endif %}
+        </div>
+      </section>
+    {% endif %}
   </main>
 
   <script>

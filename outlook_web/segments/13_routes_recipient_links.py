@@ -125,10 +125,21 @@ def _recipient_link_public_page_limit(value: Any) -> int:
     return min(parsed, RECIPIENT_LINK_PUBLIC_PAGE_MAX_LIMIT)
 
 
-def _recipient_link_public_page_url(limit: int) -> str:
+def _recipient_link_public_page_url(
+    limit: int | None = None,
+    *,
+    show_all: bool | None = None,
+) -> str:
     query = dict(request.args.items())
-    query["limit"] = str(_recipient_link_public_page_limit(limit))
-    return f"{request.base_url}?{urlencode(query)}"
+    if limit is not None:
+        query["limit"] = str(_recipient_link_public_page_limit(limit))
+    if show_all is not None:
+        if show_all:
+            query["all"] = "1"
+        else:
+            query.pop("all", None)
+    query_string = urlencode(query)
+    return f"{request.base_url}?{query_string}" if query_string else request.base_url
 
 
 def recipient_link_no_store(f):
@@ -976,6 +987,7 @@ def _recipient_link_public_mailbox_page_response(
     recipient_email: str,
     loaded_limit: int,
 ):
+    show_all = str(request.args.get("all") or "").strip().lower() in {"1", "true", "yes"}
     messages = []
     for source in result.get("messages") or []:
         item = dict(source or {})
@@ -995,12 +1007,19 @@ def _recipient_link_public_mailbox_page_response(
     refresh_url = request.url
     loaded_count = len(messages)
     has_more = result.get("success") and loaded_count >= loaded_limit
-    load_more_url = (
-        _recipient_link_public_page_url(loaded_limit + RECIPIENT_LINK_PUBLIC_PAGE_LIMIT)
-        if has_more and loaded_limit < RECIPIENT_LINK_PUBLIC_PAGE_MAX_LIMIT
-        else ""
-    )
+    load_more_url = ""
+    collapse_url = ""
+    if show_all:
+        collapse_url = _recipient_link_public_page_url(show_all=False)
+        if has_more and loaded_limit < RECIPIENT_LINK_PUBLIC_PAGE_MAX_LIMIT:
+            load_more_url = _recipient_link_public_page_url(
+                loaded_limit + RECIPIENT_LINK_PUBLIC_PAGE_LIMIT,
+                show_all=True,
+            )
+    else:
+        load_more_url = _recipient_link_public_page_url(show_all=True)
     page_title = f"邮箱展 - {str(row['recipient_email_display'] or recipient_email).strip()}"
+    current_message = messages[0] if messages else {}
     response = make_response(
         render_template(
             "recipient_mailbox_show.html",
@@ -1013,7 +1032,13 @@ def _recipient_link_public_mailbox_page_response(
             loaded_count=loaded_count,
             loaded_limit=loaded_limit,
             has_more=has_more,
+            show_all=show_all,
+            collapse_url=collapse_url,
             load_more_url=load_more_url,
+            current_subject=str(current_message.get("subject") or "无主题").strip(),
+            current_sender=str(current_message.get("from") or "").strip(),
+            current_received_at=str(current_message.get("received_at") or "").strip(),
+            current_body_srcdoc=_recipient_link_message_srcdoc(current_message) if current_message else "<div class=\"mail-empty\">当前无邮件</div>",
             messages=messages,
         ),
         response_status,
