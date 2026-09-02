@@ -1089,6 +1089,25 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
             'error': '邮箱服务查询超时',
         })
 
+    def test_public_mailbox_upstream_call_timeout_maps_to_504(self):
+        def slow_fetch(*_args, **_kwargs):
+            web_outlook_app.time.sleep(2)
+            return {'success': True, 'emails': [], 'has_more': False}
+
+        with patch.object(web_outlook_app, 'PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS', 1), \
+             patch.object(web_outlook_app, 'fetch_account_emails', side_effect=slow_fetch):
+            result = web_outlook_app.find_public_mailbox_messages(
+                self.account,
+                'target@example.com',
+                1,
+            )
+
+        self.assertEqual(result, {
+            'success': False,
+            'status': 504,
+            'error': '邮箱服务查询超时',
+        })
+
     def test_maps_generic_upstream_failure_to_502(self):
         with patch.object(web_outlook_app, 'fetch_account_emails', return_value={
             'success': False,

@@ -4,6 +4,7 @@ import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -1512,6 +1513,7 @@ def api_update_public_mailbox_api_key_auth():
 
 PUBLIC_MAILBOX_BATCH_SIZE = 50
 PUBLIC_MAILBOX_MAX_LIMIT = 20
+PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS = float(os.getenv("PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS", "12"))
 PUBLIC_MAILBOX_FORMATS = {'html', 'json'}
 PUBLIC_MAILBOX_SEARCH_FOLDERS = ('inbox', 'junkemail', 'deleteditems')
 PUBLIC_MAILBOX_HTML_CSP = (
@@ -1614,6 +1616,51 @@ def public_mailbox_upstream_error(value: Any) -> Dict[str, Any]:
     }
 
 
+def public_mailbox_fetch_timeout_error() -> Dict[str, Any]:
+    return {
+        'success': False,
+        'error': build_error_payload(
+            'EMAIL_FETCH_TIMEOUT',
+            '获取邮件超时，请稍后重试',
+            'TimeoutError',
+            504,
+            f'timeout={PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS}s',
+        ),
+    }
+
+
+def call_public_mailbox_upstream(func, *args, **kwargs):
+    timeout_seconds = max(1.0, float(PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS or 12))
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='public-mailbox-fetch')
+
+    def invoke_with_app_context():
+        with app.app_context():
+            return func(*args, **kwargs)
+
+    future = executor.submit(invoke_with_app_context)
+    try:
+        done, _not_done = wait([future], timeout=timeout_seconds)
+        if future not in done:
+            future.cancel()
+            return public_mailbox_fetch_timeout_error()
+        return future.result()
+    except Exception as exc:
+        if is_timeout_like_exception(exc):
+            return public_mailbox_fetch_timeout_error()
+        return {
+            'success': False,
+            'error': build_error_payload(
+                'EMAIL_FETCH_FAILED',
+                '获取邮件失败，请检查账号配置',
+                type(exc).__name__,
+                502,
+                sanitize_error_details(str(exc)),
+            ),
+        }
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def public_mailbox_message_key(item: Dict[str, Any]) -> tuple:
     return (
         str(item.get('folder') or 'inbox'),
@@ -1656,7 +1703,8 @@ def find_public_mailbox_messages(
 
     if not should_scan:
         for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
-            imap_result = fetch_account_imap_emails_by_recipient(
+            imap_result = call_public_mailbox_upstream(
+                fetch_account_imap_emails_by_recipient,
                 account,
                 folder_name,
                 recipient,
@@ -1700,7 +1748,13 @@ def find_public_mailbox_messages(
                     PUBLIC_MAILBOX_BATCH_SIZE,
                     scan_limit - scanned_count,
                 )
-                page = fetch_account_emails(account, folder_name, folder_skip, page_size)
+                page = call_public_mailbox_upstream(
+                    fetch_account_emails,
+                    account,
+                    folder_name,
+                    folder_skip,
+                    page_size,
+                )
                 if not page.get('success'):
                     return public_mailbox_upstream_error(page)
 
@@ -1747,7 +1801,8 @@ def find_public_mailbox_messages(
 
     messages = []
     for item in selected:
-        detail_result = fetch_email_detail_for_account(
+        detail_result = call_public_mailbox_upstream(
+            fetch_email_detail_for_account,
             account,
             item['id'],
             item['_request_method'],

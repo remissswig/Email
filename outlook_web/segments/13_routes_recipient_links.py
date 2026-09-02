@@ -125,6 +125,10 @@ def _recipient_link_public_page_limit(value: Any) -> int:
     return min(parsed, RECIPIENT_LINK_PUBLIC_PAGE_MAX_LIMIT)
 
 
+def _recipient_link_public_show_all_requested() -> bool:
+    return str(request.args.get("all") or "").strip().lower() in {"1", "true", "yes"}
+
+
 def _recipient_link_public_page_url(
     limit: int | None = None,
     *,
@@ -1052,7 +1056,7 @@ def _recipient_link_public_mailbox_page_response(
     recipient_email: str,
     loaded_limit: int,
 ):
-    show_all = str(request.args.get("all") or "").strip().lower() in {"1", "true", "yes"}
+    show_all = _recipient_link_public_show_all_requested()
     messages = []
     for source in result.get("messages") or []:
         item = dict(source or {})
@@ -1175,7 +1179,8 @@ def _recipient_link_public_mailbox_response(shared: str, recipient_email: str, *
         payload = {key: value for key, value in result.items() if key != "status"}
         return _recipient_link_public_json_response(payload, status)
 
-    loaded_limit = _recipient_link_public_page_limit(request.args.get("limit"))
+    show_all = _recipient_link_public_show_all_requested()
+    loaded_limit = _recipient_link_public_page_limit(request.args.get("limit")) if show_all else 1
     result = find_public_mailbox_messages(account, requested_recipient, loaded_limit)
     return _recipient_link_public_mailbox_page_response(
         row,
