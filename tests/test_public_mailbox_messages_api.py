@@ -89,6 +89,34 @@ class PublicMailboxMessageHelperTests(unittest.TestCase):
     def test_suite_uses_isolated_module(self):
         self.assertNotEqual(web_outlook_app.__name__, 'web_outlook_app')
 
+    def test_graph_access_token_result_reuses_process_cache(self):
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    'access_token': 'cached-graph-token',
+                    'expires_in': 3600,
+                }
+
+        with web_outlook_app.access_token_cache_lock:
+            web_outlook_app.access_token_cache.clear()
+
+        with patch.object(
+            web_outlook_app,
+            'request_graph_token_response',
+            return_value=FakeResponse(),
+        ) as token_request_mock:
+            first = web_outlook_app.get_access_token_graph_result('client-id', 'refresh-token')
+            second = web_outlook_app.get_access_token_graph_result('client-id', 'refresh-token')
+
+        self.assertTrue(first['success'])
+        self.assertTrue(second['success'])
+        self.assertEqual(first['access_token'], 'cached-graph-token')
+        self.assertEqual(second['access_token'], 'cached-graph-token')
+        token_request_mock.assert_called_once()
+
     def test_shared_email_header_matcher_matches_display_name_and_rejects_substrings(self):
         self.assertTrue(web_outlook_app.email_header_matches_address(
             'Hide My Email <01litany_muster@icloud.com>',
@@ -359,6 +387,110 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
                 'body_type': body_type,
             },
         }
+
+    def test_outlook_accounts_use_graph_recipient_search_without_detail_refetch(self):
+        account = {
+            **self.account,
+            'client_id': 'client-id',
+            'refresh_token': 'refresh-token',
+        }
+        matching = {
+            **self.item('graph-fast-match', 'target@example.com', '2026-08-21T12:00:00Z'),
+            '_detail': {
+                'id': 'graph-fast-match',
+                'subject': 'Fast match',
+                'from': 'sender@example.com',
+                'to': 'target@example.com',
+                'date': '2026-08-21T12:00:00Z',
+                'body': '<p>fast body</p>',
+                'body_type': 'html',
+            },
+        }
+
+        with patch.object(
+            web_outlook_app,
+            'fetch_account_graph_emails_by_recipient',
+            return_value={
+                'success': True,
+                'emails': [matching],
+                'recipient_search_supported': True,
+                'request_method': 'graph',
+            },
+        ) as graph_search_mock, patch.object(
+            web_outlook_app,
+            'fetch_account_emails',
+            return_value={'success': True, 'emails': [], 'has_more': False},
+        ) as scan_mock, patch.object(
+            web_outlook_app,
+            'fetch_email_detail_for_account',
+            return_value=self.detail(matching),
+        ) as detail_mock:
+            result = web_outlook_app.find_public_mailbox_messages(
+                account,
+                'target@example.com',
+                1,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['count'], 1)
+        self.assertEqual(result['messages'][0]['body'], '<p>fast body</p>')
+        graph_search_mock.assert_called_once_with(account, 'inbox', 'target@example.com', 1)
+        scan_mock.assert_not_called()
+        detail_mock.assert_not_called()
+
+    def test_outlook_graph_recipient_search_no_match_falls_back_to_limited_scan(self):
+        account = {
+            **self.account,
+            'client_id': 'client-id',
+            'refresh_token': 'refresh-token',
+        }
+        matching = self.item('fallback-match', 'target@example.com')
+
+        with patch.object(
+            web_outlook_app,
+            'fetch_account_graph_emails_by_recipient',
+            return_value={
+                'success': True,
+                'emails': [],
+                'recipient_search_supported': True,
+                'request_method': 'graph',
+            },
+        ) as graph_search_mock, patch.object(
+            web_outlook_app,
+            'fetch_account_emails',
+            return_value={
+                'success': True,
+                'emails': [matching],
+                'has_more': False,
+                'request_method': 'graph',
+            },
+        ) as scan_mock, patch.object(
+            web_outlook_app,
+            'fetch_email_detail_for_account',
+            return_value=self.detail(matching),
+        ) as detail_mock:
+            result = web_outlook_app.find_public_mailbox_messages(
+                account,
+                'target@example.com',
+                1,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['messages'][0]['id'], 'fallback-match')
+        self.assertEqual(graph_search_mock.call_args_list, [
+            call(account, 'inbox', 'target@example.com', 1),
+            call(account, 'junkemail', 'target@example.com', 1),
+            call(account, 'deleteditems', 'target@example.com', 1),
+        ])
+        scan_mock.assert_called_once_with(account, 'inbox', 0, 50)
+        detail_mock.assert_called_once_with(
+            account,
+            'fallback-match',
+            'graph',
+            'inbox',
+            'graph',
+            structured_error=True,
+        )
 
     def test_scans_next_page_and_passes_provider_method_to_detail_fetch(self):
         first_page_items = [
@@ -1850,7 +1982,7 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
         search_mock.assert_called_once_with(
             account,
             'recipient01@icloud.com',
-            20,
+            1,
         )
         row = self.get_public_link_row(int(link['id']))
         self.assertEqual(int(row['primary_access_count'] or 0), 1)
@@ -1912,7 +2044,7 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
         search_mock.assert_called_once_with(
             account,
             'recipient01+promo@icloud.com',
-            20,
+            1,
         )
         row = self.get_public_link_row(int(link['id']))
         self.assertEqual(int(row['primary_access_count'] or 0), 1)

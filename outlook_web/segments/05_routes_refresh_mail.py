@@ -3331,6 +3331,12 @@ def format_graph_email_item(item: Dict[str, Any], folder: str) -> Dict[str, Any]
     }, folder)
 
 
+def format_graph_recipient_search_item(item: Dict[str, Any], folder: str) -> Dict[str, Any]:
+    row = format_graph_email_item(item, folder)
+    row['_detail'] = format_graph_email_detail(item, [])
+    return row
+
+
 def format_email_items(items: List[Dict[str, Any]], folder: str) -> List[Dict[str, Any]]:
     return [normalize_email_list_item(item, folder) for item in items]
 
@@ -3521,6 +3527,58 @@ def fetch_account_folder_emails(account: Dict[str, Any], folder: str, skip: int,
         'success': False,
         'error': '无法获取邮件，所有方式均失败',
         'details': all_errors
+    }
+
+
+def fetch_account_graph_emails_by_recipient(
+    account: Dict[str, Any],
+    folder: str,
+    recipient: str,
+    limit: int,
+) -> Dict[str, Any]:
+    if str(account.get('account_type') or '').strip().lower() == 'imap':
+        return {
+            'success': False,
+            'recipient_search_supported': False,
+            'error': 'IMAP account does not use Graph recipient search',
+        }
+
+    client_id = str(account.get('client_id') or '').strip()
+    refresh_token = str(account.get('refresh_token') or '').strip()
+    if not client_id or not refresh_token:
+        return {
+            'success': False,
+            'recipient_search_supported': False,
+            'error': 'Graph credentials are missing',
+        }
+
+    folder_name = normalize_folder_name(folder)
+    result = get_emails_graph_by_recipient(
+        client_id,
+        refresh_token,
+        folder_name,
+        recipient,
+        limit,
+        get_account_proxy_url(account),
+        get_account_proxy_failover_urls(account),
+    )
+    if not result.get('success'):
+        return result
+
+    emails = []
+    for item in result.get('emails') or []:
+        formatted = format_graph_recipient_search_item(item, folder_name)
+        if public_mailbox_to_matches(formatted.get('to'), recipient):
+            emails.append(formatted)
+
+    emails.sort(key=lambda item: parse_email_datetime(item.get('date')) or datetime.min, reverse=True)
+    return {
+        'success': True,
+        'emails': emails[:max(1, int(limit or 1))],
+        'method': 'Graph API Recipient Search',
+        'has_more': False,
+        'request_method': 'graph',
+        'recipient_search_supported': True,
     }
 
 

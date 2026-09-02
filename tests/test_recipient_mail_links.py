@@ -436,6 +436,7 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         self.assertEqual(columns["primary_access_count"]["dflt_value"], "0")
         self.assertIn("idx_recipient_mail_links_binding", index_names)
         self.assertIn("idx_recipient_mail_links_token_hash", index_names)
+        self.assertIn("idx_recipient_mail_links_recipient_lookup", index_names)
 
     def test_recipient_link_create_and_repeat_import_reuses_token_and_first_display(self):
         upsert = getattr(self.module, "upsert_recipient_mail_link", None)

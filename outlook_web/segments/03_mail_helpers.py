@@ -139,6 +139,52 @@ def post_with_proxy_fallback(url: str, *, proxy_url: str = None,
 
 
 GRAPH_DEFAULT_TOKEN_SCOPE = "https://graph.microsoft.com/.default"
+ACCESS_TOKEN_CACHE_SKEW_SECONDS = 120
+ACCESS_TOKEN_CACHE_MAX_TTL_SECONDS = 3300
+access_token_cache: Dict[str, Dict[str, Any]] = {}
+access_token_cache_lock = threading.Lock()
+
+
+def build_access_token_cache_key(kind: str, client_id: str, refresh_token: str) -> str:
+    raw = json.dumps(
+        [
+            str(kind or '').strip().lower(),
+            str(client_id or ''),
+            str(refresh_token or ''),
+        ],
+        ensure_ascii=True,
+        separators=(',', ':'),
+    )
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+
+def get_cached_access_token(kind: str, client_id: str, refresh_token: str) -> str:
+    cache_key = build_access_token_cache_key(kind, client_id, refresh_token)
+    now = time.monotonic()
+    with access_token_cache_lock:
+        cached = access_token_cache.get(cache_key)
+        if not cached:
+            return ''
+        if float(cached.get('expires_at') or 0) <= now:
+            access_token_cache.pop(cache_key, None)
+            return ''
+        return str(cached.get('access_token') or '')
+
+
+def cache_access_token(kind: str, client_id: str, refresh_token: str, access_token: str, expires_in: Any) -> None:
+    try:
+        ttl = int(expires_in)
+    except (TypeError, ValueError):
+        return
+    if ttl <= ACCESS_TOKEN_CACHE_SKEW_SECONDS or not access_token:
+        return
+    cache_key = build_access_token_cache_key(kind, client_id, refresh_token)
+    expires_at = time.monotonic() + min(ttl - ACCESS_TOKEN_CACHE_SKEW_SECONDS, ACCESS_TOKEN_CACHE_MAX_TTL_SECONDS)
+    with access_token_cache_lock:
+        access_token_cache[cache_key] = {
+            'access_token': access_token,
+            'expires_at': expires_at,
+        }
 
 
 def build_graph_refresh_scope(graph_scopes: List[str]) -> str:
@@ -286,6 +332,10 @@ def proxy_socket_context(proxy_url: str):
 def get_access_token_graph_result(client_id: str, refresh_token: str, proxy_url: str = None,
                                   fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
     """获取 Graph API access_token（包含错误详情）"""
+    cached_token = get_cached_access_token('graph', client_id, refresh_token)
+    if cached_token:
+        return {"success": True, "access_token": cached_token}
+
     try:
         res = request_graph_token_response(
             client_id,
@@ -321,6 +371,7 @@ def get_access_token_graph_result(client_id: str, refresh_token: str, proxy_url:
                 )
             }
 
+        cache_access_token('graph', client_id, refresh_token, access_token, payload.get('expires_in'))
         return {"success": True, "access_token": access_token}
     except Exception as exc:
         return {
@@ -410,6 +461,87 @@ def get_emails_graph(client_id: str, refresh_token: str, folder: str = 'inbox', 
                 500,
                 str(exc)
             )
+        }
+
+
+def get_emails_graph_by_recipient(client_id: str, refresh_token: str, folder: str = 'inbox',
+                                  recipient: str = '', top: int = 1, proxy_url: str = None,
+                                  fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
+    """通过 Graph AQS 直接按收件人搜索，避免公开链接先拉大列表再筛。"""
+    normalized_recipient = normalize_email_address(recipient)
+    if not normalized_recipient:
+        return {
+            "success": False,
+            "error": build_error_payload(
+                "GRAPH_RECIPIENT_INVALID",
+                "recipient 不能为空",
+                "ValidationError",
+                400,
+                ""
+            ),
+            "recipient_search_supported": True,
+        }
+
+    token_result = get_access_token_graph_result(client_id, refresh_token, proxy_url, fallback_proxy_urls)
+    if not token_result.get("success"):
+        return {"success": False, "error": token_result.get("error"), "recipient_search_supported": True}
+
+    folder_map = {
+        'inbox': 'inbox',
+        'junkemail': 'junkemail',
+        'deleteditems': 'deleteditems',
+        'trash': 'deleteditems',
+    }
+    folder_name = folder_map.get(str(folder or '').lower(), 'inbox')
+    url = f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder_name}/messages"
+    params = {
+        "$search": f'"to:{normalized_recipient}"',
+        "$top": max(1, min(25, int(top or 1))),
+        "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,bodyPreview,body",
+    }
+    headers = {
+        "Authorization": f"Bearer {token_result.get('access_token')}",
+        "ConsistencyLevel": "eventual",
+        "Prefer": "outlook.body-content-type='html'",
+    }
+
+    try:
+        res = get_with_proxy_fallback(
+            url,
+            headers=headers,
+            params=params,
+            timeout=HTTP_REQUEST_TIMEOUT,
+            proxy_url=proxy_url,
+            fallback_proxy_urls=fallback_proxy_urls,
+        )
+        if res.status_code != 200:
+            return {
+                "success": False,
+                "error": build_error_payload(
+                    "GRAPH_RECIPIENT_SEARCH_FAILED",
+                    "Graph 收件人搜索失败",
+                    "GraphAPIError",
+                    res.status_code,
+                    get_response_details(res)
+                ),
+                "recipient_search_supported": res.status_code not in {400, 404},
+            }
+        return {
+            "success": True,
+            "emails": res.json().get("value", []),
+            "recipient_search_supported": True,
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": build_error_payload(
+                "GRAPH_RECIPIENT_SEARCH_FAILED",
+                "Graph 收件人搜索失败",
+                type(exc).__name__,
+                500,
+                str(exc)
+            ),
+            "recipient_search_supported": True,
         }
 
 
@@ -787,6 +919,10 @@ def request_imap_token_response(client_id: str, refresh_token: str, proxy_url: s
 def get_access_token_imap_result(client_id: str, refresh_token: str, proxy_url: str = None,
                                  fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
     """获取 IMAP access_token（包含错误详情）"""
+    cached_token = get_cached_access_token('imap', client_id, refresh_token)
+    if cached_token:
+        return {"success": True, "access_token": cached_token}
+
     try:
         res = request_imap_token_response(client_id, refresh_token, proxy_url, fallback_proxy_urls)
 
@@ -817,6 +953,7 @@ def get_access_token_imap_result(client_id: str, refresh_token: str, proxy_url: 
                 )
             }
 
+        cache_access_token('imap', client_id, refresh_token, access_token, payload.get('expires_in'))
         return {"success": True, "access_token": access_token}
     except Exception as exc:
         return {

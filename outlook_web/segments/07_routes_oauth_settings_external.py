@@ -1698,10 +1698,43 @@ def find_public_mailbox_messages(
         scan_limit = MAILBOXES_MESSAGES_SCANNED_COUNT_DEFAULT
     scanned_count = 0
     skip = 0
-    should_scan = str(account.get('account_type') or '').strip().lower() != 'imap'
+    is_imap_account = str(account.get('account_type') or '').strip().lower() == 'imap'
+    should_scan = not is_imap_account
     candidates_remain = False
 
-    if not should_scan:
+    if should_scan:
+        fast_search_complete = True
+        for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
+            graph_result = call_public_mailbox_upstream(
+                fetch_account_graph_emails_by_recipient,
+                account,
+                folder_name,
+                recipient,
+                max(limit, 1),
+            )
+            if graph_result.get('recipient_search_supported') is False:
+                fast_search_complete = False
+                break
+            if not graph_result.get('success'):
+                fast_search_complete = False
+                folder_errors.append(graph_result)
+                break
+            for source in graph_result.get('emails') or []:
+                item = dict(source or {})
+                key = public_mailbox_message_key(item)
+                if not key[2] or key in seen:
+                    continue
+                seen.add(key)
+                item['_request_method'] = 'graph'
+                matches.append(item)
+
+            if folder_name == 'inbox' and matches:
+                break
+
+        if matches:
+            should_scan = False
+
+    if is_imap_account:
         for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
             imap_result = call_public_mailbox_upstream(
                 fetch_account_imap_emails_by_recipient,
@@ -1801,17 +1834,23 @@ def find_public_mailbox_messages(
 
     messages = []
     for item in selected:
-        detail_result = call_public_mailbox_upstream(
-            fetch_email_detail_for_account,
-            account,
-            item['id'],
-            item['_request_method'],
-            item.get('folder') or 'inbox',
-            item.get('id_mode') or '',
-            structured_error=True,
-        )
-        if not detail_result.get('success'):
-            return public_mailbox_upstream_error(detail_result)
+        if isinstance(item.get('_detail'), dict):
+            detail_result = {
+                'success': True,
+                'email': item['_detail'],
+            }
+        else:
+            detail_result = call_public_mailbox_upstream(
+                fetch_email_detail_for_account,
+                account,
+                item['id'],
+                item['_request_method'],
+                item.get('folder') or 'inbox',
+                item.get('id_mode') or '',
+                structured_error=True,
+            )
+            if not detail_result.get('success'):
+                return public_mailbox_upstream_error(detail_result)
         messages.append(
             build_public_mailbox_message(item, detail_result.get('email') or {})
         )

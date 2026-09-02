@@ -1645,6 +1645,10 @@ def init_db():
         ON recipient_mail_links(main_email_display COLLATE NOCASE, recipient_email_display COLLATE NOCASE)
     ''')
     cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_recipient_mail_links_recipient_lookup
+        ON recipient_mail_links(recipient_email_normalized, id)
+    ''')
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS public_mailbox_api_keys (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
