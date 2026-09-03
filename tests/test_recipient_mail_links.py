@@ -426,9 +426,11 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         with self.app_context():
             db = self.module.get_db()
             table_info = db.execute("PRAGMA table_info(recipient_mail_links)").fetchall()
+            account_table_info = db.execute("PRAGMA table_info(accounts)").fetchall()
             indexes = db.execute("PRAGMA index_list(recipient_mail_links)").fetchall()
 
         columns = {row["name"]: row for row in table_info}
+        account_columns = {row["name"]: row for row in account_table_info}
         index_names = {row["name"] for row in indexes}
         self.assertIn("token_encrypted", columns)
         self.assertEqual(columns["token_encrypted"]["notnull"], 1)
@@ -437,6 +439,68 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         self.assertIn("idx_recipient_mail_links_binding", index_names)
         self.assertIn("idx_recipient_mail_links_token_hash", index_names)
         self.assertIn("idx_recipient_mail_links_recipient_lookup", index_names)
+        self.assertIn("recipient_share_segment", account_columns)
+        self.assertEqual(account_columns["recipient_share_segment"]["notnull"], 1)
+        self.assertEqual(account_columns["recipient_share_segment"]["dflt_value"], "''")
+
+    def test_recipient_links_reuse_persisted_account_share_segment(self):
+        generator = getattr(self.module, "generate_recipient_mail_share_segment", None)
+        self.assertIsNotNone(generator)
+        account_id = self.insert_account("owner@example.com")
+        expected_segment = "S" * 43
+
+        with patch.object(
+            self.module,
+            "generate_recipient_mail_share_segment",
+            return_value=expected_segment,
+        ) as generate_mock:
+            self.seed_recipient_link(
+                account_id=account_id,
+                recipient_email="first@example.com",
+            )
+            self.seed_recipient_link(
+                account_id=account_id,
+                recipient_email="second@example.com",
+            )
+
+        with self.app_context():
+            row = self.module.get_db().execute(
+                "SELECT recipient_share_segment FROM accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+
+        self.assertEqual(row["recipient_share_segment"], expected_segment)
+        self.assertRegex(row["recipient_share_segment"], r"^[A-Za-z0-9_-]{43}$")
+        generate_mock.assert_called_once_with()
+
+    def test_backfill_preserves_legacy_primary_share_segment(self):
+        backfill = getattr(self.module, "backfill_recipient_share_segments", None)
+        self.assertIsNotNone(backfill)
+        account_id = self.insert_account("legacy-owner@example.com")
+        self.seed_recipient_link(
+            account_id=account_id,
+            main_email="legacy-owner@example.com",
+            recipient_email="legacy-recipient@example.com",
+        )
+
+        with self.app_context():
+            db = self.module.get_db()
+            db.execute(
+                "UPDATE accounts SET recipient_share_segment = '' WHERE id = ?",
+                (account_id,),
+            )
+            updated = backfill(db)
+            row = db.execute(
+                "SELECT recipient_share_segment FROM accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            db.commit()
+
+        self.assertEqual(updated, 1)
+        self.assertEqual(
+            row["recipient_share_segment"],
+            self.module.build_recipient_link_share_segment(account_id),
+        )
 
     def test_recipient_link_create_and_repeat_import_reuses_token_and_first_display(self):
         upsert = getattr(self.module, "upsert_recipient_mail_link", None)

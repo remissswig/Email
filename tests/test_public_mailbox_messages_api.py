@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import importlib.util
 import os
 import pathlib
@@ -9,7 +10,15 @@ import tempfile
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 from unittest.mock import call, patch
+
+from outlook_web.cluster.storage import (
+    CLUSTER_PROTOCOL_VERSION,
+    ReplicaApplyError,
+    apply_increment,
+    apply_snapshot,
+)
 
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parents[1]
@@ -35,7 +44,7 @@ def temporary_environment(**updates):
                 os.environ[key] = value
 
 
-def load_isolated_web_outlook_app(*, role='primary'):
+def load_isolated_web_outlook_app(*, role='primary', secret_key=ISOLATED_SECRET_KEY):
     temp_dir = pathlib.Path(tempfile.mkdtemp(prefix='public-mailbox-messages-tests-'))
     database_path = temp_dir / 'test.db'
     module_name = f'test_public_mailbox_messages_app_{uuid.uuid4().hex}'
@@ -44,15 +53,15 @@ def load_isolated_web_outlook_app(*, role='primary'):
     sys.modules[module_name] = module
     with temporary_environment(
         DATABASE_PATH=str(database_path),
-        SECRET_KEY=ISOLATED_SECRET_KEY,
+        SECRET_KEY=secret_key,
         NODE_ROLE=role,
         MASTER_URL='https://primary.example' if role == 'replica' else None,
     ):
         spec.loader.exec_module(module)
 
-    module.resolve_secret_key = lambda: ISOLATED_SECRET_KEY
-    module.secret_key = ISOLATED_SECRET_KEY
-    module.app.secret_key = ISOLATED_SECRET_KEY
+    module.resolve_secret_key = lambda: secret_key
+    module.secret_key = secret_key
+    module.app.secret_key = secret_key
     module._cipher_suite = None
     return module, temp_dir, module_name
 
@@ -1434,6 +1443,14 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
                 (record_id,),
             ).fetchone()
 
+    def get_account_share_segment(self, account_id):
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute(
+                'SELECT recipient_share_segment FROM accounts WHERE id = ?',
+                (int(account_id),),
+            ).fetchone()
+        return row['recipient_share_segment']
+
     def get_replication_event_count(self):
         with self.app.app_context():
             return int(
@@ -1949,7 +1966,7 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
 
     def test_public_show_and_query_routes_use_shared_segment_and_return_expected_formats(self):
         link = self.seed_public_link('Recipient01@iCloud.com')
-        shared = web_outlook_app.build_recipient_link_share_segment(int(link['account_id']))
+        shared = self.get_account_share_segment(link['account_id'])
         account = {
             'id': int(link['account_id']),
             'email': 'owner@example.com',
@@ -2015,7 +2032,7 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
 
     def test_public_show_route_accepts_plus_alias_for_same_mailbox(self):
         link = self.seed_public_link('Recipient01@iCloud.com')
-        shared = web_outlook_app.build_recipient_link_share_segment(int(link['account_id']))
+        shared = self.get_account_share_segment(link['account_id'])
         account = {
             'id': int(link['account_id']),
             'email': 'owner@example.com',
@@ -2052,7 +2069,7 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
 
     def test_public_show_route_expands_to_accordion_view_when_requested(self):
         link = self.seed_public_link('Recipient01@iCloud.com')
-        shared = web_outlook_app.build_recipient_link_share_segment(int(link['account_id']))
+        shared = self.get_account_share_segment(link['account_id'])
         account = {
             'id': int(link['account_id']),
             'email': 'owner@example.com',
@@ -3020,6 +3037,159 @@ class ReplicaPublicMailboxMessagesApiTests(unittest.TestCase):
         row = self.get_public_link_row(int(link['id']))
         self.assertEqual(int(row['primary_access_count'] or 0), 0)
         self.assertIsNone(row['last_accessed_at'])
+
+    def test_primary_show_url_resolves_on_replica_with_independent_secret(self):
+        primary_module, temp_dir, module_name = load_isolated_web_outlook_app(
+            secret_key='independent-primary-secret',
+        )
+        try:
+            with primary_module.app.app_context():
+                primary_module.init_db()
+                db = primary_module.get_db()
+                cursor = db.execute(
+                    "INSERT INTO accounts (email) VALUES (?)",
+                    ('owner@example.com',),
+                )
+                account_id = int(cursor.lastrowid)
+                recipient = primary_module.normalize_recipient_email('Recipient01@iCloud.com')
+                primary_module.upsert_recipient_mail_link(
+                    db,
+                    account_id,
+                    'Owner@Example.com',
+                    recipient.display,
+                    recipient.normalized,
+                    None,
+                )
+                db.commit()
+                snapshot = primary_module.build_snapshot(db, primary_module.decrypt_data)
+
+            with primary_module.app.test_request_context(base_url='https://primary.example'):
+                share_url = primary_module.build_recipient_link_public_url(
+                    account_id,
+                    recipient.display,
+                )
+            primary_shared = urlparse(share_url).path.strip('/').split('/')[1]
+
+            self.assertEqual(CLUSTER_PROTOCOL_VERSION, 3)
+            self.assertEqual(
+                snapshot['accounts'][0]['recipient_share_segment'],
+                primary_shared,
+            )
+
+            with self.app.app_context():
+                db = self.replica_module.get_db()
+                apply_snapshot(db, snapshot, self.replica_module.encrypt_data)
+                db.commit()
+                replica_account = db.execute(
+                    "SELECT recipient_share_segment FROM accounts WHERE id = ?",
+                    (account_id,),
+                ).fetchone()
+            self.assertEqual(replica_account['recipient_share_segment'], primary_shared)
+            self.set_replica_state(
+                cursor=int(snapshot['snapshot_cursor']),
+                last_success_at=datetime.now(timezone.utc),
+                node_id='replica-independent-secret',
+            )
+
+            with patch.object(
+                self.replica_module,
+                'find_public_mailbox_messages',
+                return_value=self.success_result(),
+            ):
+                response = self.client.get(urlparse(share_url).path)
+
+            self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+            self.assertEqual(response.headers['X-Mailbox-Node'], 'replica-independent-secret')
+
+            malformed_snapshot = copy.deepcopy(snapshot)
+            malformed_snapshot['accounts'][0]['recipient_share_segment'] = 'not base64url!'
+            with self.app.app_context(), self.assertRaises(ReplicaApplyError):
+                apply_snapshot(
+                    self.replica_module.get_db(),
+                    malformed_snapshot,
+                    self.replica_module.encrypt_data,
+                )
+        finally:
+            cleanup_isolated_web_outlook_app(primary_module, temp_dir, module_name)
+
+    def test_new_share_segment_replicates_incrementally(self):
+        primary_module, temp_dir, module_name = load_isolated_web_outlook_app(
+            secret_key='increment-primary-secret',
+        )
+        try:
+            with primary_module.app.app_context():
+                primary_module.init_db()
+                db = primary_module.get_db()
+                cursor = db.execute(
+                    "INSERT INTO accounts (email) VALUES (?)",
+                    ('increment-owner@example.com',),
+                )
+                account_id = int(cursor.lastrowid)
+                db.commit()
+                snapshot = primary_module.build_snapshot(db, primary_module.decrypt_data)
+
+            with self.app.app_context():
+                db = self.replica_module.get_db()
+                apply_snapshot(db, snapshot, self.replica_module.encrypt_data)
+                db.commit()
+
+            with primary_module.app.app_context():
+                db = primary_module.get_db()
+                recipient = primary_module.normalize_recipient_email('increment@icloud.com')
+                primary_module.upsert_recipient_mail_link(
+                    db,
+                    account_id,
+                    'increment-owner@example.com',
+                    recipient.display,
+                    recipient.normalized,
+                    None,
+                )
+                db.commit()
+                increment = primary_module.build_increment(
+                    db,
+                    int(snapshot['snapshot_cursor']),
+                    100,
+                    primary_module.decrypt_data,
+                )
+
+            self.assertEqual(len(increment['accounts']), 1)
+            expected_segment = increment['accounts'][0]['recipient_share_segment']
+            self.assertRegex(expected_segment, r'^[A-Za-z0-9_-]{43}$')
+
+            with self.app.app_context():
+                db = self.replica_module.get_db()
+                apply_increment(db, increment, self.replica_module.encrypt_data)
+                db.commit()
+                row = db.execute(
+                    'SELECT recipient_share_segment FROM accounts WHERE id = ?',
+                    (account_id,),
+                ).fetchone()
+            self.assertEqual(row['recipient_share_segment'], expected_segment)
+        finally:
+            cleanup_isolated_web_outlook_app(primary_module, temp_dir, module_name)
+
+    def test_replica_schema_upgrade_forces_fresh_snapshot(self):
+        self.set_replica_state(
+            cursor=41,
+            last_success_at=datetime.now(timezone.utc),
+        )
+        with self.app.app_context():
+            db = self.replica_module.get_db()
+            db.execute('ALTER TABLE accounts DROP COLUMN recipient_share_segment')
+            db.commit()
+
+        self.replica_module.init_db()
+        with self.app.app_context():
+            db = self.replica_module.get_db()
+            columns = {
+                row['name']
+                for row in db.execute('PRAGMA table_info(accounts)').fetchall()
+            }
+            state = self.replica_module.load_replica_state(db)
+
+        self.assertIn('recipient_share_segment', columns)
+        self.assertIsNone(state.last_success_at)
+        self.assertEqual(state.protocol_version, CLUSTER_PROTOCOL_VERSION)
 
     def test_replica_health_routes_reflect_liveness_and_readiness_window(self):
         self.set_replica_state(last_success_at=None)

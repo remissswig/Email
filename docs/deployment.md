@@ -128,6 +128,12 @@ bash scripts/install-node.sh --master https://PRIMARY_HOST --node-id NODE_ID --m
 /api/v1/cluster/status
 ```
 
+### 复制协议 v3 升级
+
+协议 v3 会把邮箱分享链接的稳定路径段随账号数据同步。主节点与副本节点可以继续使用各自独立的 `SECRET_KEY`；主节点生成的 `/show/...` 和 `/query/...` 链接在副本节点上也能使用。
+
+协议版本必须一致，不能混用 v2 与 v3。升级时应安排同一维护窗口：先升级主节点，再升级所有副本节点，并等待每个副本的 `/health/ready` 恢复为 `200`。已有副本首次以 v3 启动时会清除旧的同步成功标记并强制拉取完整快照；快照完成前相关查询返回 `503 replica_not_ready`，这是预期行为。升级过程中保留各节点原有的 `.env`、`SECRET_KEY`、数据目录和副本身份库，不要把主节点密钥复制到副本。
+
 ### Enrollment、凭据轮换与恢复
 
 主节点设置页的“节点管理”可以创建节点、生成一次性 enrollment token，并显示包含 `MASTER_URL`、节点 ID 和主节点指纹的安装命令。token 只在结果窗口中显示一次，不会写入 `.env` 或 Compose 文件。副本安装脚本首次运行时从标准输入读取 token；重复运行会校验并复用本地身份，然后先拉取最新镜像再启动。

@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Changed
+- 只读副本复制协议升级到 v3，账号快照和增量载荷新增稳定的邮箱分享路径段；主从节点需要在同一维护窗口协调升级。
+
+### Fixed
+- 修复主节点生成的 `/show/...` 和 `/query/...` 邮箱分享链接在使用独立 `SECRET_KEY` 的从节点上被误判为“链接不存在”的问题。已有主节点链接在升级时保留原路径，新链接使用账号级随机路径段并随复制数据同步。
+
 ## [2.5.2] - 2026-06-30
 
 ### Fixed

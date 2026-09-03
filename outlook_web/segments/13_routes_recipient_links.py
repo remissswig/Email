@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import html
 import hashlib
 import hmac
@@ -77,18 +76,43 @@ def digest_recipient_mail_token(token: str) -> str:
     return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
 
 
-def _recipient_link_share_seed(account_id: int) -> bytes:
-    return f"recipient-mailbox:{int(account_id)}".encode("utf-8")
-
-
 def build_recipient_link_share_segment(account_id: int) -> str:
-    secret_key = str(app.secret_key or "").strip()
-    seed = _recipient_link_share_seed(account_id)
-    if secret_key:
-        digest = hmac.new(secret_key.encode("utf-8"), seed, hashlib.sha256).digest()
-    else:
-        digest = hashlib.sha256(seed).digest()
-    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return legacy_recipient_share_segment(account_id)
+
+
+def generate_recipient_mail_share_segment() -> str:
+    return secrets.token_urlsafe(RECIPIENT_LINK_TOKEN_BYTES)
+
+
+def ensure_recipient_mail_share_segment(db, account_id: int) -> str:
+    row = db.execute(
+        "SELECT recipient_share_segment FROM accounts WHERE id = ?",
+        (int(account_id),),
+    ).fetchone()
+    if row is None:
+        raise ValueError("recipient link account does not exist")
+
+    current = str(row["recipient_share_segment"] or "").strip()
+    if current:
+        return current
+
+    candidate = generate_recipient_mail_share_segment()
+    db.execute(
+        """
+        UPDATE accounts
+        SET recipient_share_segment = ?
+        WHERE id = ? AND COALESCE(recipient_share_segment, '') = ''
+        """,
+        (candidate, int(account_id)),
+    )
+    row = db.execute(
+        "SELECT recipient_share_segment FROM accounts WHERE id = ?",
+        (int(account_id),),
+    ).fetchone()
+    segment = str(row["recipient_share_segment"] or "").strip() if row else ""
+    if not segment:
+        raise RuntimeError("recipient share segment allocation failed")
+    return segment
 
 
 def _recipient_link_lookup_recipient_email(value: Any) -> str:
@@ -487,6 +511,7 @@ def upsert_recipient_mail_link(
     recipient_email_normalized,
     expires_at,
 ):
+    ensure_recipient_mail_share_segment(db, int(account_id))
     existing = _get_recipient_mail_link_row(db, account_id, recipient_email_normalized)
     if existing is not None:
         return _return_existing_recipient_mail_link(
@@ -889,9 +914,10 @@ def build_recipient_link_url(token: str) -> str:
 def build_recipient_link_public_url(account_id: int, recipient_email: str, *, mode: str = "show") -> str:
     normalized_mode = "query" if str(mode or "").strip().lower() == "query" else "show"
     recipient = quote(str(recipient_email or "").strip(), safe="@._-+")
+    shared = ensure_recipient_mail_share_segment(get_db(), int(account_id))
     return (
         f"{effective_recipient_link_base_url().rstrip('/')}/{normalized_mode}/"
-        f"{build_recipient_link_share_segment(account_id)}/{recipient}"
+        f"{shared}/{recipient}"
     )
 
 
@@ -946,7 +972,10 @@ def resolve_recipient_link_public(shared: Any, recipient_email: Any):
 
     rows = get_db().execute(
         """
-        SELECT l.*, a.id AS bound_account_exists
+        SELECT
+            l.*,
+            a.id AS bound_account_exists,
+            a.recipient_share_segment AS recipient_share_segment
         FROM recipient_mail_links AS l
         LEFT JOIN accounts AS a ON a.id = l.account_id
         WHERE l.recipient_email_normalized = ?
@@ -955,7 +984,8 @@ def resolve_recipient_link_public(shared: Any, recipient_email: Any):
         (lookup_recipient,),
     ).fetchall()
     for row in rows:
-        if build_recipient_link_share_segment(int(row["account_id"])) == normalized_shared:
+        persisted_shared = str(row["recipient_share_segment"] or "").strip()
+        if persisted_shared and hmac.compare_digest(persisted_shared, normalized_shared):
             return row
     return None
 

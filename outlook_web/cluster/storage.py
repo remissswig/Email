@@ -15,7 +15,7 @@ REPLICATED_SETTING_KEYS = frozenset({
     'mailboxes_messages_scanned_count',
 })
 MAX_INCREMENT_EVENTS = 500
-CLUSTER_PROTOCOL_VERSION = 2
+CLUSTER_PROTOCOL_VERSION = 3
 _IDENTITY_KEY_VERSION = 1
 _RFC3339_UTC_RE = re.compile(
     r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$'
@@ -36,6 +36,7 @@ _ACCOUNT_PAYLOAD_KEYS = (
     'proxy_url',
     'fallback_proxy_url_1',
     'fallback_proxy_url_2',
+    'recipient_share_segment',
     'created_at',
     'updated_at',
 )
@@ -190,6 +191,14 @@ def _normalize_stored_email(value: Any, label: str) -> str:
     return normalized
 
 
+def _validate_recipient_share_segment(value: Any) -> str:
+    segment = _require_text(value, 'account.recipient_share_segment', max_length=128)
+    assert segment is not None
+    if segment and not re.fullmatch(r'[A-Za-z0-9_-]{32,128}', segment):
+        raise ValueError('account.recipient_share_segment must be base64url text')
+    return segment
+
+
 def _normalize_setting_value(key: str, value: Any) -> str:
     text = _require_text(value, f'settings.{key}', max_length=64)
     assert text is not None
@@ -235,6 +244,7 @@ def _serialize_account_row(row: sqlite3.Row, decrypt_sensitive: Callable[[str], 
         'proxy_url': _require_text(row['proxy_url'] or '', 'account.proxy_url', max_length=2048),
         'fallback_proxy_url_1': _require_text(row['fallback_proxy_url_1'] or '', 'account.fallback_proxy_url_1', max_length=2048),
         'fallback_proxy_url_2': _require_text(row['fallback_proxy_url_2'] or '', 'account.fallback_proxy_url_2', max_length=2048),
+        'recipient_share_segment': _validate_recipient_share_segment(row['recipient_share_segment'] or ''),
         'created_at': _normalize_stored_timestamp(row['created_at'], 'account.created_at'),
         'updated_at': _normalize_stored_timestamp(row['updated_at'], 'account.updated_at'),
     }
@@ -335,6 +345,7 @@ def _validate_account_payload(item: Any) -> dict[str, Any]:
         'proxy_url': _require_text(payload['proxy_url'], 'account.proxy_url', max_length=2048),
         'fallback_proxy_url_1': _require_text(payload['fallback_proxy_url_1'], 'account.fallback_proxy_url_1', max_length=2048),
         'fallback_proxy_url_2': _require_text(payload['fallback_proxy_url_2'], 'account.fallback_proxy_url_2', max_length=2048),
+        'recipient_share_segment': _validate_recipient_share_segment(payload['recipient_share_segment']),
         'created_at': _require_rfc3339_text(payload['created_at'], 'account.created_at'),
         'updated_at': _require_rfc3339_text(payload['updated_at'], 'account.updated_at'),
     }
@@ -994,6 +1005,14 @@ def initialize_replica_schema(conn: sqlite3.Connection) -> None:
         VALUES ('cursor', '0')
         '''
     )
+    conn.execute(
+        '''
+        INSERT INTO cluster_replica_state (key, value)
+        VALUES ('protocol_version', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        ''',
+        (str(CLUSTER_PROTOCOL_VERSION),),
+    )
     conn.commit()
 
 
@@ -1608,7 +1627,7 @@ def build_snapshot(
                 id, email, password, client_id, refresh_token, status,
                 account_type, provider, imap_host, imap_port, imap_password,
                 proxy_url, fallback_proxy_url_1, fallback_proxy_url_2,
-                created_at, updated_at
+                recipient_share_segment, created_at, updated_at
             FROM accounts
             ORDER BY id
             '''
@@ -1727,7 +1746,7 @@ def build_increment(
             id, email, password, client_id, refresh_token, status,
             account_type, provider, imap_host, imap_port, imap_password,
             proxy_url, fallback_proxy_url_1, fallback_proxy_url_2,
-            created_at, updated_at
+            recipient_share_segment, created_at, updated_at
             ''',
         )
         alias_rows = _select_rows_by_ids(
@@ -1897,8 +1916,8 @@ def _apply_account_upserts(
                 id, email, password, client_id, refresh_token, group_id, status,
                 account_type, provider, imap_host, imap_port, imap_password,
                 proxy_url, fallback_proxy_url_1, fallback_proxy_url_2,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                recipient_share_segment, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 email = excluded.email,
                 password = excluded.password,
@@ -1914,6 +1933,7 @@ def _apply_account_upserts(
                 proxy_url = excluded.proxy_url,
                 fallback_proxy_url_1 = excluded.fallback_proxy_url_1,
                 fallback_proxy_url_2 = excluded.fallback_proxy_url_2,
+                recipient_share_segment = excluded.recipient_share_segment,
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at
             ''',
@@ -1933,6 +1953,7 @@ def _apply_account_upserts(
                 account['proxy_url'],
                 account['fallback_proxy_url_1'],
                 account['fallback_proxy_url_2'],
+                account['recipient_share_segment'],
                 account['created_at'],
                 account['updated_at'],
             ),

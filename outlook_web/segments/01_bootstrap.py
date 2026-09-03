@@ -12,6 +12,7 @@ import imaplib
 import sqlite3
 import os
 import hashlib
+import hmac
 import secrets
 import time
 import json
@@ -1320,6 +1321,35 @@ def normalize_group_sort_orders_on_startup(cursor) -> None:
     )
 
 
+def legacy_recipient_share_segment(account_id: int) -> str:
+    seed = f"recipient-mailbox:{int(account_id)}".encode("utf-8")
+    secret_key = str(app.secret_key or "").strip()
+    if secret_key:
+        digest = hmac.new(secret_key.encode("utf-8"), seed, hashlib.sha256).digest()
+    else:
+        digest = hashlib.sha256(seed).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def backfill_recipient_share_segments(conn) -> int:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT a.id
+        FROM accounts AS a
+        INNER JOIN recipient_mail_links AS l ON l.account_id = a.id
+        WHERE COALESCE(a.recipient_share_segment, '') = ''
+        ORDER BY a.id
+        """
+    ).fetchall()
+    for row in rows:
+        account_id = int(row[0])
+        conn.execute(
+            "UPDATE accounts SET recipient_share_segment = ? WHERE id = ?",
+            (legacy_recipient_share_segment(account_id), account_id),
+        )
+    return len(rows)
+
+
 def init_db():
     """初始化数据库"""
     conn = sqlite3.connect(DATABASE)
@@ -1373,6 +1403,7 @@ def init_db():
             proxy_url TEXT DEFAULT '',
             fallback_proxy_url_1 TEXT DEFAULT '',
             fallback_proxy_url_2 TEXT DEFAULT '',
+            recipient_share_segment TEXT NOT NULL DEFAULT '',
             last_refresh_at TIMESTAMP,
             last_refresh_status TEXT DEFAULT 'never',
             last_refresh_error TEXT,
@@ -1843,6 +1874,7 @@ def init_db():
     # 检查并添加缺失的列（数据库迁移）
     cursor.execute("PRAGMA table_info(accounts)")
     columns = [col[1] for col in cursor.fetchall()]
+    recipient_share_segment_added = False
 
     if 'group_id' not in columns:
         cursor.execute('ALTER TABLE accounts ADD COLUMN group_id INTEGER DEFAULT 1')
@@ -1882,6 +1914,12 @@ def init_db():
         cursor.execute('ALTER TABLE accounts ADD COLUMN fallback_proxy_url_1 TEXT')
     if 'fallback_proxy_url_2' not in columns:
         cursor.execute('ALTER TABLE accounts ADD COLUMN fallback_proxy_url_2 TEXT')
+    if 'recipient_share_segment' not in columns:
+        cursor.execute(
+            "ALTER TABLE accounts "
+            "ADD COLUMN recipient_share_segment TEXT NOT NULL DEFAULT ''"
+        )
+        recipient_share_segment_added = True
 
     cursor.execute("PRAGMA table_info(public_mailbox_api_keys)")
     public_mailbox_api_key_columns = [col[1] for col in cursor.fetchall()]
@@ -2537,8 +2575,13 @@ def init_db():
             encrypt_data,
             lambda: datetime.now(timezone.utc),
         )
+        backfill_recipient_share_segments(conn)
     else:
         initialize_replica_schema(conn)
+        if recipient_share_segment_added:
+            conn.execute(
+                "DELETE FROM cluster_replica_state WHERE key = 'last_success_at'"
+            )
 
     conn.commit()
     conn.close()
