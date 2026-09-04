@@ -160,6 +160,45 @@ class PublicMailboxMessageHelperTests(unittest.TestCase):
             'meaty.payers0p+aa@icloud.com',
         ))
 
+    def test_icloud_delivery_headers_match_at_replaced_by_equals_form(self):
+        self.assertTrue(web_outlook_app.public_mailbox_delivery_headers_match(
+            {
+                'internet_message_headers': [
+                    {
+                        'name': 'Received-SPF',
+                        'value': (
+                            'pass domain of '
+                            'bounces+20216706-4ff1-vacuole.cooled9b+aas=icloud.com'
+                            '@em7877.tm.openai.com'
+                        ),
+                    },
+                ],
+            },
+            'vacuole.cooled9b+aas@icloud.com',
+        ))
+
+    def test_icloud_delivery_headers_reject_base_for_plus_delivery(self):
+        self.assertFalse(web_outlook_app.public_mailbox_delivery_headers_match(
+            {
+                'internet_message_headers': [
+                    {
+                        'name': 'Return-Path',
+                        'value': (
+                            'bounces+20216706-4ff1-vacuole.cooled9b+aas=icloud.com'
+                            '_at_em7877_tm_openai_com@icloud.com'
+                        ),
+                    },
+                ],
+            },
+            'vacuole.cooled9b@icloud.com',
+        ))
+
+    def test_non_icloud_addresses_do_not_require_delivery_header_match(self):
+        self.assertTrue(web_outlook_app.public_mailbox_delivery_headers_match(
+            {'internet_message_headers': []},
+            'target@example.com',
+        ))
+
     def test_query_defaults(self):
         parsed, error = web_outlook_app.parse_public_mailbox_message_query({
             'mainemail': 'Owner@Example.com',
@@ -387,13 +426,18 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         }
 
     @staticmethod
-    def detail(item, body=None, body_type='html'):
+    def detail(item, body=None, body_type='html', headers=None):
         return {
             'success': True,
             'email': {
                 **item,
                 'body': body if body is not None else f'<p>{item["id"]}</p>',
                 'body_type': body_type,
+                **(
+                    {'internet_message_headers': headers}
+                    if headers is not None
+                    else {}
+                ),
             },
         }
 
@@ -500,6 +544,135 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
             'graph',
             structured_error=True,
         )
+
+    def test_icloud_plus_match_requires_encoded_delivery_header(self):
+        matching = self.item(
+            'plus-match',
+            'Hide My Email <vacuole.cooled9b@icloud.com>',
+            '2026-08-21T12:00:00Z',
+        )
+
+        with patch.object(
+            web_outlook_app,
+            'fetch_account_emails',
+            return_value={
+                'success': True,
+                'emails': [matching],
+                'has_more': False,
+                'request_method': 'graph',
+            },
+        ) as fetch_mock, patch.object(
+            web_outlook_app,
+            'fetch_email_detail_for_account',
+            return_value=self.detail(
+                matching,
+                body='<p>code</p>',
+                body_type='html',
+                headers=[
+                    {
+                        'name': 'Authentication-Results-Original',
+                        'value': (
+                            'spf=pass smtp.mailfrom='
+                            'bounces+20216706-4ff1-vacuole.cooled9b+aas=icloud.com'
+                            '@em7877.tm.openai.com'
+                        ),
+                    },
+                ],
+            ),
+        ) as detail_mock:
+            result = web_outlook_app.find_public_mailbox_messages(
+                self.account,
+                'vacuole.cooled9b+aas@icloud.com',
+                1,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['messages'][0]['id'], 'plus-match')
+        fetch_mock.assert_called_once_with(self.account, 'inbox', 0, 50)
+        detail_mock.assert_called_once()
+
+    def test_icloud_base_does_not_match_plus_delivery_header(self):
+        matching = self.item(
+            'plus-match',
+            'Hide My Email <vacuole.cooled9b@icloud.com>',
+            '2026-08-21T12:00:00Z',
+        )
+
+        with patch.object(
+            web_outlook_app,
+            'fetch_account_emails',
+            return_value={
+                'success': True,
+                'emails': [matching],
+                'has_more': False,
+                'request_method': 'graph',
+            },
+        ), patch.object(
+            web_outlook_app,
+            'fetch_email_detail_for_account',
+            return_value=self.detail(
+                matching,
+                headers=[
+                    {
+                        'name': 'Return-Path',
+                        'value': (
+                            'bounces+20216706-4ff1-vacuole.cooled9b+aas=icloud.com'
+                            '_at_em7877_tm_openai_com@icloud.com'
+                        ),
+                    },
+                ],
+            ),
+        ) as detail_mock:
+            result = web_outlook_app.find_public_mailbox_messages(
+                self.account,
+                'vacuole.cooled9b@icloud.com',
+                1,
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['status'], 404)
+        detail_mock.assert_called_once()
+
+    def test_icloud_base_accepts_matching_encoded_delivery_header(self):
+        matching = self.item(
+            'base-match',
+            'Hide My Email <found-gherkin8s@icloud.com>',
+            '2026-08-21T12:00:00Z',
+        )
+
+        with patch.object(
+            web_outlook_app,
+            'fetch_account_emails',
+            return_value={
+                'success': True,
+                'emails': [matching],
+                'has_more': False,
+                'request_method': 'graph',
+            },
+        ), patch.object(
+            web_outlook_app,
+            'fetch_email_detail_for_account',
+            return_value=self.detail(
+                matching,
+                headers=[
+                    {
+                        'name': 'Received-SPF',
+                        'value': (
+                            'pass domain of bounces+20216706-cb96-'
+                            'found-gherkin8s=icloud.com@em7877.tm.openai.com'
+                        ),
+                    },
+                ],
+            ),
+        ):
+            result = web_outlook_app.find_public_mailbox_messages(
+                self.account,
+                'found-gherkin8s@icloud.com',
+                1,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['messages'][0]['id'], 'base-match')
 
     def test_scans_next_page_and_passes_provider_method_to_detail_fetch(self):
         first_page_items = [

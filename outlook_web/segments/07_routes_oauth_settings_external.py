@@ -1516,6 +1516,11 @@ PUBLIC_MAILBOX_MAX_LIMIT = 20
 PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS = float(os.getenv("PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS", "12"))
 PUBLIC_MAILBOX_FORMATS = {'html', 'json'}
 PUBLIC_MAILBOX_SEARCH_FOLDERS = ('inbox', 'junkemail', 'deleteditems')
+PUBLIC_MAILBOX_DELIVERY_HEADER_NAMES = {
+    'received-spf',
+    'authentication-results-original',
+    'return-path',
+}
 PUBLIC_MAILBOX_HTML_CSP = (
     "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'"
 )
@@ -1549,6 +1554,79 @@ def normalize_public_mailbox_query_address(value: Any) -> str:
 
 def public_mailbox_to_matches(to_value: Any, target_email: str) -> bool:
     return email_header_matches_address(to_value, target_email)
+
+
+def public_mailbox_encoded_delivery_recipient(target_email: str) -> str:
+    normalized = normalize_email_address(target_email)
+    if normalized.count('@') != 1:
+        return ''
+    local_part, domain = normalized.split('@', 1)
+    if not local_part or domain != 'icloud.com':
+        return ''
+    return f'{local_part}={domain}'
+
+
+def public_mailbox_requires_delivery_header_match(target_email: str) -> bool:
+    return bool(public_mailbox_encoded_delivery_recipient(target_email))
+
+
+def public_mailbox_detail_has_header_field(detail: Dict[str, Any]) -> bool:
+    if not isinstance(detail, dict):
+        return False
+    return (
+        'internet_message_headers' in detail
+        or 'internetMessageHeaders' in detail
+        or 'headers' in detail
+    )
+
+
+def iter_public_mailbox_delivery_header_values(detail: Dict[str, Any]):
+    if not isinstance(detail, dict):
+        return
+
+    raw_headers = []
+    for key in ('internet_message_headers', 'internetMessageHeaders', 'headers'):
+        if key in detail:
+            raw_headers = detail.get(key) or []
+            break
+
+    if isinstance(raw_headers, dict):
+        for name, value in raw_headers.items():
+            if str(name or '').strip().lower() in PUBLIC_MAILBOX_DELIVERY_HEADER_NAMES:
+                yield str(value or '')
+        return
+
+    if isinstance(raw_headers, (list, tuple)):
+        for header in raw_headers:
+            if isinstance(header, dict):
+                name = str(header.get('name') or '').strip().lower()
+                value = str(header.get('value') or '')
+            elif isinstance(header, (list, tuple)) and len(header) >= 2:
+                name = str(header[0] or '').strip().lower()
+                value = str(header[1] or '')
+            else:
+                continue
+            if name in PUBLIC_MAILBOX_DELIVERY_HEADER_NAMES:
+                yield value
+
+
+def public_mailbox_delivery_header_value_matches(value: Any, encoded_recipient: str) -> bool:
+    encoded = str(encoded_recipient or '').strip().lower()
+    if not encoded:
+        return False
+    text = str(value or '').lower()
+    pattern = rf'(?<![a-z0-9.%+=]){re.escape(encoded)}(?![a-z0-9.%+=])'
+    return re.search(pattern, text) is not None
+
+
+def public_mailbox_delivery_headers_match(detail: Dict[str, Any], target_email: str) -> bool:
+    encoded_recipient = public_mailbox_encoded_delivery_recipient(target_email)
+    if not encoded_recipient:
+        return True
+    return any(
+        public_mailbox_delivery_header_value_matches(value, encoded_recipient)
+        for value in iter_public_mailbox_delivery_header_values(detail)
+    )
 
 
 def parse_public_mailbox_message_query(values: Any) -> tuple[Optional[Dict[str, Any]], str]:
@@ -1817,8 +1895,7 @@ def find_public_mailbox_messages(
         key=lambda item: parse_email_datetime(item.get('date')) or datetime.min,
         reverse=True,
     )
-    selected = matches[:limit]
-    if not selected:
+    if not matches:
         scan_limit_reached = scanned_count >= scan_limit and candidates_remain
         return {
             'success': False,
@@ -1833,11 +1910,22 @@ def find_public_mailbox_messages(
         }
 
     messages = []
-    for item in selected:
-        if isinstance(item.get('_detail'), dict):
+    requires_delivery_header_match = public_mailbox_requires_delivery_header_match(recipient)
+    for item in matches:
+        if len(messages) >= limit:
+            break
+
+        item_detail = item.get('_detail')
+        if (
+            isinstance(item_detail, dict)
+            and (
+                not requires_delivery_header_match
+                or public_mailbox_detail_has_header_field(item_detail)
+            )
+        ):
             detail_result = {
                 'success': True,
-                'email': item['_detail'],
+                'email': item_detail,
             }
         else:
             detail_result = call_public_mailbox_upstream(
@@ -1851,9 +1939,29 @@ def find_public_mailbox_messages(
             )
             if not detail_result.get('success'):
                 return public_mailbox_upstream_error(detail_result)
+        detail = detail_result.get('email') or {}
+        if (
+            requires_delivery_header_match
+            and not public_mailbox_delivery_headers_match(detail, recipient)
+        ):
+            continue
         messages.append(
-            build_public_mailbox_message(item, detail_result.get('email') or {})
+            build_public_mailbox_message(item, detail)
         )
+
+    if not messages:
+        scan_limit_reached = scanned_count >= scan_limit and candidates_remain
+        return {
+            'success': False,
+            'status': 404,
+            'error': (
+                '未在扫描范围内找到匹配邮件'
+                if scan_limit_reached
+                else '未找到匹配邮件'
+            ),
+            'scan_limit_reached': scan_limit_reached,
+            'scanned_count': scanned_count,
+        }
 
     return {
         'success': True,

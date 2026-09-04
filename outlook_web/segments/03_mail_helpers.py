@@ -617,7 +617,7 @@ def get_email_detail_graph(client_id: str, refresh_token: str, message_id: str, 
     try:
         url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}"
         params = {
-            "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,body,bodyPreview"
+            "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,body,bodyPreview,internetMessageHeaders"
         }
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -1344,6 +1344,10 @@ def build_email_detail_from_message(msg, message_id: str, date_value: str = '') 
         'body': body_html or body_text,
         'body_type': 'html' if body_html else 'text',
         'attachments': extract_message_attachments(msg),
+        'internet_message_headers': [
+            {'name': str(name or ''), 'value': decode_header_value(value)}
+            for name, value in msg.items()
+        ],
     }
 
 

@@ -2777,7 +2777,7 @@ def upsert_retained_normal_mail_detail(account: Dict[str, Any], folder: str,
 
 
 def format_graph_email_detail(detail: Dict[str, Any], attachments: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return {
+    email_detail = {
         'id': detail.get('id'),
         'subject': detail.get('subject', '无主题'),
         'from': detail.get('from', {}).get('emailAddress', {}).get('address', '未知'),
@@ -2797,6 +2797,9 @@ def format_graph_email_detail(detail: Dict[str, Any], attachments: List[Dict[str
         'attachments': attachments,
         'has_attachments': bool(attachments or detail.get('hasAttachments')),
     }
+    if 'internetMessageHeaders' in detail:
+        email_detail['internet_message_headers'] = detail.get('internetMessageHeaders') or []
+    return email_detail
 
 def build_retained_detail_success_response(account: Dict[str, Any], folder: str,
                                            message_id: str, email_detail: Dict[str, Any],
