@@ -265,7 +265,7 @@
                     <div class="mail-meta-grid">
                       <div class="mail-meta"><strong>发件人</strong>{{ item['from'] or '未知发件人' }}</div>
                       <div class="mail-meta"><strong>时间</strong>{{ item.received_at or '未知时间' }}</div>
-                      <div class="mail-meta"><strong>收件人</strong>{{ item.to or recipient_email }}</div>
+                      <div class="mail-meta"><strong>收件人</strong>{{ recipient_email }}</div>
                       <div class="mail-meta"><strong>邮件ID</strong>{{ item.id or '-' }}</div>
                     </div>
                     <iframe

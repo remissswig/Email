@@ -1117,14 +1117,18 @@ def _recipient_link_public_mailbox_page_response(
             )
     else:
         load_more_url = _recipient_link_public_page_url(show_all=True)
-    page_title = f"邮箱展 - {str(row['recipient_email_display'] or recipient_email).strip()}"
+    try:
+        display_recipient_email = normalize_recipient_email(recipient_email).display
+    except RecipientLinkInputError:
+        display_recipient_email = str(row["recipient_email_display"] or recipient_email).strip()
+    page_title = f"邮箱展 - {display_recipient_email}"
     current_message = messages[0] if messages else {}
     response = make_response(
         render_template(
             "recipient_mailbox_show.html",
             page_title=page_title,
             main_email=str(row["main_email_display"] or "").strip(),
-            recipient_email=str(row["recipient_email_display"] or recipient_email).strip(),
+            recipient_email=display_recipient_email,
             shared=shared,
             refresh_url=refresh_url,
             notice=notice,

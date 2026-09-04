@@ -2227,6 +2227,8 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
         self.assertEqual(response.content_type, 'text/html; charset=utf-8')
         response_html = response.get_data(as_text=True)
         self.assertIn('最新邮件', response_html)
+        self.assertIn('邮箱展 - Recipient01+promo@iCloud.com', response_html)
+        self.assertIn('<span>Recipient01+promo@iCloud.com</span>', response_html)
         self.assertIn('Verification code', response_html)
         self.assertIn('查看更多', response_html)
         self.assert_public_token_headers(response)
@@ -2258,7 +2260,7 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
             'find_public_mailbox_messages',
             return_value=self.success_messages_result(40),
         ) as search_mock:
-            response = self.client.get(f"/show/{shared}/Recipient01@iCloud.com?all=1")
+            response = self.client.get(f"/show/{shared}/Recipient01+promo@iCloud.com?all=1")
 
         self.assertEqual(response.status_code, 200)
         html = response.get_data(as_text=True)
@@ -2267,10 +2269,13 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
         self.assertIn('收起邮件', html)
         self.assertIn('邮件列表', html)
         self.assertIn('class="mail-item"', html)
+        self.assertIn('邮箱展 - Recipient01+promo@iCloud.com', html)
+        self.assertIn('<div class="mail-meta"><strong>收件人</strong>Recipient01+promo@iCloud.com</div>', html)
+        self.assertNotIn('<div class="mail-meta"><strong>收件人</strong>Hide My Email <01litany_muster@icloud.com></div>', html)
         self.assertIn('limit=40', html)
         search_mock.assert_called_once_with(
             account,
-            'recipient01@icloud.com',
+            'recipient01+promo@icloud.com',
             20,
         )
 
