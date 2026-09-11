@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import sqlite3
 import threading
@@ -1514,6 +1515,7 @@ def api_update_public_mailbox_api_key_auth():
 PUBLIC_MAILBOX_BATCH_SIZE = 50
 PUBLIC_MAILBOX_MAX_LIMIT = 20
 PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS = float(os.getenv("PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS", "12"))
+PUBLIC_MAILBOX_RESULT_CACHE_SECONDS = float(os.getenv("PUBLIC_MAILBOX_RESULT_CACHE_SECONDS", "8"))
 PUBLIC_MAILBOX_FORMATS = {'html', 'json'}
 PUBLIC_MAILBOX_SEARCH_FOLDERS = ('inbox', 'junkemail', 'deleteditems')
 PUBLIC_MAILBOX_DELIVERY_HEADER_NAMES = {
@@ -1786,6 +1788,57 @@ def public_mailbox_message_key(item: Dict[str, Any]) -> tuple:
     )
 
 
+PUBLIC_MAILBOX_RESULT_CACHE_LOCK = threading.Lock()
+PUBLIC_MAILBOX_RESULT_CACHE: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
+PUBLIC_MAILBOX_RESULT_CACHE_MAX_ENTRIES = 512
+
+
+def public_mailbox_result_cache_key(account: Dict[str, Any], recipient: str, limit: int) -> tuple:
+    return (
+        int(account.get('id') or 0),
+        normalize_email_address(account.get('email') or ''),
+        normalize_email_address(recipient),
+        int(limit or 1),
+    )
+
+
+def get_public_mailbox_cached_result(account: Dict[str, Any], recipient: str, limit: int) -> Optional[Dict[str, Any]]:
+    ttl = max(0.0, float(PUBLIC_MAILBOX_RESULT_CACHE_SECONDS or 0))
+    if ttl <= 0:
+        return None
+    now = time.time()
+    key = public_mailbox_result_cache_key(account, recipient, limit)
+    with PUBLIC_MAILBOX_RESULT_CACHE_LOCK:
+        cached = PUBLIC_MAILBOX_RESULT_CACHE.get(key)
+        if not cached:
+            return None
+        expires_at, result = cached
+        if expires_at <= now:
+            PUBLIC_MAILBOX_RESULT_CACHE.pop(key, None)
+            return None
+        return copy.deepcopy(result)
+
+
+def set_public_mailbox_cached_result(account: Dict[str, Any], recipient: str, limit: int, result: Dict[str, Any]) -> None:
+    ttl = max(0.0, float(PUBLIC_MAILBOX_RESULT_CACHE_SECONDS or 0))
+    if ttl <= 0 or not result.get('success'):
+        return
+    key = public_mailbox_result_cache_key(account, recipient, limit)
+    with PUBLIC_MAILBOX_RESULT_CACHE_LOCK:
+        if len(PUBLIC_MAILBOX_RESULT_CACHE) >= PUBLIC_MAILBOX_RESULT_CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                PUBLIC_MAILBOX_RESULT_CACHE,
+                key=lambda item_key: PUBLIC_MAILBOX_RESULT_CACHE[item_key][0],
+            )
+            PUBLIC_MAILBOX_RESULT_CACHE.pop(oldest_key, None)
+        PUBLIC_MAILBOX_RESULT_CACHE[key] = (time.time() + ttl, copy.deepcopy(result))
+
+
+def clear_public_mailbox_result_cache() -> None:
+    with PUBLIC_MAILBOX_RESULT_CACHE_LOCK:
+        PUBLIC_MAILBOX_RESULT_CACHE.clear()
+
+
 def build_public_mailbox_message(
     item: Dict[str, Any],
     detail: Dict[str, Any],
@@ -1806,6 +1859,10 @@ def find_public_mailbox_messages(
     recipient: str,
     limit: int,
 ) -> Dict[str, Any]:
+    cached_result = get_public_mailbox_cached_result(account, recipient, limit)
+    if cached_result is not None:
+        return cached_result
+
     matches: List[Dict[str, Any]] = []
     seen = set()
     folder_errors: List[Dict[str, Any]] = []
@@ -2004,12 +2061,14 @@ def find_public_mailbox_messages(
             'scanned_count': scanned_count,
         }
 
-    return {
+    result = {
         'success': True,
         'status': 200,
         'count': len(messages),
         'messages': messages,
     }
+    set_public_mailbox_cached_result(account, recipient, limit, result)
+    return result
 
 
 def _mailbox_node_identifier() -> str:

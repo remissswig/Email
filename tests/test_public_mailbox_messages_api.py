@@ -447,6 +447,9 @@ class PublicMailboxMessageHelperTests(unittest.TestCase):
 
 class PublicMailboxMessageSearchTests(unittest.TestCase):
     def setUp(self):
+        clear_cache = getattr(web_outlook_app, 'clear_public_mailbox_result_cache', None)
+        if clear_cache:
+            clear_cache()
         self.account = {
             'id': 7,
             'email': 'owner@example.com',
@@ -539,6 +542,46 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         graph_search_mock.assert_called_once_with(account, 'inbox', 'target@example.com', 1)
         scan_mock.assert_not_called()
         detail_mock.assert_not_called()
+
+    def test_successful_public_mailbox_result_uses_short_process_cache(self):
+        account = {
+            **self.account,
+            'client_id': 'client-id',
+            'refresh_token': 'refresh-token',
+        }
+        matching = {
+            **self.item('graph-fast-match', 'target@example.com', '2026-08-21T12:00:00Z'),
+            '_detail': {
+                'id': 'graph-fast-match',
+                'subject': 'Fast match',
+                'from': 'sender@example.com',
+                'to': 'target@example.com',
+                'date': '2026-08-21T12:00:00Z',
+                'body': '<p>fast body</p>',
+                'body_type': 'html',
+            },
+        }
+
+        with patch.object(
+            web_outlook_app,
+            'PUBLIC_MAILBOX_RESULT_CACHE_SECONDS',
+            30,
+        ), patch.object(
+            web_outlook_app,
+            'fetch_account_graph_emails_by_recipient',
+            return_value={
+                'success': True,
+                'emails': [matching],
+                'recipient_search_supported': True,
+                'request_method': 'graph',
+            },
+        ) as graph_search_mock:
+            first = web_outlook_app.find_public_mailbox_messages(account, 'target@example.com', 1)
+            second = web_outlook_app.find_public_mailbox_messages(account, 'target@example.com', 1)
+
+        self.assertTrue(first['success'])
+        self.assertEqual(first, second)
+        graph_search_mock.assert_called_once_with(account, 'inbox', 'target@example.com', 1)
 
     def test_outlook_graph_recipient_search_no_match_falls_back_to_limited_scan(self):
         account = {
