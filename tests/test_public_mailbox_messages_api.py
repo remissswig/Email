@@ -1277,6 +1277,41 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertEqual(result['scanned_count'], 1)
         self.assertFalse(result['scan_limit_reached'])
 
+    def test_imap_recipient_search_normalizes_provider_folder_for_detail_fetch(self):
+        with patch.object(
+            web_outlook_app,
+            'get_emails_imap_generic_by_recipient',
+            return_value={
+                'success': True,
+                'emails': [{
+                    **self.item('2', 'target@example.com'),
+                    'folder': 'Junk',
+                    'id_mode': 'uid',
+                }],
+                'method': 'IMAP (Generic Recipient Search)',
+                'has_more': False,
+                'recipient_search_supported': True,
+                'scanned_count': 1,
+                'scan_limit_reached': False,
+            },
+        ), patch.object(
+            web_outlook_app,
+            'get_account_proxy_url',
+            return_value='',
+        ):
+            result = web_outlook_app.fetch_account_imap_emails_by_recipient(
+                self.imap_account,
+                'junkemail',
+                'target@example.com',
+                1,
+                25,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['emails'][0]['folder'], 'junkemail')
+        self.assertEqual(result['emails'][0]['id'], '2')
+        self.assertEqual(result['emails'][0]['id_mode'], 'uid')
+
     def test_non_imap_accounts_never_call_imap_recipient_search(self):
         matching = self.item('graph-match', 'target@example.com')
 

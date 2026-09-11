@@ -2325,6 +2325,7 @@ def mark_oauth_imap_items_read(account: Dict[str, Any], items: List[Dict[str, st
 
 def normalize_email_list_item(item: Dict[str, Any], folder: str) -> Dict[str, Any]:
     row = dict(item or {})
+    folder_name = normalize_folder_name(folder)
     row['subject'] = row.get('subject', '无主题')
     row['from'] = row.get('from', '未知')
     row['to'] = str(row.get('to', '') or '')
@@ -2332,7 +2333,7 @@ def normalize_email_list_item(item: Dict[str, Any], folder: str) -> Dict[str, An
     row['is_read'] = bool(row.get('is_read', False))
     row['has_attachments'] = bool(row.get('has_attachments', False))
     row['body_preview'] = row.get('body_preview', '')
-    row['folder'] = row.get('folder') or folder
+    row['folder'] = folder_name
     row['id_mode'] = row.get('id_mode', '')
     return row
 
