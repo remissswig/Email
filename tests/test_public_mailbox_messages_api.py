@@ -193,6 +193,55 @@ class PublicMailboxMessageHelperTests(unittest.TestCase):
             'vacuole.cooled9b@icloud.com',
         ))
 
+    def test_icloud_hme_header_matches_exact_private_relay_recipient(self):
+        self.assertTrue(web_outlook_app.public_mailbox_delivery_headers_match(
+            {
+                'internet_message_headers': [
+                    {
+                        'name': 'X-ICLOUD-HME',
+                        'value': (
+                            'p=bore_behalf_7r@icloud.com; d=; '
+                            'f=baopengwang779554@outlook.com; r=to; '
+                            's=no-reply@signup.aws'
+                        ),
+                    },
+                ],
+            },
+            'bore_behalf_7r@icloud.com',
+        ))
+
+    def test_icloud_hme_header_rejects_base_for_plus_alias(self):
+        self.assertFalse(web_outlook_app.public_mailbox_delivery_headers_match(
+            {
+                'internet_message_headers': [
+                    {
+                        'name': 'X-ICLOUD-HME',
+                        'value': (
+                            'p=vacuole.cooled9b@icloud.com; d=; '
+                            'f=owner@outlook.com; r=to; s=sender@example.com'
+                        ),
+                    },
+                ],
+            },
+            'vacuole.cooled9b+aas@icloud.com',
+        ))
+
+    def test_icloud_plus_alias_ignores_even_exact_hme_header(self):
+        self.assertFalse(web_outlook_app.public_mailbox_delivery_headers_match(
+            {
+                'internet_message_headers': [
+                    {
+                        'name': 'X-ICLOUD-HME',
+                        'value': (
+                            'p=bore_behalf_7r+xxx@icloud.com; d=; '
+                            'f=owner@outlook.com; r=to; s=sender@example.com'
+                        ),
+                    },
+                ],
+            },
+            'bore_behalf_7r+xxx@icloud.com',
+        ))
+
     def test_non_icloud_addresses_do_not_require_delivery_header_match(self):
         self.assertTrue(web_outlook_app.public_mailbox_delivery_headers_match(
             {'internet_message_headers': []},
@@ -544,6 +593,82 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
             'graph',
             structured_error=True,
         )
+
+    def test_limited_fallback_scan_checks_junk_after_inbox_limit(self):
+        account = {
+            **self.account,
+            'client_id': 'client-id',
+            'refresh_token': 'refresh-token',
+        }
+        inbox_items = [
+            self.item('inbox-other-1', 'other@example.com'),
+            self.item('inbox-other-2', 'other@example.com'),
+        ]
+        matching = {
+            **self.item('junk-match', 'target@example.com'),
+            'folder': 'junkemail',
+        }
+
+        def fetch_side_effect(_account, folder, skip, top):
+            if folder == 'inbox':
+                self.assertEqual(skip, 0)
+                self.assertEqual(top, 2)
+                return {
+                    'success': True,
+                    'emails': inbox_items,
+                    'has_more': True,
+                    'request_method': 'graph',
+                }
+            if folder == 'junkemail':
+                self.assertEqual(skip, 0)
+                self.assertEqual(top, 2)
+                return {
+                    'success': True,
+                    'emails': [matching],
+                    'has_more': False,
+                    'request_method': 'graph',
+                }
+            return {
+                'success': True,
+                'emails': [],
+                'has_more': False,
+                'request_method': 'graph',
+            }
+
+        with patch.object(
+            web_outlook_app,
+            'fetch_account_graph_emails_by_recipient',
+            return_value={
+                'success': True,
+                'emails': [],
+                'recipient_search_supported': True,
+                'request_method': 'graph',
+            },
+        ), patch.object(
+            web_outlook_app,
+            'get_mailboxes_messages_scanned_count',
+            return_value=2,
+        ), patch.object(
+            web_outlook_app,
+            'fetch_account_emails',
+            side_effect=fetch_side_effect,
+        ) as scan_mock, patch.object(
+            web_outlook_app,
+            'fetch_email_detail_for_account',
+            return_value=self.detail(matching),
+        ):
+            result = web_outlook_app.find_public_mailbox_messages(
+                account,
+                'target@example.com',
+                1,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['messages'][0]['id'], 'junk-match')
+        self.assertEqual(scan_mock.call_args_list, [
+            call(account, 'inbox', 0, 2),
+            call(account, 'junkemail', 0, 2),
+        ])
 
     def test_icloud_plus_match_requires_encoded_delivery_header(self):
         matching = self.item(
@@ -1295,9 +1420,13 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertFalse(result['success'])
         self.assertEqual(result['status'], 404)
         self.assertTrue(result['scan_limit_reached'])
-        self.assertEqual(result['scanned_count'], 3)
+        self.assertEqual(result['scanned_count'], 9)
         scan_limit_mock.assert_called_once_with()
-        fetch_mock.assert_called_once_with(self.account, 'inbox', 0, 3)
+        self.assertEqual(fetch_mock.call_args_list, [
+            call(self.account, 'inbox', 0, 3),
+            call(self.account, 'junkemail', 0, 3),
+            call(self.account, 'deleteditems', 0, 3),
+        ])
 
     def test_exactly_consuming_available_candidates_does_not_claim_scan_limit_reached(self):
         page = {
@@ -1329,8 +1458,12 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertFalse(result['success'])
         self.assertEqual(result['status'], 404)
         self.assertFalse(result['scan_limit_reached'])
-        self.assertEqual(result['scanned_count'], 3)
-        fetch_mock.assert_called_once_with(self.account, 'inbox', 0, 3)
+        self.assertEqual(result['scanned_count'], 9)
+        self.assertEqual(fetch_mock.call_args_list, [
+            call(self.account, 'inbox', 0, 3),
+            call(self.account, 'junkemail', 0, 3),
+            call(self.account, 'deleteditems', 0, 3),
+        ])
 
     def test_finding_match_at_configured_scan_limit_boundary_succeeds(self):
         matching = self.item('match-3', 'Hide My Email <target@example.com>')

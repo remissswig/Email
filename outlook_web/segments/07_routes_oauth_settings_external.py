@@ -1521,6 +1521,7 @@ PUBLIC_MAILBOX_DELIVERY_HEADER_NAMES = {
     'authentication-results-original',
     'return-path',
 }
+PUBLIC_MAILBOX_HME_HEADER_NAME = 'x-icloud-hme'
 PUBLIC_MAILBOX_HTML_CSP = (
     "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'"
 )
@@ -1566,6 +1567,14 @@ def public_mailbox_encoded_delivery_recipient(target_email: str) -> str:
     return f'{local_part}={domain}'
 
 
+def public_mailbox_is_plus_tagged_icloud_recipient(target_email: str) -> bool:
+    normalized = normalize_email_address(target_email)
+    if normalized.count('@') != 1:
+        return False
+    local_part, domain = normalized.split('@', 1)
+    return domain == 'icloud.com' and '+' in local_part
+
+
 def public_mailbox_requires_delivery_header_match(target_email: str) -> bool:
     return bool(public_mailbox_encoded_delivery_recipient(target_email))
 
@@ -1581,9 +1590,18 @@ def public_mailbox_detail_has_header_field(detail: Dict[str, Any]) -> bool:
 
 
 def iter_public_mailbox_delivery_header_values(detail: Dict[str, Any]):
+    yield from iter_public_mailbox_header_values(detail, PUBLIC_MAILBOX_DELIVERY_HEADER_NAMES)
+
+
+def iter_public_mailbox_hme_header_values(detail: Dict[str, Any]):
+    yield from iter_public_mailbox_header_values(detail, {PUBLIC_MAILBOX_HME_HEADER_NAME})
+
+
+def iter_public_mailbox_header_values(detail: Dict[str, Any], header_names: set[str]):
     if not isinstance(detail, dict):
         return
 
+    normalized_names = {str(name or '').strip().lower() for name in header_names}
     raw_headers = []
     for key in ('internet_message_headers', 'internetMessageHeaders', 'headers'):
         if key in detail:
@@ -1592,7 +1610,7 @@ def iter_public_mailbox_delivery_header_values(detail: Dict[str, Any]):
 
     if isinstance(raw_headers, dict):
         for name, value in raw_headers.items():
-            if str(name or '').strip().lower() in PUBLIC_MAILBOX_DELIVERY_HEADER_NAMES:
+            if str(name or '').strip().lower() in normalized_names:
                 yield str(value or '')
         return
 
@@ -1606,7 +1624,7 @@ def iter_public_mailbox_delivery_header_values(detail: Dict[str, Any]):
                 value = str(header[1] or '')
             else:
                 continue
-            if name in PUBLIC_MAILBOX_DELIVERY_HEADER_NAMES:
+            if name in normalized_names:
                 yield value
 
 
@@ -1619,13 +1637,34 @@ def public_mailbox_delivery_header_value_matches(value: Any, encoded_recipient: 
     return re.search(pattern, text) is not None
 
 
+def public_mailbox_hme_header_value_matches(value: Any, target_email: str) -> bool:
+    normalized = normalize_email_address(target_email)
+    if not normalized:
+        return False
+    text = str(value or '').strip()
+    pairs = {}
+    for part in text.split(';'):
+        key, separator, raw_value = part.partition('=')
+        if not separator:
+            continue
+        pairs[str(key or '').strip().lower()] = str(raw_value or '').strip().strip('"')
+    return normalize_email_address(pairs.get('p')) == normalized
+
+
 def public_mailbox_delivery_headers_match(detail: Dict[str, Any], target_email: str) -> bool:
     encoded_recipient = public_mailbox_encoded_delivery_recipient(target_email)
     if not encoded_recipient:
         return True
-    return any(
+    if any(
         public_mailbox_delivery_header_value_matches(value, encoded_recipient)
         for value in iter_public_mailbox_delivery_header_values(detail)
+    ):
+        return True
+    if public_mailbox_is_plus_tagged_icloud_recipient(target_email):
+        return False
+    return any(
+        public_mailbox_hme_header_value_matches(value, target_email)
+        for value in iter_public_mailbox_hme_header_values(detail)
     )
 
 
@@ -1806,7 +1845,7 @@ def find_public_mailbox_messages(
                 item['_request_method'] = 'graph'
                 matches.append(item)
 
-            if folder_name == 'inbox' and matches:
+            if matches:
                 break
 
         if matches:
@@ -1838,7 +1877,7 @@ def find_public_mailbox_messages(
                 item['_request_method'] = 'imap'
                 matches.append(item)
 
-            if folder_name == 'inbox' and matches:
+            if matches:
                 break
 
         if not should_scan:
@@ -1854,10 +1893,11 @@ def find_public_mailbox_messages(
     if should_scan:
         for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
             folder_skip = 0
-            while scanned_count < scan_limit:
+            folder_scanned_count = 0
+            while folder_scanned_count < scan_limit:
                 page_size = min(
                     PUBLIC_MAILBOX_BATCH_SIZE,
-                    scan_limit - scanned_count,
+                    scan_limit - folder_scanned_count,
                 )
                 page = call_public_mailbox_upstream(
                     fetch_account_emails,
@@ -1876,6 +1916,7 @@ def find_public_mailbox_messages(
                 for source in items:
                     item = dict(source or {})
                     scanned_count += 1
+                    folder_scanned_count += 1
                     key = public_mailbox_message_key(item)
                     if not key[2] or key in seen:
                         continue
@@ -1884,11 +1925,11 @@ def find_public_mailbox_messages(
                         item['_request_method'] = request_method
                         matches.append(item)
 
-                if not page.get('has_more') or not items or scanned_count >= scan_limit:
+                if not page.get('has_more') or not items or folder_scanned_count >= scan_limit:
                     break
                 folder_skip += len(items)
 
-            if folder_name == 'inbox' and matches:
+            if matches:
                 break
 
     matches.sort(
