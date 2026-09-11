@@ -1858,7 +1858,7 @@ def find_public_mailbox_messages(
                 account,
                 folder_name,
                 recipient,
-                scan_limit,
+                max(limit, 1),
                 scan_limit,
             )
             if imap_result.get('recipient_search_supported') is False:

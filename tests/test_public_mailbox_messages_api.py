@@ -910,9 +910,9 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
 
         self.assertTrue(result['success'])
         self.assertEqual(imap_search_mock.call_args_list, [
-            call(self.imap_account, 'inbox', 'target@example.com', 100, 100),
-            call(self.imap_account, 'junkemail', 'target@example.com', 100, 100),
-            call(self.imap_account, 'deleteditems', 'target@example.com', 100, 100),
+            call(self.imap_account, 'inbox', 'target@example.com', 1, 100),
+            call(self.imap_account, 'junkemail', 'target@example.com', 1, 100),
+            call(self.imap_account, 'deleteditems', 'target@example.com', 1, 100),
         ])
         fetch_mock.assert_not_called()
         detail_mock.assert_called_once_with(
@@ -1010,9 +1010,9 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
             'error': '未找到匹配邮件',
         })
         self.assertEqual(imap_search_mock.call_args_list, [
-            call(self.imap_account, 'inbox', 'target@example.com', 100, 100),
-            call(self.imap_account, 'junkemail', 'target@example.com', 100, 100),
-            call(self.imap_account, 'deleteditems', 'target@example.com', 100, 100),
+            call(self.imap_account, 'inbox', 'target@example.com', 1, 100),
+            call(self.imap_account, 'junkemail', 'target@example.com', 1, 100),
+            call(self.imap_account, 'deleteditems', 'target@example.com', 1, 100),
         ])
         fetch_mock.assert_not_called()
         self.assertNotIn('scan_limit_reached', result)
@@ -1129,9 +1129,9 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
 
         self.assertTrue(result['success'])
         self.assertEqual(imap_search_mock.call_args_list, [
-            call(self.imap_account, 'inbox', 'target@example.com', 100, 100),
-            call(self.imap_account, 'junkemail', 'target@example.com', 100, 100),
-            call(self.imap_account, 'deleteditems', 'target@example.com', 100, 100),
+            call(self.imap_account, 'inbox', 'target@example.com', 1, 100),
+            call(self.imap_account, 'junkemail', 'target@example.com', 1, 100),
+            call(self.imap_account, 'deleteditems', 'target@example.com', 1, 100),
         ])
         fetch_mock.assert_not_called()
         detail_mock.assert_called_once_with(
@@ -1183,7 +1183,7 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
             self.imap_account,
             'inbox',
             'target@example.com',
-            100,
+            1,
             100,
         )
         self.assertEqual(fetch_mock.call_args_list, [call(self.imap_account, 'inbox', 0, 50)])
@@ -1228,9 +1228,9 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertFalse(result['success'])
         self.assertEqual(result['status'], 404)
         self.assertEqual(imap_search_mock.call_args_list, [
-            call(self.imap_account, 'inbox', 'target@example.com', 100, 100),
-            call(self.imap_account, 'junkemail', 'target@example.com', 100, 100),
-            call(self.imap_account, 'deleteditems', 'target@example.com', 100, 100),
+            call(self.imap_account, 'inbox', 'target@example.com', 1, 100),
+            call(self.imap_account, 'junkemail', 'target@example.com', 1, 100),
+            call(self.imap_account, 'deleteditems', 'target@example.com', 1, 100),
         ])
         fetch_mock.assert_not_called()
 

@@ -2385,24 +2385,30 @@ def get_emails_imap_generic_by_recipient(email_addr: str, imap_password: str, im
         emails_data = []
         scanned_count = 0
         scan_limit_reached = False
-        ordered_message_ids = list(reversed(message_ids))
+        if search_mode == 'uid':
+            ordered_message_ids = sorted(
+                message_ids,
+                key=lambda value: int((value.decode('utf-8', errors='ignore') if isinstance(value, (bytes, bytearray)) else str(value)) or 0),
+                reverse=True,
+            )
+        else:
+            ordered_message_ids = list(reversed(message_ids))
         if not recovery_scan_enabled:
-            for index, message_id in enumerate(ordered_message_ids):
-                if len(emails_data) >= limit:
-                    break
-                if scanned_count >= scan_limit:
-                    scan_limit_reached = index < len(ordered_message_ids)
-                    break
+            index = 0
+            while index < len(ordered_message_ids) and scanned_count < scan_limit:
+                remaining_budget = scan_limit - scanned_count
+                batch_size = min(IMAP_RECIPIENT_HEADER_BATCH_SIZE, remaining_budget, len(ordered_message_ids) - index)
+                batch_ids = ordered_message_ids[index:index + batch_size]
                 try:
-                    f_status, f_data, fetch_mode, fetch_attempts = fetch_imap_message(
+                    batch_status, batch_records, fetch_mode, fetch_attempts, _response_text = fetch_imap_message_header_batch(
                         mail,
-                        message_id,
-                        '(INTERNALDATE BODY.PEEK[HEADER.FIELDS (TO SUBJECT FROM DATE)])',
-                        preferred_mode=search_mode or 'uid'
+                        batch_ids,
+                        preferred_mode=search_mode or 'uid',
+                        allow_uid_fallback=False,
                     )
-                    if (f_status != 'OK' or not f_data) and imap_fetch_attempts_include_timeout(fetch_attempts):
+                    if batch_status != 'OK' and imap_fetch_attempts_include_timeout(fetch_attempts):
                         raise TimeoutError('IMAP recipient header fetch timed out')
-                    if f_status != 'OK' or not f_data:
+                    if batch_status != 'OK':
                         return {
                             'success': False,
                             'error': build_error_payload(
@@ -2411,7 +2417,7 @@ def get_emails_imap_generic_by_recipient(email_addr: str, imap_password: str, im
                                 'IMAPFetchError',
                                 502,
                                 {
-                                    'message_id': message_id.decode('utf-8', errors='ignore') if isinstance(message_id, (bytes, bytearray)) else str(message_id),
+                                    'message_id': batch_ids[0].decode('utf-8', errors='ignore') if isinstance(batch_ids[0], (bytes, bytearray)) else str(batch_ids[0]),
                                     'fetch_attempts': fetch_attempts[:10],
                                 }
                             ),
@@ -2419,41 +2425,47 @@ def get_emails_imap_generic_by_recipient(email_addr: str, imap_password: str, im
                             'recipient_search_supported': True,
                         }
 
-                    raw_email, fetch_response_text = parse_imap_fetch_response(f_data)
-                    if not raw_email:
-                        return {
-                            'success': False,
-                            'error': build_error_payload(
-                                'IMAP_RECIPIENT_FETCH_FAILED',
-                                'Failed to fetch IMAP message headers for recipient search',
-                                'IMAPFetchError',
-                                502,
-                                {
-                                    'message_id': message_id.decode('utf-8', errors='ignore') if isinstance(message_id, (bytes, bytearray)) else str(message_id),
-                                    'fetch_attempts': fetch_attempts[:10],
-                                }
-                            ),
-                            'error_code': 'IMAP_RECIPIENT_FETCH_FAILED',
-                            'recipient_search_supported': True,
-                        }
+                    record_map = {}
+                    for record in batch_records:
+                        record_key = str(record.get('uid') if fetch_mode == 'uid' else record.get('sequence_id') or '').strip()
+                        if record_key and record_key not in record_map:
+                            record_map[record_key] = record
 
-                    internal_date = extract_imap_internaldate(fetch_response_text)
-                    msg = email.message_from_bytes(raw_email)
-                    to_value = decode_header_value(msg.get('To', ''))
-                    scanned_count += 1
-                    if not email_header_matches_address(to_value, normalized_recipient):
-                        continue
+                    for message_id in batch_ids:
+                        message_id_text = message_id.decode('utf-8', errors='ignore') if isinstance(message_id, (bytes, bytearray)) else str(message_id)
+                        record = record_map.get(message_id_text)
+                        if not record or not record.get('raw_header'):
+                            return {
+                                'success': False,
+                                'error': build_error_payload(
+                                    'IMAP_RECIPIENT_FETCH_FAILED',
+                                    'Failed to fetch IMAP message headers for recipient search',
+                                    'IMAPFetchError',
+                                    502,
+                                    {
+                                        'message_id': message_id_text,
+                                        'fetch_attempts': fetch_attempts[:10],
+                                    }
+                                ),
+                                'error_code': 'IMAP_RECIPIENT_FETCH_FAILED',
+                                'recipient_search_supported': True,
+                            }
 
-                    message_id_text = message_id.decode('utf-8', errors='ignore') if isinstance(message_id, (bytes, bytearray)) else str(message_id)
-                    emails_data.append({
-                        'id': message_id_text,
-                        'subject': decode_header_value(msg.get('Subject', '')),
-                        'from': decode_header_value(msg.get('From', '')),
-                        'to': to_value,
-                        'date': internal_date or msg.get('Date', ''),
-                        'folder': selected,
-                        'id_mode': fetch_mode or search_mode or 'uid',
-                    })
+                        msg = email.message_from_bytes(record['raw_header'])
+                        to_value = decode_header_value(msg.get('To', ''))
+                        scanned_count += 1
+                        if not email_header_matches_address(to_value, normalized_recipient):
+                            continue
+
+                        emails_data.append({
+                            'id': message_id_text,
+                            'subject': decode_header_value(msg.get('Subject', '')),
+                            'from': decode_header_value(msg.get('From', '')),
+                            'to': to_value,
+                            'date': record.get('internal_date') or msg.get('Date', ''),
+                            'folder': selected,
+                            'id_mode': fetch_mode or search_mode or 'uid',
+                        })
                 except Exception as exc:
                     if is_timeout_like_exception(exc):
                         raise
@@ -2465,7 +2477,7 @@ def get_emails_imap_generic_by_recipient(email_addr: str, imap_password: str, im
                             'IMAPFetchError',
                             502,
                             {
-                                'message_id': message_id.decode('utf-8', errors='ignore') if isinstance(message_id, (bytes, bytearray)) else str(message_id),
+                                'message_id': batch_ids[0].decode('utf-8', errors='ignore') if isinstance(batch_ids[0], (bytes, bytearray)) else str(batch_ids[0]),
                                 'error': sanitize_error_details(str(exc))[:200],
                                 'error_type': type(exc).__name__,
                             }
@@ -2473,6 +2485,9 @@ def get_emails_imap_generic_by_recipient(email_addr: str, imap_password: str, im
                         'error_code': 'IMAP_RECIPIENT_FETCH_FAILED',
                         'recipient_search_supported': True,
                     }
+                index += batch_size
+            if scanned_count >= scan_limit and index < len(ordered_message_ids):
+                scan_limit_reached = True
         index = 0
         while recovery_scan_enabled and index < len(ordered_message_ids) and len(emails_data) < limit and scanned_count < scan_limit:
             remaining_budget = scan_limit - scanned_count
@@ -2588,7 +2603,7 @@ def get_emails_imap_generic_by_recipient(email_addr: str, imap_password: str, im
         emails_data.sort(key=lambda item: parse_email_datetime(item.get('date')) or datetime.min, reverse=True)
         return {
             'success': True,
-            'emails': emails_data,
+            'emails': emails_data[:limit],
             'method': 'IMAP (Generic Recipient Search)',
             'has_more': False,
             'recipient_search_supported': True,
