@@ -583,6 +583,66 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertEqual(first, second)
         graph_search_mock.assert_called_once_with(account, 'inbox', 'target@example.com', 1)
 
+    def test_outlook_plus_recipient_uses_graph_base_address_candidate_before_scan(self):
+        account = {
+            **self.account,
+            'email': 'owner@outlook.com',
+            'client_id': 'client-id',
+            'refresh_token': 'refresh-token',
+        }
+        matching = {
+            **self.item('base-match', 'owner@outlook.com', '2026-08-21T12:00:00Z'),
+            '_detail': {
+                'id': 'base-match',
+                'subject': 'Base match',
+                'from': 'sender@example.com',
+                'to': 'owner@outlook.com',
+                'date': '2026-08-21T12:00:00Z',
+                'body': '<p>base body</p>',
+                'body_type': 'html',
+            },
+        }
+
+        def graph_side_effect(_account, folder, recipient, limit):
+            self.assertEqual(folder, 'inbox')
+            self.assertEqual(limit, 1)
+            if recipient == 'owner@outlook.com':
+                return {
+                    'success': True,
+                    'emails': [matching],
+                    'recipient_search_supported': True,
+                    'request_method': 'graph',
+                }
+            return {
+                'success': True,
+                'emails': [],
+                'recipient_search_supported': True,
+                'request_method': 'graph',
+            }
+
+        with patch.object(
+            web_outlook_app,
+            'fetch_account_graph_emails_by_recipient',
+            side_effect=graph_side_effect,
+        ) as graph_search_mock, patch.object(
+            web_outlook_app,
+            'fetch_account_emails',
+            return_value={'success': True, 'emails': [], 'has_more': False},
+        ) as scan_mock:
+            result = web_outlook_app.find_public_mailbox_messages(
+                account,
+                'owner+tag@outlook.com',
+                1,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['messages'][0]['id'], 'base-match')
+        self.assertEqual(graph_search_mock.call_args_list, [
+            call(account, 'inbox', 'owner+tag@outlook.com', 1),
+            call(account, 'inbox', 'owner@outlook.com', 1),
+        ])
+        scan_mock.assert_not_called()
+
     def test_outlook_graph_recipient_search_no_match_falls_back_to_limited_scan(self):
         account = {
             **self.account,

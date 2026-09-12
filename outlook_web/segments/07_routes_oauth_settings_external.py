@@ -1892,31 +1892,39 @@ def find_public_mailbox_messages(
 
     if should_scan:
         fast_search_complete = True
+        graph_recipient_candidates = build_email_query_candidates(
+            recipient,
+            include_gmail_suffix=False,
+        ) or [recipient]
         for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
-            graph_result = call_public_mailbox_upstream(
-                fetch_account_graph_emails_by_recipient,
-                account,
-                folder_name,
-                recipient,
-                max(limit, 1),
-            )
-            if graph_result.get('recipient_search_supported') is False:
-                fast_search_complete = False
-                break
-            if not graph_result.get('success'):
-                fast_search_complete = False
-                folder_errors.append(graph_result)
-                break
-            for source in graph_result.get('emails') or []:
-                item = dict(source or {})
-                key = public_mailbox_message_key(item)
-                if not key[2] or key in seen:
-                    continue
-                seen.add(key)
-                item['_request_method'] = 'graph'
-                matches.append(item)
+            for graph_recipient in graph_recipient_candidates:
+                graph_result = call_public_mailbox_upstream(
+                    fetch_account_graph_emails_by_recipient,
+                    account,
+                    folder_name,
+                    graph_recipient,
+                    max(limit, 1),
+                )
+                if graph_result.get('recipient_search_supported') is False:
+                    fast_search_complete = False
+                    break
+                if not graph_result.get('success'):
+                    fast_search_complete = False
+                    folder_errors.append(graph_result)
+                    break
+                for source in graph_result.get('emails') or []:
+                    item = dict(source or {})
+                    key = public_mailbox_message_key(item)
+                    if not key[2] or key in seen:
+                        continue
+                    seen.add(key)
+                    item['_request_method'] = 'graph'
+                    matches.append(item)
 
-            if matches:
+                if matches:
+                    break
+
+            if matches or not fast_search_complete:
                 break
 
         if matches:
