@@ -967,6 +967,43 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
             structured_error=True,
         )
 
+    def test_imap_recipient_search_stops_after_folder_timeout(self):
+        timeout_result = {
+            'success': False,
+            'error': {
+                'code': 'EMAIL_FETCH_TIMEOUT',
+                'status': 504,
+                'type': 'TimeoutError',
+                'details': 'timeout=8s',
+            },
+            'recipient_search_supported': True,
+        }
+
+        with patch.object(
+            web_outlook_app,
+            'fetch_account_imap_emails_by_recipient',
+            create=True,
+            return_value=timeout_result,
+        ) as imap_search_mock:
+            result = web_outlook_app.find_public_mailbox_messages(
+                self.imap_account,
+                'target@example.com',
+                1,
+            )
+
+        self.assertEqual(result, {
+            'success': False,
+            'status': 504,
+            'error': '邮箱服务查询超时',
+        })
+        imap_search_mock.assert_called_once_with(
+            self.imap_account,
+            'inbox',
+            'target@example.com',
+            1,
+            web_outlook_app.MAILBOXES_MESSAGES_SCANNED_COUNT_DEFAULT,
+        )
+
     def test_imap_search_unsupported_falls_back_to_existing_scan(self):
         matching = self.item('fallback-match', 'target@example.com')
 
@@ -1717,6 +1754,9 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
 
 class PublicMailboxMessagesApiTests(unittest.TestCase):
     def setUp(self):
+        clear_cache = getattr(web_outlook_app, 'clear_public_mailbox_result_cache', None)
+        if clear_cache:
+            clear_cache()
         self.app = web_outlook_app.app
         self.app.config['TESTING'] = True
         self.app.config['WTF_CSRF_ENABLED'] = False
@@ -3073,7 +3113,7 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
         })
         self.assertEqual(response.headers['Cache-Control'], 'no-store')
         fetch_mock.assert_not_called()
-        self.assertEqual(create_imap_connection_mock.call_count, 3)
+        self.assertEqual(create_imap_connection_mock.call_count, 1)
 
     def test_plain_imap_search_timeout_returns_504_json_without_scan_fallback(self):
         imap_account = {
@@ -3143,7 +3183,7 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
         })
         self.assertEqual(response.headers['Cache-Control'], 'no-store')
         fetch_mock.assert_not_called()
-        self.assertEqual(create_imap_connection_mock.call_count, 3)
+        self.assertEqual(create_imap_connection_mock.call_count, 1)
         self.assertTrue(mail.logged_out)
 
 

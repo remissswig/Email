@@ -1514,8 +1514,9 @@ def api_update_public_mailbox_api_key_auth():
 
 PUBLIC_MAILBOX_BATCH_SIZE = 50
 PUBLIC_MAILBOX_MAX_LIMIT = 20
-PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS = float(os.getenv("PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS", "12"))
+PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS = float(os.getenv("PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS", "2.5"))
 PUBLIC_MAILBOX_RESULT_CACHE_SECONDS = float(os.getenv("PUBLIC_MAILBOX_RESULT_CACHE_SECONDS", "8"))
+PUBLIC_MAILBOX_ERROR_CACHE_SECONDS = float(os.getenv("PUBLIC_MAILBOX_ERROR_CACHE_SECONDS", "5"))
 PUBLIC_MAILBOX_FORMATS = {'html', 'json'}
 PUBLIC_MAILBOX_SEARCH_FOLDERS = ('inbox', 'junkemail', 'deleteditems')
 PUBLIC_MAILBOX_DELIVERY_HEADER_NAMES = {
@@ -1819,9 +1820,17 @@ def get_public_mailbox_cached_result(account: Dict[str, Any], recipient: str, li
         return copy.deepcopy(result)
 
 
+def public_mailbox_result_cache_ttl(result: Dict[str, Any]) -> float:
+    if result.get('success'):
+        return max(0.0, float(PUBLIC_MAILBOX_RESULT_CACHE_SECONDS or 0))
+    if int(result.get('status') or 0) in {502, 504}:
+        return max(0.0, float(PUBLIC_MAILBOX_ERROR_CACHE_SECONDS or 0))
+    return 0.0
+
+
 def set_public_mailbox_cached_result(account: Dict[str, Any], recipient: str, limit: int, result: Dict[str, Any]) -> None:
-    ttl = max(0.0, float(PUBLIC_MAILBOX_RESULT_CACHE_SECONDS or 0))
-    if ttl <= 0 or not result.get('success'):
+    ttl = public_mailbox_result_cache_ttl(result)
+    if ttl <= 0:
         return
     key = public_mailbox_result_cache_key(account, recipient, limit)
     with PUBLIC_MAILBOX_RESULT_CACHE_LOCK:
@@ -1832,6 +1841,11 @@ def set_public_mailbox_cached_result(account: Dict[str, Any], recipient: str, li
             )
             PUBLIC_MAILBOX_RESULT_CACHE.pop(oldest_key, None)
         PUBLIC_MAILBOX_RESULT_CACHE[key] = (time.time() + ttl, copy.deepcopy(result))
+
+
+def cache_public_mailbox_result(account: Dict[str, Any], recipient: str, limit: int, result: Dict[str, Any]) -> Dict[str, Any]:
+    set_public_mailbox_cached_result(account, recipient, limit, result)
+    return result
 
 
 def clear_public_mailbox_result_cache() -> None:
@@ -1923,6 +1937,8 @@ def find_public_mailbox_messages(
                 break
             if not imap_result.get('success'):
                 folder_errors.append(imap_result)
+                if public_mailbox_payload_has_timeout(imap_result):
+                    break
                 continue
             strict_items = list(imap_result.get('emails') or [])
             for source in strict_items:
@@ -1939,7 +1955,12 @@ def find_public_mailbox_messages(
 
         if not should_scan:
             if folder_errors and not matches:
-                return public_mailbox_upstream_error(folder_errors[0])
+                return cache_public_mailbox_result(
+                    account,
+                    recipient,
+                    limit,
+                    public_mailbox_upstream_error(folder_errors[0]),
+                )
             if not matches:
                 return {
                     'success': False,
@@ -1964,7 +1985,12 @@ def find_public_mailbox_messages(
                     page_size,
                 )
                 if not page.get('success'):
-                    return public_mailbox_upstream_error(page)
+                    return cache_public_mailbox_result(
+                        account,
+                        recipient,
+                        limit,
+                        public_mailbox_upstream_error(page),
+                    )
 
                 page_items = list(page.get('emails') or [])
                 items = page_items[:page_size]
@@ -2036,7 +2062,12 @@ def find_public_mailbox_messages(
                 structured_error=True,
             )
             if not detail_result.get('success'):
-                return public_mailbox_upstream_error(detail_result)
+                return cache_public_mailbox_result(
+                    account,
+                    recipient,
+                    limit,
+                    public_mailbox_upstream_error(detail_result),
+                )
         detail = detail_result.get('email') or {}
         if (
             requires_delivery_header_match
@@ -2067,8 +2098,7 @@ def find_public_mailbox_messages(
         'count': len(messages),
         'messages': messages,
     }
-    set_public_mailbox_cached_result(account, recipient, limit, result)
-    return result
+    return cache_public_mailbox_result(account, recipient, limit, result)
 
 
 def _mailbox_node_identifier() -> str:
