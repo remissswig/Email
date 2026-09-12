@@ -967,12 +967,12 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
     def test_imap_accounts_use_recipient_search_before_generic_scan(self):
         matching = {
             **self.item('imap-match', 'target@example.com', '2026-08-21T12:00:00Z'),
-            'folder': 'deleteditems',
+            'folder': 'inbox',
             'id_mode': 'uid',
         }
 
         def imap_side_effect(account, folder, recipient, limit, scan_limit):
-            if folder == 'deleteditems':
+            if folder == 'inbox':
                 return {
                     'success': True,
                     'emails': [matching],
@@ -1014,15 +1014,13 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertTrue(result['success'])
         self.assertEqual(imap_search_mock.call_args_list, [
             call(self.imap_account, 'inbox', 'target@example.com', 1, 100),
-            call(self.imap_account, 'junkemail', 'target@example.com', 1, 100),
-            call(self.imap_account, 'deleteditems', 'target@example.com', 1, 100),
         ])
         fetch_mock.assert_not_called()
         detail_mock.assert_called_once_with(
             self.imap_account,
             'imap-match',
             'imap',
-            'deleteditems',
+            'inbox',
             'uid',
             structured_error=True,
         )
@@ -1223,12 +1221,12 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
     def test_imap_accounts_use_recipient_search_before_generic_scan(self):
         matching = {
             **self.item('imap-match', 'target@example.com', '2026-08-21T12:00:00Z'),
-            'folder': 'deleteditems',
+            'folder': 'inbox',
             'id_mode': 'uid',
         }
 
         def imap_side_effect(account, folder, recipient, limit, scan_limit):
-            if folder == 'deleteditems':
+            if folder == 'inbox':
                 return {
                     'success': True,
                     'emails': [matching],
@@ -1270,15 +1268,13 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertTrue(result['success'])
         self.assertEqual(imap_search_mock.call_args_list, [
             call(self.imap_account, 'inbox', 'target@example.com', 1, 100),
-            call(self.imap_account, 'junkemail', 'target@example.com', 1, 100),
-            call(self.imap_account, 'deleteditems', 'target@example.com', 1, 100),
         ])
         fetch_mock.assert_not_called()
         detail_mock.assert_called_once_with(
             self.imap_account,
             'imap-match',
             'imap',
-            'deleteditems',
+            'inbox',
             'uid',
             structured_error=True,
         )
@@ -1369,8 +1365,6 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertEqual(result['status'], 404)
         self.assertEqual(imap_search_mock.call_args_list, [
             call(self.imap_account, 'inbox', 'target@example.com', 1, 100),
-            call(self.imap_account, 'junkemail', 'target@example.com', 1, 100),
-            call(self.imap_account, 'deleteditems', 'target@example.com', 1, 100),
         ])
         fetch_mock.assert_not_called()
 
@@ -1412,10 +1406,42 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
             1,
             'socks5://proxy.local:1080',
             25,
+            allow_recovery_scan=True,
         )
         self.assertEqual(result['request_method'], 'imap')
         self.assertEqual(result['scanned_count'], 1)
         self.assertFalse(result['scan_limit_reached'])
+
+    def test_public_imap_lookup_disables_recovery_scan(self):
+        captured = {}
+
+        def imap_side_effect(account, folder, recipient, limit, scan_limit):
+            captured['disabled'] = bool(account.get('_public_mailbox_disable_imap_recovery_scan'))
+            return {
+                'success': True,
+                'emails': [],
+                'request_method': 'imap',
+                'recipient_search_supported': True,
+                'scanned_count': 0,
+                'scan_limit_reached': False,
+            }
+
+        with patch.object(
+            web_outlook_app,
+            'fetch_account_imap_emails_by_recipient',
+            create=True,
+            side_effect=imap_side_effect,
+        ) as imap_search_mock:
+            result = web_outlook_app.find_public_mailbox_messages(
+                self.imap_account,
+                'target@example.com',
+                1,
+            )
+
+        self.assertEqual(result['status'], 404)
+        self.assertTrue(captured['disabled'])
+        self.assertNotIn('_public_mailbox_disable_imap_recovery_scan', self.imap_account)
+        imap_search_mock.assert_called()
 
     def test_imap_recipient_search_normalizes_provider_folder_for_detail_fetch(self):
         with patch.object(

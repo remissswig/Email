@@ -1514,7 +1514,7 @@ def api_update_public_mailbox_api_key_auth():
 
 PUBLIC_MAILBOX_BATCH_SIZE = 50
 PUBLIC_MAILBOX_MAX_LIMIT = 20
-PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS = float(os.getenv("PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS", "2.5"))
+PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS = float(os.getenv("PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS", "4"))
 PUBLIC_MAILBOX_RESULT_CACHE_SECONDS = float(os.getenv("PUBLIC_MAILBOX_RESULT_CACHE_SECONDS", "8"))
 PUBLIC_MAILBOX_ERROR_CACHE_SECONDS = float(os.getenv("PUBLIC_MAILBOX_ERROR_CACHE_SECONDS", "5"))
 PUBLIC_MAILBOX_FORMATS = {'html', 'json'}
@@ -1931,15 +1931,20 @@ def find_public_mailbox_messages(
             should_scan = False
 
     if is_imap_account:
-        for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
-            imap_result = call_public_mailbox_upstream(
-                fetch_account_imap_emails_by_recipient,
-                account,
-                folder_name,
-                recipient,
-                max(limit, 1),
-                scan_limit,
-            )
+        imap_search_folders = ('inbox',)
+        for folder_name in imap_search_folders:
+            account['_public_mailbox_disable_imap_recovery_scan'] = True
+            try:
+                imap_result = call_public_mailbox_upstream(
+                    fetch_account_imap_emails_by_recipient,
+                    account,
+                    folder_name,
+                    recipient,
+                    max(limit, 1),
+                    scan_limit,
+                )
+            finally:
+                account.pop('_public_mailbox_disable_imap_recovery_scan', None)
             if imap_result.get('recipient_search_supported') is False:
                 should_scan = True
                 break

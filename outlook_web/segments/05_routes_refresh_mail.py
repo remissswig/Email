@@ -3674,6 +3674,7 @@ def fetch_account_imap_emails_by_recipient(
         limit,
         get_account_proxy_url(account),
         scan_limit,
+        allow_recovery_scan=not bool(account.get('_public_mailbox_disable_imap_recovery_scan')),
     )
     if not result.get('success'):
         return result

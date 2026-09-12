@@ -2246,7 +2246,8 @@ def get_emails_imap_generic_by_recipient(email_addr: str, imap_password: str, im
                                          imap_port: int = 993, folder: str = 'inbox',
                                          provider: str = 'custom', recipient: str = '',
                                          limit: int = 1, proxy_url: str = '',
-                                         scan_limit: int = MAILBOXES_MESSAGES_SCANNED_COUNT_DEFAULT) -> Dict[str, Any]:
+                                         scan_limit: int = MAILBOXES_MESSAGES_SCANNED_COUNT_DEFAULT,
+                                         allow_recovery_scan: bool = True) -> Dict[str, Any]:
     normalized_recipient = str(recipient or '').strip()
     if not normalized_recipient:
         return {
@@ -2351,6 +2352,17 @@ def get_emails_imap_generic_by_recipient(email_addr: str, imap_password: str, im
         recovery_scan_enabled = False
         recovery_sequence_ids_from_exists = False
         if not message_ids:
+            if not allow_recovery_scan:
+                return {
+                    'success': True,
+                    'emails': [],
+                    'method': 'IMAP (Generic Recipient Search)',
+                    'has_more': False,
+                    'recipient_search_supported': True,
+                    'scanned_count': 0,
+                    'scan_limit_reached': False,
+                    'recovery_scan_skipped': True,
+                }
             recovery_scan_enabled = True
             message_ids, search_mode, all_search_attempts = search_imap_message_ids(mail)
             search_attempts.extend(all_search_attempts)
