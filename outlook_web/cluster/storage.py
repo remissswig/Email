@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import os
 import re
 import sqlite3
 import secrets
@@ -14,7 +15,16 @@ REPLICATED_SETTING_KEYS = frozenset({
     'public_mailbox_api_key_auth_enabled',
     'mailboxes_messages_scanned_count',
 })
-MAX_INCREMENT_EVENTS = 500
+def _cluster_max_increment_events() -> int:
+    raw_value = str(os.getenv('CLUSTER_MAX_INCREMENT_EVENTS', '5000') or '').strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return 5000
+    return max(500, min(value, 10000))
+
+
+MAX_INCREMENT_EVENTS = _cluster_max_increment_events()
 CLUSTER_PROTOCOL_VERSION = 3
 _IDENTITY_KEY_VERSION = 1
 _RFC3339_UTC_RE = re.compile(
