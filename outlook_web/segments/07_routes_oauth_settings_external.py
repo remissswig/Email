@@ -1514,7 +1514,18 @@ def api_update_public_mailbox_api_key_auth():
 
 PUBLIC_MAILBOX_BATCH_SIZE = 50
 PUBLIC_MAILBOX_MAX_LIMIT = 20
-PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS = float(os.getenv("PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS", "4"))
+
+
+def _public_mailbox_fetch_timeout_seconds() -> float:
+    raw_value = str(os.getenv("PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS", "8") or "").strip()
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return 8.0
+    return max(4.0, min(value, 15.0))
+
+
+PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS = _public_mailbox_fetch_timeout_seconds()
 PUBLIC_MAILBOX_RESULT_CACHE_SECONDS = float(os.getenv("PUBLIC_MAILBOX_RESULT_CACHE_SECONDS", "8"))
 PUBLIC_MAILBOX_ERROR_CACHE_SECONDS = float(os.getenv("PUBLIC_MAILBOX_ERROR_CACHE_SECONDS", "5"))
 PUBLIC_MAILBOX_FORMATS = {'html', 'json'}
