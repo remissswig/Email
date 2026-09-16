@@ -1792,6 +1792,144 @@ def call_public_mailbox_upstream(func, *args, **kwargs):
         executor.shutdown(wait=False, cancel_futures=True)
 
 
+def fetch_public_mailbox_scan_pages(
+    account: Dict[str, Any],
+    page_requests: List[tuple[str, int, int]],
+) -> Dict[str, Dict[str, Any]]:
+    if not page_requests:
+        return {}
+    if len(page_requests) == 1:
+        folder_name, folder_skip, page_size = page_requests[0]
+        return {
+            folder_name: call_public_mailbox_upstream(
+                fetch_account_emails,
+                account,
+                folder_name,
+                folder_skip,
+                page_size,
+            )
+        }
+
+    results: Dict[str, Dict[str, Any]] = {}
+    max_workers = min(len(page_requests), len(PUBLIC_MAILBOX_SEARCH_FOLDERS))
+    executor = ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix='public-mailbox-scan',
+    )
+    future_map = {
+        executor.submit(
+            call_public_mailbox_upstream,
+            fetch_account_emails,
+            account,
+            folder_name,
+            folder_skip,
+            page_size,
+        ): (folder_name, folder_skip, page_size)
+        for folder_name, folder_skip, page_size in page_requests
+    }
+    try:
+        done, not_done = wait(
+            future_map,
+            timeout=max(1.0, float(PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS or 12)) + 1.0,
+        )
+        for future in not_done:
+            future.cancel()
+            folder_name, _folder_skip, _page_size = future_map[future]
+            results[folder_name] = public_mailbox_fetch_timeout_error()
+        for future in done:
+            folder_name, _folder_skip, _page_size = future_map[future]
+            try:
+                results[folder_name] = future.result()
+            except Exception as exc:
+                if is_timeout_like_exception(exc):
+                    results[folder_name] = public_mailbox_fetch_timeout_error()
+                else:
+                    results[folder_name] = {
+                        'success': False,
+                        'error': build_error_payload(
+                            'EMAIL_FETCH_FAILED',
+                            '获取邮件失败，请检查账号配置',
+                            type(exc).__name__,
+                            502,
+                            sanitize_error_details(str(exc)),
+                        ),
+                    }
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return results
+
+
+def fetch_public_mailbox_graph_recipient_pages(
+    account: Dict[str, Any],
+    recipient_candidates: List[str],
+    limit: int,
+) -> Dict[tuple[str, str], Dict[str, Any]]:
+    search_requests = [
+        (folder_name, graph_recipient)
+        for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS
+        for graph_recipient in recipient_candidates
+    ]
+    if not search_requests:
+        return {}
+    if len(search_requests) == 1:
+        folder_name, graph_recipient = search_requests[0]
+        return {
+            (folder_name, graph_recipient): call_public_mailbox_upstream(
+                fetch_account_graph_emails_by_recipient,
+                account,
+                folder_name,
+                graph_recipient,
+                limit,
+            )
+        }
+
+    results: Dict[tuple[str, str], Dict[str, Any]] = {}
+    executor = ThreadPoolExecutor(
+        max_workers=min(len(search_requests), 6),
+        thread_name_prefix='public-mailbox-graph-search',
+    )
+    future_map = {
+        executor.submit(
+            call_public_mailbox_upstream,
+            fetch_account_graph_emails_by_recipient,
+            account,
+            folder_name,
+            graph_recipient,
+            limit,
+        ): (folder_name, graph_recipient)
+        for folder_name, graph_recipient in search_requests
+    }
+    try:
+        done, not_done = wait(
+            future_map,
+            timeout=max(1.0, float(PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS or 12)) + 1.0,
+        )
+        for future in not_done:
+            future.cancel()
+            results[future_map[future]] = public_mailbox_fetch_timeout_error()
+        for future in done:
+            request_key = future_map[future]
+            try:
+                results[request_key] = future.result()
+            except Exception as exc:
+                if is_timeout_like_exception(exc):
+                    results[request_key] = public_mailbox_fetch_timeout_error()
+                else:
+                    results[request_key] = {
+                        'success': False,
+                        'error': build_error_payload(
+                            'EMAIL_FETCH_FAILED',
+                            '获取邮件失败，请检查账号配置',
+                            type(exc).__name__,
+                            502,
+                            sanitize_error_details(str(exc)),
+                        ),
+                    }
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return results
+
+
 def public_mailbox_message_key(item: Dict[str, Any]) -> tuple:
     return (
         str(item.get('folder') or 'inbox'),
@@ -1907,15 +2045,16 @@ def find_public_mailbox_messages(
             recipient,
             include_gmail_suffix=False,
         ) or [recipient]
+        graph_results = fetch_public_mailbox_graph_recipient_pages(
+            account,
+            graph_recipient_candidates,
+            max(limit, 1),
+        )
         for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
             for graph_recipient in graph_recipient_candidates:
-                graph_result = call_public_mailbox_upstream(
-                    fetch_account_graph_emails_by_recipient,
-                    account,
-                    folder_name,
-                    graph_recipient,
-                    max(limit, 1),
-                )
+                graph_result = graph_results.get((folder_name, graph_recipient))
+                if graph_result is None:
+                    continue
                 if graph_result.get('recipient_search_supported') is False:
                     fast_search_complete = False
                     break
@@ -1939,7 +2078,7 @@ def find_public_mailbox_messages(
                 break
 
     if is_imap_account:
-        imap_search_folders = ('inbox',)
+        imap_search_folders = PUBLIC_MAILBOX_SEARCH_FOLDERS
         for folder_name in imap_search_folders:
             account['_public_mailbox_disable_imap_recovery_scan'] = True
             try:
@@ -1948,7 +2087,7 @@ def find_public_mailbox_messages(
                     account,
                     folder_name,
                     recipient,
-                    max(limit, 1),
+                    max(limit, scan_limit),
                     scan_limit,
                 )
             finally:
@@ -1990,56 +2129,109 @@ def find_public_mailbox_messages(
                 }
 
     if should_scan:
+        first_page_states: Dict[str, Dict[str, Any]] = {}
+        first_page_found_match = False
+        first_page_size = min(PUBLIC_MAILBOX_BATCH_SIZE, scan_limit)
+        first_page_requests = [
+            (folder_name, 0, first_page_size)
+            for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS
+            if first_page_size > 0
+        ]
+        first_pages = fetch_public_mailbox_scan_pages(account, first_page_requests)
+
         for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
-            folder_skip = 0
-            folder_scanned_count = 0
-            folder_found_match = False
-            while folder_scanned_count < scan_limit:
-                page_size = min(
-                    PUBLIC_MAILBOX_BATCH_SIZE,
-                    scan_limit - folder_scanned_count,
-                )
-                page = call_public_mailbox_upstream(
-                    fetch_account_emails,
+            page = first_pages.get(folder_name)
+            if page is None:
+                continue
+            if not page.get('success'):
+                if matches:
+                    folder_errors.append(page)
+                    continue
+                return cache_public_mailbox_result(
                     account,
-                    folder_name,
-                    folder_skip,
-                    page_size,
+                    recipient,
+                    limit,
+                    public_mailbox_upstream_error(page),
                 )
-                if not page.get('success'):
-                    if matches:
-                        folder_errors.append(page)
-                        break
-                    return cache_public_mailbox_result(
-                        account,
-                        recipient,
-                        limit,
-                        public_mailbox_upstream_error(page),
+
+            page_items = list(page.get('emails') or [])
+            items = page_items[:first_page_size]
+            candidates_remain = candidates_remain or bool(page.get('has_more')) or len(page_items) > len(items)
+            request_method = str(page.get('request_method') or 'graph').strip().lower()
+            folder_scanned_count = 0
+            for source in items:
+                item = dict(source or {})
+                scanned_count += 1
+                folder_scanned_count += 1
+                key = public_mailbox_message_key(item)
+                if not key[2] or key in seen:
+                    continue
+                seen.add(key)
+                if public_mailbox_to_matches(item.get('to'), recipient):
+                    item['_request_method'] = request_method
+                    matches.append(item)
+                    first_page_found_match = True
+
+            first_page_states[folder_name] = {
+                'has_more': bool(page.get('has_more')) and bool(items),
+                'next_skip': len(items),
+                'scanned_count': folder_scanned_count,
+            }
+
+        if not first_page_found_match:
+            for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
+                folder_state = first_page_states.get(folder_name) or {}
+                if not folder_state.get('has_more'):
+                    continue
+                folder_skip = int(folder_state.get('next_skip') or 0)
+                folder_scanned_count = int(folder_state.get('scanned_count') or 0)
+                folder_found_match = False
+                while folder_scanned_count < scan_limit:
+                    page_size = min(
+                        PUBLIC_MAILBOX_BATCH_SIZE,
+                        scan_limit - folder_scanned_count,
                     )
+                    page = call_public_mailbox_upstream(
+                        fetch_account_emails,
+                        account,
+                        folder_name,
+                        folder_skip,
+                        page_size,
+                    )
+                    if not page.get('success'):
+                        if matches:
+                            folder_errors.append(page)
+                            break
+                        return cache_public_mailbox_result(
+                            account,
+                            recipient,
+                            limit,
+                            public_mailbox_upstream_error(page),
+                        )
 
-                page_items = list(page.get('emails') or [])
-                items = page_items[:page_size]
-                candidates_remain = candidates_remain or bool(page.get('has_more')) or len(page_items) > len(items)
-                request_method = str(page.get('request_method') or 'graph').strip().lower()
-                for source in items:
-                    item = dict(source or {})
-                    scanned_count += 1
-                    folder_scanned_count += 1
-                    key = public_mailbox_message_key(item)
-                    if not key[2] or key in seen:
-                        continue
-                    seen.add(key)
-                    if public_mailbox_to_matches(item.get('to'), recipient):
-                        item['_request_method'] = request_method
-                        matches.append(item)
-                        folder_found_match = True
+                    page_items = list(page.get('emails') or [])
+                    items = page_items[:page_size]
+                    candidates_remain = candidates_remain or bool(page.get('has_more')) or len(page_items) > len(items)
+                    request_method = str(page.get('request_method') or 'graph').strip().lower()
+                    for source in items:
+                        item = dict(source or {})
+                        scanned_count += 1
+                        folder_scanned_count += 1
+                        key = public_mailbox_message_key(item)
+                        if not key[2] or key in seen:
+                            continue
+                        seen.add(key)
+                        if public_mailbox_to_matches(item.get('to'), recipient):
+                            item['_request_method'] = request_method
+                            matches.append(item)
+                            folder_found_match = True
 
-                if not page.get('has_more') or not items or folder_scanned_count >= scan_limit:
+                    if not page.get('has_more') or not items or folder_scanned_count >= scan_limit:
+                        break
+                    folder_skip += len(items)
+
+                if folder_found_match:
                     break
-                folder_skip += len(items)
-
-            if folder_found_match:
-                break
 
     matches.sort(
         key=lambda item: parse_email_datetime(item.get('date')) or datetime.min,

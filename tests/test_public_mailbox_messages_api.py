@@ -444,8 +444,12 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertTrue(result['success'])
         self.assertEqual(result['count'], 1)
         self.assertEqual(result['messages'][0]['body'], '<p>fast body</p>')
-        graph_search_mock.assert_called_once_with(account, 'inbox', 'target@example.com', 1)
-        self.assertEqual(scan_mock.call_args_list, [
+        self.assertCountEqual(graph_search_mock.call_args_list, [
+            call(account, 'inbox', 'target@example.com', 1),
+            call(account, 'junkemail', 'target@example.com', 1),
+            call(account, 'deleteditems', 'target@example.com', 1),
+        ])
+        self.assertCountEqual(scan_mock.call_args_list, [
             call(account, 'inbox', 0, 50),
             call(account, 'junkemail', 0, 50),
             call(account, 'deleteditems', 0, 50),
@@ -504,7 +508,11 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertTrue(result['success'])
         self.assertEqual(result['messages'][0]['id'], 'scan-newer')
         self.assertEqual(result['messages'][0]['body'], '<p>newer body</p>')
-        scan_mock.assert_called_once_with(account, 'inbox', 0, 50)
+        self.assertCountEqual(scan_mock.call_args_list, [
+            call(account, 'inbox', 0, 50),
+            call(account, 'junkemail', 0, 50),
+            call(account, 'deleteditems', 0, 50),
+        ])
         detail_mock.assert_called_once_with(
             account,
             'scan-newer',
@@ -553,12 +561,16 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
 
         self.assertTrue(result['success'])
         self.assertEqual(result['messages'][0]['id'], 'fallback-match')
-        self.assertEqual(graph_search_mock.call_args_list, [
+        self.assertCountEqual(graph_search_mock.call_args_list, [
             call(account, 'inbox', 'target@example.com', 1),
             call(account, 'junkemail', 'target@example.com', 1),
             call(account, 'deleteditems', 'target@example.com', 1),
         ])
-        scan_mock.assert_called_once_with(account, 'inbox', 0, 50)
+        self.assertCountEqual(scan_mock.call_args_list, [
+            call(account, 'inbox', 0, 50),
+            call(account, 'junkemail', 0, 50),
+            call(account, 'deleteditems', 0, 50),
+        ])
         detail_mock.assert_called_once_with(
             account,
             'fallback-match',
@@ -617,8 +629,10 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
 
         self.assertTrue(result['success'])
         self.assertEqual(result['messages'][0]['id'], 'match-1')
-        self.assertEqual(fetch_mock.call_args_list, [
+        self.assertCountEqual(fetch_mock.call_args_list, [
             call(self.account, 'inbox', 0, 50),
+            call(self.account, 'junkemail', 0, 50),
+            call(self.account, 'deleteditems', 0, 50),
             call(self.account, 'inbox', 50, 50),
         ])
         detail_mock.assert_called_once_with(
@@ -733,9 +747,14 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
             self.imap_account,
             'inbox',
             'target@example.com',
-            1,
+            100,
+            100,
         )
-        fetch_mock.assert_called_once_with(self.imap_account, 'inbox', 0, 50)
+        self.assertCountEqual(fetch_mock.call_args_list, [
+            call(self.imap_account, 'inbox', 0, 50),
+            call(self.imap_account, 'junkemail', 0, 50),
+            call(self.imap_account, 'deleteditems', 0, 50),
+        ])
         detail_mock.assert_called_once_with(
             self.imap_account,
             'fallback-match',
@@ -955,7 +974,11 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
             100,
             100,
         )
-        self.assertEqual(fetch_mock.call_args_list, [call(self.imap_account, 'inbox', 0, 50)])
+        self.assertCountEqual(fetch_mock.call_args_list, [
+            call(self.imap_account, 'inbox', 0, 50),
+            call(self.imap_account, 'junkemail', 0, 50),
+            call(self.imap_account, 'deleteditems', 0, 50),
+        ])
         detail_mock.assert_called_once_with(
             self.imap_account,
             'fallback-match',
@@ -1041,6 +1064,7 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
             1,
             'socks5://proxy.local:1080',
             25,
+            allow_recovery_scan=True,
         )
         self.assertEqual(result['request_method'], 'imap')
         self.assertEqual(result['scanned_count'], 1)
@@ -1075,8 +1099,10 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
             )
 
         self.assertTrue(result['success'])
-        self.assertEqual(fetch_mock.call_args_list, [
+        self.assertCountEqual(fetch_mock.call_args_list, [
             call(self.account, 'inbox', 0, 50),
+            call(self.account, 'junkemail', 0, 50),
+            call(self.account, 'deleteditems', 0, 50),
         ])
         detail_mock.assert_called_once_with(
             self.account,
@@ -1189,9 +1215,13 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertFalse(result['success'])
         self.assertEqual(result['status'], 404)
         self.assertTrue(result['scan_limit_reached'])
-        self.assertEqual(result['scanned_count'], 3)
+        self.assertEqual(result['scanned_count'], 9)
         scan_limit_mock.assert_called_once_with()
-        fetch_mock.assert_called_once_with(self.account, 'inbox', 0, 3)
+        self.assertCountEqual(fetch_mock.call_args_list, [
+            call(self.account, 'inbox', 0, 3),
+            call(self.account, 'junkemail', 0, 3),
+            call(self.account, 'deleteditems', 0, 3),
+        ])
 
     def test_exactly_consuming_available_candidates_does_not_claim_scan_limit_reached(self):
         page = {
@@ -1223,8 +1253,12 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertFalse(result['success'])
         self.assertEqual(result['status'], 404)
         self.assertFalse(result['scan_limit_reached'])
-        self.assertEqual(result['scanned_count'], 3)
-        fetch_mock.assert_called_once_with(self.account, 'inbox', 0, 3)
+        self.assertEqual(result['scanned_count'], 9)
+        self.assertCountEqual(fetch_mock.call_args_list, [
+            call(self.account, 'inbox', 0, 3),
+            call(self.account, 'junkemail', 0, 3),
+            call(self.account, 'deleteditems', 0, 3),
+        ])
 
     def test_finding_match_at_configured_scan_limit_boundary_succeeds(self):
         matching = self.item('match-3', 'Hide My Email <target@example.com>')
@@ -1263,7 +1297,11 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertEqual(result['count'], 1)
         self.assertEqual(result['messages'][0]['id'], 'match-3')
         scan_limit_mock.assert_called_once_with()
-        fetch_mock.assert_called_once_with(self.account, 'inbox', 0, 3)
+        self.assertCountEqual(fetch_mock.call_args_list, [
+            call(self.account, 'inbox', 0, 3),
+            call(self.account, 'junkemail', 0, 3),
+            call(self.account, 'deleteditems', 0, 3),
+        ])
         detail_mock.assert_called_once_with(
             self.account,
             'match-3',
