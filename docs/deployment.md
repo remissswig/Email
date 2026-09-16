@@ -117,6 +117,31 @@ docker-compose down
 - 如需确认定时任务是否已启动，可执行 `docker-compose logs -f`，日志中应出现“定时任务已启动”。
 - 若使用 Cron 模式，请确认已在系统设置中开启 `use_cron_schedule`，并填写正确的 5 段 Cron 表达式。
 
+## 公开邮箱入口缓存
+
+公开验证码/收件箱展示入口需要实时查询上游邮箱。反代 `/show/`、`/mailbox/`、`/query/` 时不要忽略应用返回的 `Cache-Control: no-store`，也不要对这些路径启用 Nginx/网关缓存。示例：
+
+```nginx
+location ^~ /show/ {
+    proxy_pass http://127.0.0.1:9080/show/;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_cache off;
+}
+```
+
+## 集群节点巡检
+
+多节点部署并通过 Nacos/APISIX 分发 `/show/` 时，可以安装 `scripts/mail-cluster-healthcheck.py` 定时巡检各实例的公开查询结果。脚本会从 Nacos 读取实例列表，直连每个实例的同一条 `/query/<share-segment>/<recipient>` 探针，比较返回的邮件数量和最新时间；连续异常达到阈值后会通过 Nacos 禁用该实例，恢复一致后自动启用。
+
+```bash
+install -m 0755 scripts/mail-cluster-healthcheck.py /usr/local/bin/mail-cluster-healthcheck.py
+install -m 0644 scripts/mail-cluster-healthcheck.cron.example /etc/cron.d/mail-cluster-healthcheck
+```
+
+安装后请编辑 `/etc/cron.d/mail-cluster-healthcheck`，把 `MAIL_CLUSTER_HOST_HEADER`、`MAIL_CLUSTER_PROBE_PATH`、`MAIL_CLUSTER_NACOS_URL` 改成当前环境的值。探针路径应使用可稳定返回邮件的低风险测试分享链接，不要提交真实客户邮箱或分享 token。
+
 ## 环境变量配置
 
 | 变量名 | 说明 | 默认值 |

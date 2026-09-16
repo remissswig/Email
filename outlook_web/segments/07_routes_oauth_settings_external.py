@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import copy
 import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
+from datetime import datetime, timezone
 
 from typing import TYPE_CHECKING, Any, Dict, Optional
+
+from outlook_web.cluster.client import (
+    _is_sqlite_corruption_error,
+    quarantine_corrupt_replica_database,
+    load_replica_state,
+    replica_readiness,
+)
 
 if TYPE_CHECKING:
     # These segmented files are executed into the shared `web_outlook_app`
@@ -614,6 +624,7 @@ def api_get_settings():
         'normal_mail_local_retention_enabled',
         'false',
     )
+    settings['mailboxes_messages_scanned_count'] = get_mailboxes_messages_scanned_count()
     skin_settings = get_skin_settings_payload()
     settings['active_skin_id'] = skin_settings['active_skin_id']
     settings['configured_skin_id'] = skin_settings['configured_skin_id']
@@ -845,6 +856,20 @@ def api_update_settings():
                 errors.append('更新普通邮箱本地保留开关失败')
         else:
             errors.append('普通邮箱本地保留开关必须是 true 或 false')
+
+    if MAILBOXES_MESSAGES_SCANNED_COUNT_SETTING in data:
+        scanned_count, scanned_count_error = parse_mailboxes_messages_scanned_count(
+            data.get(MAILBOXES_MESSAGES_SCANNED_COUNT_SETTING)
+        )
+        if scanned_count_error:
+            errors.append(scanned_count_error)
+        elif set_setting(
+            MAILBOXES_MESSAGES_SCANNED_COUNT_SETTING,
+            str(scanned_count),
+        ):
+            updated.append('最多扫描邮件数')
+        else:
+            errors.append('淇濆瓨鏈€澶氭壂鎻忛偖浠舵暟澶辫触')
 
     if 'active_skin_id' in data:
         success, error, _skin = set_active_skin(data.get('active_skin_id'))
@@ -1269,6 +1294,1023 @@ def api_delete_skin(skin_id):
 
 
 # ==================== 对外 API ====================
+
+PUBLIC_MAILBOX_API_KEY_SETTINGS_PREFIX = '/api/settings/public-mailbox-api-key'
+PUBLIC_MAILBOX_API_KEYS_PATH = '/api/settings/public-mailbox-api-keys'
+PUBLIC_MAILBOX_API_KEY_AUTH_PATH = '/api/settings/public-mailbox-api-key-auth'
+
+
+@app.after_request
+def add_no_store_headers_for_public_mailbox_api_key_settings(response):
+    if not request.path.startswith(PUBLIC_MAILBOX_API_KEY_SETTINGS_PREFIX):
+        return response
+
+    if response.status_code == 400 and not session.get('logged_in'):
+        payload = response.get_json(silent=True) if hasattr(response, 'get_json') else None
+        if isinstance(payload, dict) and payload.get('csrf_error'):
+            response = make_response(
+                jsonify({'success': False, 'error': '请先登录', 'need_login': True}),
+                401,
+            )
+
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+def parse_public_mailbox_api_key_expiry(value: Any) -> tuple[Optional[str], str]:
+    if value is None:
+        return None, ''
+    if not isinstance(value, str):
+        return None, 'expires_at 格式无效'
+
+    candidate = value.strip()
+    if not candidate:
+        return None, ''
+    if candidate.endswith('Z'):
+        candidate = f"{candidate[:-1]}+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except (TypeError, ValueError):
+        return None, 'expires_at 格式无效'
+
+    if parsed.tzinfo is None:
+        return None, 'expires_at 必须包含时区'
+
+    normalized = parsed.astimezone(timezone.utc)
+    if normalized <= datetime.now(timezone.utc):
+        return None, 'expires_at 必须晚于当前时间'
+    return normalized.isoformat().replace('+00:00', 'Z'), ''
+
+
+def reject_public_mailbox_api_key_same_origin_csrf_recovery():
+    if not bool(getattr(g, 'csrf_same_origin_recovered', False)):
+        return None
+    description = getattr(
+        g,
+        'csrf_same_origin_error_description',
+        'The CSRF token is missing.',
+    )
+    if CSRF_AVAILABLE:
+        return handle_csrf_error(CSRFError(description))
+    return jsonify({
+        'success': False,
+        'error': '请求验证失败，请刷新后重试',
+        'csrf_error': True,
+        'description': description,
+    }), 400
+
+
+def public_mailbox_api_key_settings_error(message: str, status: int):
+    return jsonify({'success': False, 'error': message}), status
+
+
+@app.route(PUBLIC_MAILBOX_API_KEYS_PATH, methods=['GET'])
+@login_required
+def api_list_public_mailbox_api_keys():
+    return jsonify({
+        'success': True,
+        'auth_enabled': is_public_mailbox_api_key_auth_enabled(),
+        'keys': list_public_mailbox_api_keys(),
+        'accounts': list_public_mailbox_api_key_binding_accounts(),
+    })
+
+
+@app.route(PUBLIC_MAILBOX_API_KEYS_PATH, methods=['POST'])
+@login_required
+def api_create_public_mailbox_api_key():
+    recovered_csrf_response = reject_public_mailbox_api_key_same_origin_csrf_recovery()
+    if recovered_csrf_response is not None:
+        return recovered_csrf_response
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return public_mailbox_api_key_settings_error('请求体必须是 JSON 对象', 400)
+
+    name_value = data.get('name')
+    if not isinstance(name_value, str):
+        return public_mailbox_api_key_settings_error('名称不能为空', 400)
+    normalized_name = name_value.strip()
+    if not normalized_name:
+        return public_mailbox_api_key_settings_error('名称不能为空', 400)
+    if len(normalized_name) > 80:
+        return public_mailbox_api_key_settings_error('名称不能超过 80 个字符', 400)
+
+    normalized_remark = ''
+    if 'remark' in data:
+        remark_value = data.get('remark')
+        if not isinstance(remark_value, str):
+            return public_mailbox_api_key_settings_error('备注不能超过 500 个字符', 400)
+        normalized_remark = remark_value.strip()
+    if len(normalized_remark) > 500:
+        return public_mailbox_api_key_settings_error('备注不能超过 500 个字符', 400)
+
+    secret_value = data.get('secret')
+    if secret_value is not None and not isinstance(secret_value, str):
+        return public_mailbox_api_key_settings_error(
+            'secret 必须是字符串、null 或省略',
+            400,
+        )
+
+    normalized_secret = secret_value
+    if isinstance(secret_value, str):
+        trimmed_secret = secret_value.strip()
+        if secret_value and not trimmed_secret:
+            return public_mailbox_api_key_settings_error('secret 不能为空', 400)
+        if trimmed_secret:
+            if len(trimmed_secret) > 512:
+                return public_mailbox_api_key_settings_error(
+                    'secret 不能超过 512 个字符',
+                    400,
+                )
+            normalized_secret = trimmed_secret
+        else:
+            normalized_secret = ''
+
+    expires_at, expiry_error = parse_public_mailbox_api_key_expiry(data.get('expires_at'))
+    if expiry_error:
+        return public_mailbox_api_key_settings_error(expiry_error, 400)
+
+    account_id = data.get('account_id')
+    if account_id is not None and (
+        isinstance(account_id, bool)
+        or not isinstance(account_id, int)
+        or account_id <= 0
+    ):
+        return public_mailbox_api_key_settings_error('绑定邮箱不存在', 400)
+
+    try:
+        created = create_public_mailbox_api_key(
+            normalized_name,
+            normalized_remark,
+            expires_at,
+            normalized_secret,
+            account_id=account_id,
+        )
+    except PublicMailboxApiKeyConflictError:
+        return public_mailbox_api_key_settings_error('API 密钥已存在', 409)
+    except ValueError:
+        return public_mailbox_api_key_settings_error('绑定邮箱不存在', 400)
+
+    return jsonify({
+        'success': True,
+        'key': {
+            'id': created['id'],
+            'name': created['name'],
+            'remark': created['remark'],
+            'secret': get_public_mailbox_api_key_secret(created['id']),
+            'expires_at': created['expires_at'],
+            'created_at': created['created_at'],
+            'account_id': created['account_id'],
+            'account_email': created['account_email'],
+        },
+    }), 201
+
+
+@app.route(f'{PUBLIC_MAILBOX_API_KEYS_PATH}/<int:key_id>/secret', methods=['GET'])
+@login_required
+def api_get_public_mailbox_api_key_secret(key_id):
+    try:
+        secret = get_public_mailbox_api_key_secret(key_id)
+    except RuntimeError:
+        app.logger.exception('Failed to reveal public mailbox API key id=%s', key_id)
+        return public_mailbox_api_key_settings_error('API 密钥读取失败', 500)
+
+    if secret is None:
+        return public_mailbox_api_key_settings_error('API 密钥不存在', 404)
+    return jsonify({'success': True, 'id': key_id, 'secret': secret})
+
+
+@app.route(f'{PUBLIC_MAILBOX_API_KEYS_PATH}/<int:key_id>', methods=['DELETE'])
+@login_required
+def api_delete_public_mailbox_api_key(key_id):
+    recovered_csrf_response = reject_public_mailbox_api_key_same_origin_csrf_recovery()
+    if recovered_csrf_response is not None:
+        return recovered_csrf_response
+
+    if not delete_public_mailbox_api_key(key_id):
+        return public_mailbox_api_key_settings_error('API 密钥不存在', 404)
+    return jsonify({'success': True, 'message': 'API 密钥已删除'})
+
+
+@app.route(PUBLIC_MAILBOX_API_KEY_AUTH_PATH, methods=['PUT'])
+@login_required
+def api_update_public_mailbox_api_key_auth():
+    recovered_csrf_response = reject_public_mailbox_api_key_same_origin_csrf_recovery()
+    if recovered_csrf_response is not None:
+        return recovered_csrf_response
+
+    data = request.get_json(silent=True)
+    enabled = data.get('enabled') if isinstance(data, dict) else None
+    if type(enabled) is not bool:
+        return public_mailbox_api_key_settings_error('enabled 必须是 JSON 布尔值', 400)
+
+    set_public_mailbox_api_key_auth_enabled(enabled)
+    return jsonify({
+        'success': True,
+        'auth_enabled': is_public_mailbox_api_key_auth_enabled(),
+    })
+
+
+PUBLIC_MAILBOX_BATCH_SIZE = 50
+PUBLIC_MAILBOX_MAX_LIMIT = 20
+
+
+def _public_mailbox_fetch_timeout_seconds() -> float:
+    raw_value = str(os.getenv("PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS", "8") or "").strip()
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return 8.0
+    return max(4.0, min(value, 15.0))
+
+
+PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS = _public_mailbox_fetch_timeout_seconds()
+PUBLIC_MAILBOX_RESULT_CACHE_SECONDS = float(os.getenv("PUBLIC_MAILBOX_RESULT_CACHE_SECONDS", "8"))
+PUBLIC_MAILBOX_ERROR_CACHE_SECONDS = float(os.getenv("PUBLIC_MAILBOX_ERROR_CACHE_SECONDS", "5"))
+PUBLIC_MAILBOX_FORMATS = {'html', 'json'}
+PUBLIC_MAILBOX_SEARCH_FOLDERS = ('inbox', 'junkemail', 'deleteditems')
+PUBLIC_MAILBOX_DELIVERY_HEADER_NAMES = {
+    'received-spf',
+    'authentication-results-original',
+    'return-path',
+}
+PUBLIC_MAILBOX_HME_HEADER_NAME = 'x-icloud-hme'
+PUBLIC_MAILBOX_HTML_CSP = (
+    "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'"
+)
+
+
+def normalize_public_mailbox_query_address(value: Any) -> str:
+    raw_value = str(value or '').strip()
+    if (
+        not raw_value
+        or len(raw_value) > 254
+        or any(char.isspace() for char in raw_value)
+    ):
+        return ''
+
+    parsed_addresses = email.utils.getaddresses([raw_value])
+    if len(parsed_addresses) != 1:
+        return ''
+
+    display_name, address = parsed_addresses[0]
+    normalized = normalize_email_address(address)
+    if display_name or normalized != normalize_email_address(raw_value):
+        return ''
+    if normalized.count('@') != 1:
+        return ''
+
+    local_part, domain = normalized.split('@', 1)
+    if not local_part or not domain:
+        return ''
+    return normalized
+
+
+def public_mailbox_to_matches(to_value: Any, target_email: str) -> bool:
+    return email_header_matches_address(to_value, target_email)
+
+
+def public_mailbox_encoded_delivery_recipient(target_email: str) -> str:
+    normalized = normalize_email_address(target_email)
+    if normalized.count('@') != 1:
+        return ''
+    local_part, domain = normalized.split('@', 1)
+    if not local_part or domain != 'icloud.com':
+        return ''
+    return f'{local_part}={domain}'
+
+
+def public_mailbox_is_plus_tagged_icloud_recipient(target_email: str) -> bool:
+    normalized = normalize_email_address(target_email)
+    if normalized.count('@') != 1:
+        return False
+    local_part, domain = normalized.split('@', 1)
+    return domain == 'icloud.com' and '+' in local_part
+
+
+def public_mailbox_requires_delivery_header_match(target_email: str) -> bool:
+    return bool(public_mailbox_encoded_delivery_recipient(target_email))
+
+
+def public_mailbox_detail_has_header_field(detail: Dict[str, Any]) -> bool:
+    if not isinstance(detail, dict):
+        return False
+    return (
+        'internet_message_headers' in detail
+        or 'internetMessageHeaders' in detail
+        or 'headers' in detail
+    )
+
+
+def iter_public_mailbox_delivery_header_values(detail: Dict[str, Any]):
+    yield from iter_public_mailbox_header_values(detail, PUBLIC_MAILBOX_DELIVERY_HEADER_NAMES)
+
+
+def iter_public_mailbox_hme_header_values(detail: Dict[str, Any]):
+    yield from iter_public_mailbox_header_values(detail, {PUBLIC_MAILBOX_HME_HEADER_NAME})
+
+
+def iter_public_mailbox_header_values(detail: Dict[str, Any], header_names: set[str]):
+    if not isinstance(detail, dict):
+        return
+
+    normalized_names = {str(name or '').strip().lower() for name in header_names}
+    raw_headers = []
+    for key in ('internet_message_headers', 'internetMessageHeaders', 'headers'):
+        if key in detail:
+            raw_headers = detail.get(key) or []
+            break
+
+    if isinstance(raw_headers, dict):
+        for name, value in raw_headers.items():
+            if str(name or '').strip().lower() in normalized_names:
+                yield str(value or '')
+        return
+
+    if isinstance(raw_headers, (list, tuple)):
+        for header in raw_headers:
+            if isinstance(header, dict):
+                name = str(header.get('name') or '').strip().lower()
+                value = str(header.get('value') or '')
+            elif isinstance(header, (list, tuple)) and len(header) >= 2:
+                name = str(header[0] or '').strip().lower()
+                value = str(header[1] or '')
+            else:
+                continue
+            if name in normalized_names:
+                yield value
+
+
+def public_mailbox_delivery_header_value_matches(value: Any, encoded_recipient: str) -> bool:
+    encoded = str(encoded_recipient or '').strip().lower()
+    if not encoded:
+        return False
+    text = str(value or '').lower()
+    pattern = rf'(?<![a-z0-9.%+=]){re.escape(encoded)}(?![a-z0-9.%+=])'
+    return re.search(pattern, text) is not None
+
+
+def public_mailbox_hme_header_value_matches(value: Any, target_email: str) -> bool:
+    normalized = normalize_email_address(target_email)
+    if not normalized:
+        return False
+    text = str(value or '').strip()
+    pairs = {}
+    for part in text.split(';'):
+        key, separator, raw_value = part.partition('=')
+        if not separator:
+            continue
+        pairs[str(key or '').strip().lower()] = str(raw_value or '').strip().strip('"')
+    return normalize_email_address(pairs.get('p')) == normalized
+
+
+def public_mailbox_delivery_headers_match(detail: Dict[str, Any], target_email: str) -> bool:
+    encoded_recipient = public_mailbox_encoded_delivery_recipient(target_email)
+    if not encoded_recipient:
+        return True
+    if any(
+        public_mailbox_delivery_header_value_matches(value, encoded_recipient)
+        for value in iter_public_mailbox_delivery_header_values(detail)
+    ):
+        return True
+    if public_mailbox_is_plus_tagged_icloud_recipient(target_email):
+        return False
+    return any(
+        public_mailbox_hme_header_value_matches(value, target_email)
+        for value in iter_public_mailbox_hme_header_values(detail)
+    )
+
+
+def parse_public_mailbox_message_query(values: Any) -> tuple[Optional[Dict[str, Any]], str]:
+    raw_mainemail_value = values.get('mainemail')
+    raw_mainemail = str(
+        raw_mainemail_value if raw_mainemail_value is not None else ''
+    ).strip()
+    recipient = normalize_public_mailbox_query_address(values.get('email'))
+    mainemail = (
+        normalize_public_mailbox_query_address(raw_mainemail)
+        if raw_mainemail
+        else recipient
+    )
+    raw_format = str(values.get('format') or '').strip().lower()
+    response_format = raw_format or 'html'
+    raw_limit_value = values.get('limit')
+    raw_limit = str(raw_limit_value if raw_limit_value is not None else '').strip() or '1'
+
+    if not recipient:
+        return None, 'email 参数缺失或格式无效'
+    if not mainemail:
+        return None, 'mainemail 参数格式无效'
+    if response_format not in PUBLIC_MAILBOX_FORMATS:
+        return None, 'format 参数必须是 html 或 json'
+    if not raw_limit.isdigit():
+        return None, 'limit 参数必须是整数'
+
+    limit = int(raw_limit)
+    if not 1 <= limit <= PUBLIC_MAILBOX_MAX_LIMIT:
+        return None, f'limit 参数必须在 1 到 {PUBLIC_MAILBOX_MAX_LIMIT} 之间'
+    if response_format == 'html' and limit != 1:
+        return None, 'format=html 时 limit 必须为 1'
+
+    return {
+        'mainemail': mainemail,
+        'email': recipient,
+        'format': response_format,
+        'limit': limit,
+    }, ''
+
+
+def public_mailbox_payload_has_timeout(value: Any) -> bool:
+    if isinstance(value, dict):
+        if value.get('status') == 504 or value.get('code') == 'EMAIL_FETCH_TIMEOUT':
+            return True
+        if 'timeout' in str(value.get('type') or '').lower():
+            return True
+        return any(public_mailbox_payload_has_timeout(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(public_mailbox_payload_has_timeout(item) for item in value)
+    return False
+
+
+def public_mailbox_upstream_error(value: Any) -> Dict[str, Any]:
+    if public_mailbox_payload_has_timeout(value):
+        return {
+            'success': False,
+            'status': 504,
+            'error': '邮箱服务查询超时',
+        }
+    return {
+        'success': False,
+        'status': 502,
+        'error': '邮箱服务查询失败',
+    }
+
+
+def public_mailbox_fetch_timeout_error() -> Dict[str, Any]:
+    return {
+        'success': False,
+        'error': build_error_payload(
+            'EMAIL_FETCH_TIMEOUT',
+            '获取邮件超时，请稍后重试',
+            'TimeoutError',
+            504,
+            f'timeout={PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS}s',
+        ),
+    }
+
+
+def call_public_mailbox_upstream(func, *args, **kwargs):
+    timeout_seconds = max(1.0, float(PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS or 12))
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='public-mailbox-fetch')
+
+    def invoke_with_app_context():
+        with app.app_context():
+            return func(*args, **kwargs)
+
+    future = executor.submit(invoke_with_app_context)
+    try:
+        done, _not_done = wait([future], timeout=timeout_seconds)
+        if future not in done:
+            future.cancel()
+            return public_mailbox_fetch_timeout_error()
+        return future.result()
+    except Exception as exc:
+        if is_timeout_like_exception(exc):
+            return public_mailbox_fetch_timeout_error()
+        return {
+            'success': False,
+            'error': build_error_payload(
+                'EMAIL_FETCH_FAILED',
+                '获取邮件失败，请检查账号配置',
+                type(exc).__name__,
+                502,
+                sanitize_error_details(str(exc)),
+            ),
+        }
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def public_mailbox_message_key(item: Dict[str, Any]) -> tuple:
+    return (
+        str(item.get('folder') or 'inbox'),
+        str(item.get('id_mode') or ''),
+        str(item.get('id') or ''),
+    )
+
+
+PUBLIC_MAILBOX_RESULT_CACHE_LOCK = threading.Lock()
+PUBLIC_MAILBOX_RESULT_CACHE: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
+PUBLIC_MAILBOX_RESULT_CACHE_MAX_ENTRIES = 512
+
+
+def public_mailbox_result_cache_key(account: Dict[str, Any], recipient: str, limit: int) -> tuple:
+    return (
+        int(account.get('id') or 0),
+        normalize_email_address(account.get('email') or ''),
+        normalize_email_address(recipient),
+        int(limit or 1),
+    )
+
+
+def get_public_mailbox_cached_result(account: Dict[str, Any], recipient: str, limit: int) -> Optional[Dict[str, Any]]:
+    ttl = max(0.0, float(PUBLIC_MAILBOX_RESULT_CACHE_SECONDS or 0))
+    if ttl <= 0:
+        return None
+    now = time.time()
+    key = public_mailbox_result_cache_key(account, recipient, limit)
+    with PUBLIC_MAILBOX_RESULT_CACHE_LOCK:
+        cached = PUBLIC_MAILBOX_RESULT_CACHE.get(key)
+        if not cached:
+            return None
+        expires_at, result = cached
+        if expires_at <= now:
+            PUBLIC_MAILBOX_RESULT_CACHE.pop(key, None)
+            return None
+        return copy.deepcopy(result)
+
+
+def public_mailbox_result_cache_ttl(result: Dict[str, Any]) -> float:
+    if result.get('success'):
+        return max(0.0, float(PUBLIC_MAILBOX_RESULT_CACHE_SECONDS or 0))
+    if int(result.get('status') or 0) in {502, 504}:
+        return max(0.0, float(PUBLIC_MAILBOX_ERROR_CACHE_SECONDS or 0))
+    return 0.0
+
+
+def set_public_mailbox_cached_result(account: Dict[str, Any], recipient: str, limit: int, result: Dict[str, Any]) -> None:
+    ttl = public_mailbox_result_cache_ttl(result)
+    if ttl <= 0:
+        return
+    key = public_mailbox_result_cache_key(account, recipient, limit)
+    with PUBLIC_MAILBOX_RESULT_CACHE_LOCK:
+        if len(PUBLIC_MAILBOX_RESULT_CACHE) >= PUBLIC_MAILBOX_RESULT_CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                PUBLIC_MAILBOX_RESULT_CACHE,
+                key=lambda item_key: PUBLIC_MAILBOX_RESULT_CACHE[item_key][0],
+            )
+            PUBLIC_MAILBOX_RESULT_CACHE.pop(oldest_key, None)
+        PUBLIC_MAILBOX_RESULT_CACHE[key] = (time.time() + ttl, copy.deepcopy(result))
+
+
+def cache_public_mailbox_result(account: Dict[str, Any], recipient: str, limit: int, result: Dict[str, Any]) -> Dict[str, Any]:
+    set_public_mailbox_cached_result(account, recipient, limit, result)
+    return result
+
+
+def clear_public_mailbox_result_cache() -> None:
+    with PUBLIC_MAILBOX_RESULT_CACHE_LOCK:
+        PUBLIC_MAILBOX_RESULT_CACHE.clear()
+
+
+def build_public_mailbox_message(
+    item: Dict[str, Any],
+    detail: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        'id': str(detail.get('id') or item.get('id') or ''),
+        'subject': str(detail.get('subject') or item.get('subject') or ''),
+        'from': str(detail.get('from') or item.get('from') or ''),
+        'to': str(detail.get('to') or item.get('to') or ''),
+        'received_at': str(detail.get('date') or item.get('date') or ''),
+        'body': str(detail.get('body') or ''),
+        'body_type': str(detail.get('body_type') or 'text').strip().lower(),
+    }
+
+
+def find_public_mailbox_messages(
+    account: Dict[str, Any],
+    recipient: str,
+    limit: int,
+) -> Dict[str, Any]:
+    cached_result = get_public_mailbox_cached_result(account, recipient, limit)
+    if cached_result is not None:
+        return cached_result
+
+    matches: List[Dict[str, Any]] = []
+    seen = set()
+    folder_errors: List[Dict[str, Any]] = []
+    try:
+        scan_limit = get_mailboxes_messages_scanned_count()
+    except RuntimeError:
+        scan_limit = MAILBOXES_MESSAGES_SCANNED_COUNT_DEFAULT
+    scanned_count = 0
+    skip = 0
+    is_imap_account = str(account.get('account_type') or '').strip().lower() == 'imap'
+    should_scan = not is_imap_account
+    candidates_remain = False
+
+    if should_scan:
+        fast_search_complete = True
+        graph_recipient_candidates = build_email_query_candidates(
+            recipient,
+            include_gmail_suffix=False,
+        ) or [recipient]
+        for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
+            for graph_recipient in graph_recipient_candidates:
+                graph_result = call_public_mailbox_upstream(
+                    fetch_account_graph_emails_by_recipient,
+                    account,
+                    folder_name,
+                    graph_recipient,
+                    max(limit, 1),
+                )
+                if graph_result.get('recipient_search_supported') is False:
+                    fast_search_complete = False
+                    break
+                if not graph_result.get('success'):
+                    fast_search_complete = False
+                    folder_errors.append(graph_result)
+                    break
+                for source in graph_result.get('emails') or []:
+                    item = dict(source or {})
+                    key = public_mailbox_message_key(item)
+                    if not key[2] or key in seen:
+                        continue
+                    seen.add(key)
+                    item['_request_method'] = 'graph'
+                    matches.append(item)
+
+                if matches:
+                    break
+
+            if matches or not fast_search_complete:
+                break
+
+    if is_imap_account:
+        imap_search_folders = ('inbox',)
+        for folder_name in imap_search_folders:
+            account['_public_mailbox_disable_imap_recovery_scan'] = True
+            try:
+                imap_result = call_public_mailbox_upstream(
+                    fetch_account_imap_emails_by_recipient,
+                    account,
+                    folder_name,
+                    recipient,
+                    max(limit, 1),
+                    scan_limit,
+                )
+            finally:
+                account.pop('_public_mailbox_disable_imap_recovery_scan', None)
+            if imap_result.get('recipient_search_supported') is False:
+                should_scan = True
+                break
+            if not imap_result.get('success'):
+                folder_errors.append(imap_result)
+                if public_mailbox_payload_has_timeout(imap_result):
+                    break
+                continue
+            strict_items = list(imap_result.get('emails') or [])
+            for source in strict_items:
+                item = dict(source or {})
+                key = public_mailbox_message_key(item)
+                if not key[2] or key in seen:
+                    continue
+                seen.add(key)
+                item['_request_method'] = 'imap'
+                matches.append(item)
+
+            if matches:
+                break
+
+        if not should_scan:
+            if folder_errors and not matches:
+                return cache_public_mailbox_result(
+                    account,
+                    recipient,
+                    limit,
+                    public_mailbox_upstream_error(folder_errors[0]),
+                )
+            if not matches:
+                return {
+                    'success': False,
+                    'status': 404,
+                    'error': '未找到匹配邮件',
+                }
+
+    if should_scan:
+        for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
+            folder_skip = 0
+            folder_scanned_count = 0
+            folder_found_match = False
+            while folder_scanned_count < scan_limit:
+                page_size = min(
+                    PUBLIC_MAILBOX_BATCH_SIZE,
+                    scan_limit - folder_scanned_count,
+                )
+                page = call_public_mailbox_upstream(
+                    fetch_account_emails,
+                    account,
+                    folder_name,
+                    folder_skip,
+                    page_size,
+                )
+                if not page.get('success'):
+                    if matches:
+                        folder_errors.append(page)
+                        break
+                    return cache_public_mailbox_result(
+                        account,
+                        recipient,
+                        limit,
+                        public_mailbox_upstream_error(page),
+                    )
+
+                page_items = list(page.get('emails') or [])
+                items = page_items[:page_size]
+                candidates_remain = candidates_remain or bool(page.get('has_more')) or len(page_items) > len(items)
+                request_method = str(page.get('request_method') or 'graph').strip().lower()
+                for source in items:
+                    item = dict(source or {})
+                    scanned_count += 1
+                    folder_scanned_count += 1
+                    key = public_mailbox_message_key(item)
+                    if not key[2] or key in seen:
+                        continue
+                    seen.add(key)
+                    if public_mailbox_to_matches(item.get('to'), recipient):
+                        item['_request_method'] = request_method
+                        matches.append(item)
+                        folder_found_match = True
+
+                if not page.get('has_more') or not items or folder_scanned_count >= scan_limit:
+                    break
+                folder_skip += len(items)
+
+            if folder_found_match:
+                break
+
+    matches.sort(
+        key=lambda item: parse_email_datetime(item.get('date')) or datetime.min,
+        reverse=True,
+    )
+    if not matches:
+        scan_limit_reached = scanned_count >= scan_limit and candidates_remain
+        return {
+            'success': False,
+            'status': 404,
+            'error': (
+                '未在扫描范围内找到匹配邮件'
+                if scan_limit_reached
+                else '未找到匹配邮件'
+            ),
+            'scan_limit_reached': scan_limit_reached,
+            'scanned_count': scanned_count,
+        }
+
+    messages = []
+    requires_delivery_header_match = public_mailbox_requires_delivery_header_match(recipient)
+    for item in matches:
+        if len(messages) >= limit:
+            break
+
+        item_detail = item.get('_detail')
+        if (
+            isinstance(item_detail, dict)
+            and (
+                not requires_delivery_header_match
+                or public_mailbox_detail_has_header_field(item_detail)
+            )
+        ):
+            detail_result = {
+                'success': True,
+                'email': item_detail,
+            }
+        else:
+            detail_result = call_public_mailbox_upstream(
+                fetch_email_detail_for_account,
+                account,
+                item['id'],
+                item['_request_method'],
+                item.get('folder') or 'inbox',
+                item.get('id_mode') or '',
+                structured_error=True,
+            )
+            if not detail_result.get('success'):
+                return cache_public_mailbox_result(
+                    account,
+                    recipient,
+                    limit,
+                    public_mailbox_upstream_error(detail_result),
+                )
+        detail = detail_result.get('email') or {}
+        if (
+            requires_delivery_header_match
+            and not public_mailbox_delivery_headers_match(detail, recipient)
+        ):
+            continue
+        messages.append(
+            build_public_mailbox_message(item, detail)
+        )
+
+    if not messages:
+        scan_limit_reached = scanned_count >= scan_limit and candidates_remain
+        return {
+            'success': False,
+            'status': 404,
+            'error': (
+                '未在扫描范围内找到匹配邮件'
+                if scan_limit_reached
+                else '未找到匹配邮件'
+            ),
+            'scan_limit_reached': scan_limit_reached,
+            'scanned_count': scanned_count,
+        }
+
+    result = {
+        'success': True,
+        'status': 200,
+        'count': len(messages),
+        'messages': messages,
+    }
+    return cache_public_mailbox_result(account, recipient, limit, result)
+
+
+def _mailbox_node_identifier() -> str:
+    if not CLUSTER_CONFIG.is_replica:
+        return 'primary'
+    try:
+        return _load_replica_state_with_repair().node_id or 'replica'
+    except Exception:
+        return 'replica'
+
+
+def _load_replica_state_with_repair():
+    db = get_db()
+    try:
+        return load_replica_state(db)
+    except (sqlite3.Error, ValueError) as exc:
+        if isinstance(exc, sqlite3.Error) and not _is_sqlite_corruption_error(exc):
+            raise
+        quarantine_corrupt_replica_database(
+            DATABASE,
+            os.path.dirname(DATABASE),
+            connection=db,
+            now=datetime.now(timezone.utc),
+        )
+        g._database = None
+        init_db()
+        return load_replica_state(get_db())
+
+
+def _replica_readiness_error_response(error_code: str, response_format: str):
+    payload = {
+        'success': False,
+        'error_code': error_code,
+        'error': error_code,
+    }
+    if response_format == 'html':
+        return public_mailbox_html_message_response(error_code, 503)
+    return public_mailbox_json_response(payload, 503)
+
+
+def add_public_mailbox_response_headers(response, html_response: bool = False):
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['X-Mailbox-Node'] = _mailbox_node_identifier()
+    if html_response:
+        response.headers['Content-Security-Policy'] = PUBLIC_MAILBOX_HTML_CSP
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['Referrer-Policy'] = 'no-referrer'
+    return response
+
+
+def public_mailbox_json_response(payload: Dict[str, Any], status: int = 200):
+    response = make_response(jsonify(payload), status)
+    return add_public_mailbox_response_headers(response)
+
+
+def public_mailbox_html_message_response(
+    message: Any,
+    status: int = 200,
+):
+    safe_message = html.escape(str(message or '请求无法处理'))
+    response = make_response(safe_message, status)
+    response.headers['Content-Type'] = 'text/html; charset=utf-8'
+    return add_public_mailbox_response_headers(response, html_response=True)
+
+
+def public_mailbox_html_result_response(result: Dict[str, Any]):
+    if not result.get('success'):
+        status = int(result.get('status') or 502)
+        if status == 404:
+            return public_mailbox_html_message_response('\u5f53\u524d\u65e0\u90ae\u4ef6', 200)
+        return public_mailbox_html_message_response(
+            result.get('error') or '邮箱服务查询失败',
+            status,
+        )
+
+    message = (result.get('messages') or [{}])[0]
+    body = str(message.get('body') or '')
+    if message.get('body_type') != 'html':
+        body = f'<pre>{html.escape(body)}</pre>'
+    response = make_response(body, 200)
+    response.headers['Content-Type'] = 'text/html; charset=utf-8'
+    return add_public_mailbox_response_headers(response, html_response=True)
+
+
+@app.route('/api/v1/mailboxes/messages', methods=['GET'])
+@csrf_exempt
+@public_mailbox_api_key_required
+def api_public_mailbox_messages():
+    query_values = {
+        'mainemail': get_query_arg_preserve_plus('mainemail', ''),
+        'email': get_query_arg_preserve_plus('email', ''),
+        'format': request.args.get('format'),
+        'limit': request.args.get('limit'),
+    }
+    parsed, validation_error = parse_public_mailbox_message_query(query_values)
+    if validation_error:
+        if public_mailbox_request_wants_html():
+            return public_mailbox_html_message_response(validation_error, 400)
+        return public_mailbox_json_response({
+            'success': False,
+            'error': validation_error,
+        }, 400)
+
+    if CLUSTER_CONFIG.is_replica:
+        replica_state = _load_replica_state_with_repair()
+        is_ready, error_code = replica_readiness(
+            replica_state,
+            datetime.now(timezone.utc),
+            CLUSTER_CONFIG.max_stale_seconds,
+        )
+        if not is_ready:
+            return _replica_readiness_error_response(error_code, parsed['format'])
+
+    bound_account_id = getattr(g, 'public_mailbox_api_key_account_id', None)
+    if bound_account_id is not None:
+        account = get_account_by_id(bound_account_id)
+        explicit_mainemail = str(query_values['mainemail'] or '').strip()
+        if account and explicit_mainemail:
+            requested_account = resolve_account_by_address(parsed['mainemail'])
+            if (
+                not requested_account
+                or requested_account.get('id') != account.get('id')
+            ):
+                if parsed['format'] == 'html':
+                    return public_mailbox_html_message_response(
+                        'API 密钥无权访问该主邮箱',
+                        403,
+                    )
+                return public_mailbox_json_response({
+                    'success': False,
+                    'error': 'API 密钥无权访问该主邮箱',
+                }, 403)
+    else:
+        account = resolve_account_by_address(parsed['mainemail'])
+    if not account:
+        if bound_account_id is not None:
+            error = 'API 密钥绑定的邮箱不存在'
+            if parsed['format'] == 'html':
+                return public_mailbox_html_message_response(error, 403)
+            return public_mailbox_json_response({
+                'success': False,
+                'error': error,
+            }, 403)
+        if parsed['format'] == 'html':
+            return public_mailbox_html_message_response(
+                '主邮箱或别名不存在',
+                404,
+            )
+        return public_mailbox_json_response({
+            'success': False,
+            'error': '主邮箱或别名不存在',
+        }, 404)
+
+    result = find_public_mailbox_messages(
+        account,
+        parsed['email'],
+        parsed['limit'],
+    )
+    if not result.get('success'):
+        status = int(result.get('status') or 502)
+        if parsed['format'] == 'html':
+            if status == 404:
+                return public_mailbox_html_message_response(
+                    '当前无邮件',
+                    200,
+                )
+            return public_mailbox_html_message_response(
+                result.get('error') or '邮箱服务查询失败',
+                status,
+            )
+        payload = {
+            key: value
+            for key, value in result.items()
+            if key != 'status'
+        }
+        return public_mailbox_json_response(payload, status)
+
+    if parsed['format'] == 'html':
+        return public_mailbox_html_result_response(result)
+
+    return public_mailbox_json_response({
+        'success': True,
+        'count': result['count'],
+        'messages': result['messages'],
+    })
+
 
 @app.route('/api/external/emails', methods=['GET'])
 @csrf_exempt

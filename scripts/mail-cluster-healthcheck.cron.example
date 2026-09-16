@@ -1,0 +1,6 @@
+MAIL_CLUSTER_HOST_HEADER=mail.example.com
+MAIL_CLUSTER_PROBE_PATH=/query/<share-segment>/<recipient@example.com>
+MAIL_CLUSTER_FAIL_THRESHOLD=2
+MAIL_CLUSTER_RECOVER_THRESHOLD=1
+MAIL_CLUSTER_PROBE_TIMEOUT=18
+* * * * * root /usr/local/bin/mail-cluster-healthcheck.py
