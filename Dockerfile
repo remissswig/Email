@@ -14,8 +14,10 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     GUNICORN_TIMEOUT=300 \
-    GUNICORN_THREADS=4 \
-    IMAP_TIMEOUT=45
+    GUNICORN_THREADS=8 \
+    IMAP_TIMEOUT=45 \
+    PUBLIC_MAILBOX_UPSTREAM_CONCURRENCY=3 \
+    PUBLIC_MAILBOX_ACCOUNT_LOCK_ACQUIRE_TIMEOUT_SECONDS=1.5
 
 # 复制依赖文件
 COPY requirements.txt .
@@ -35,4 +37,4 @@ RUN mkdir -p /app/data
 EXPOSE 5000
 
 # 启动应用（保持单 worker，使用线程提升慢请求容错）
-CMD ["sh", "-c", "gunicorn -k gthread -w 1 --threads ${GUNICORN_THREADS:-4} -b 0.0.0.0:5000 --timeout ${GUNICORN_TIMEOUT:-300} --graceful-timeout 30 --access-logfile - --error-logfile - --capture-output web_outlook_app:app"]
+CMD ["sh", "-c", "gunicorn -k gthread -w 1 --threads ${GUNICORN_THREADS:-8} -b 0.0.0.0:5000 --timeout ${GUNICORN_TIMEOUT:-300} --graceful-timeout 30 --access-logfile - --error-logfile - --capture-output web_outlook_app:app"]

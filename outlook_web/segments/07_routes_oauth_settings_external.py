@@ -1528,6 +1528,28 @@ def _public_mailbox_fetch_timeout_seconds() -> float:
 PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS = _public_mailbox_fetch_timeout_seconds()
 PUBLIC_MAILBOX_RESULT_CACHE_SECONDS = float(os.getenv("PUBLIC_MAILBOX_RESULT_CACHE_SECONDS", "8"))
 PUBLIC_MAILBOX_ERROR_CACHE_SECONDS = float(os.getenv("PUBLIC_MAILBOX_ERROR_CACHE_SECONDS", "5"))
+
+
+def _public_mailbox_upstream_concurrency() -> int:
+    raw_value = str(os.getenv("PUBLIC_MAILBOX_UPSTREAM_CONCURRENCY", "4") or "").strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return 4
+    return max(1, min(value, 8))
+
+
+PUBLIC_MAILBOX_UPSTREAM_CONCURRENCY = _public_mailbox_upstream_concurrency()
+PUBLIC_MAILBOX_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS = 0.25
+PUBLIC_MAILBOX_ACCOUNT_LOCK_ACQUIRE_TIMEOUT_SECONDS = float(
+    os.getenv("PUBLIC_MAILBOX_ACCOUNT_LOCK_ACQUIRE_TIMEOUT_SECONDS", "1.5") or "1.5"
+)
+PUBLIC_MAILBOX_UPSTREAM_GATE = threading.BoundedSemaphore(
+    PUBLIC_MAILBOX_UPSTREAM_CONCURRENCY,
+)
+PUBLIC_MAILBOX_ACCOUNT_LOCKS: Dict[str, threading.Lock] = {}
+PUBLIC_MAILBOX_ACCOUNT_LOCKS_GUARD = threading.Lock()
+PUBLIC_MAILBOX_BUSY_ERROR_CACHE_SECONDS = 2.0
 PUBLIC_MAILBOX_FORMATS = {'html', 'json'}
 PUBLIC_MAILBOX_SEARCH_FOLDERS = ('inbox', 'junkemail', 'deleteditems')
 PUBLIC_MAILBOX_DELIVERY_HEADER_NAMES = {
@@ -1733,7 +1755,31 @@ def public_mailbox_payload_has_timeout(value: Any) -> bool:
     return False
 
 
+def public_mailbox_payload_is_throttled(value: Any) -> bool:
+    if isinstance(value, dict):
+        status = int(value.get('status') or 0)
+        code = str(value.get('code') or '').upper()
+        details = str(value.get('details') or value.get('message') or '').lower()
+        if (
+            status == 429
+            or code in {'EMAIL_FETCH_THROTTLED', 'GRAPH_API_THROTTLED'}
+            or 'applicationthrottled' in details
+            or 'mailboxconcurrency' in details
+        ):
+            return True
+        return any(public_mailbox_payload_is_throttled(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(public_mailbox_payload_is_throttled(item) for item in value)
+    return False
+
+
 def public_mailbox_upstream_error(value: Any) -> Dict[str, Any]:
+    if public_mailbox_payload_is_throttled(value):
+        return {
+            'success': False,
+            'status': 429,
+            'error': '邮箱服务当前繁忙，请稍后重试',
+        }
     if public_mailbox_payload_has_timeout(value):
         return {
             'success': False,
@@ -1760,15 +1806,99 @@ def public_mailbox_fetch_timeout_error() -> Dict[str, Any]:
     }
 
 
+def public_mailbox_upstream_busy_error() -> Dict[str, Any]:
+    return {
+        'success': False,
+        'error': build_error_payload(
+            'EMAIL_FETCH_THROTTLED',
+            '邮箱服务当前繁忙，请稍后重试',
+            'ThrottleError',
+            429,
+            'public mailbox upstream concurrency limit reached',
+        ),
+    }
+
+
+def public_mailbox_exception_is_throttled(exc: Exception) -> bool:
+    details = str(exc or '').lower()
+    return (
+        'applicationthrottled' in details
+        or 'mailboxconcurrency' in details
+        or 'too many requests' in details
+        or 'status code 429' in details
+    )
+
+
+def _public_mailbox_account_lock_key(args: tuple, kwargs: dict) -> str:
+    account = args[0] if args and isinstance(args[0], dict) else kwargs.get('account')
+    if not isinstance(account, dict):
+        return ''
+    account_id = str(account.get('id') or '').strip()
+    if account_id:
+        return f'id:{account_id}'
+    account_email = normalize_email_address(account.get('email') or '')
+    return f'email:{account_email}' if account_email else ''
+
+
+def _public_mailbox_account_lock(key: str) -> Optional[threading.Lock]:
+    if not key:
+        return None
+    with PUBLIC_MAILBOX_ACCOUNT_LOCKS_GUARD:
+        lock = PUBLIC_MAILBOX_ACCOUNT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            PUBLIC_MAILBOX_ACCOUNT_LOCKS[key] = lock
+        return lock
+
+
 def call_public_mailbox_upstream(func, *args, **kwargs):
     timeout_seconds = max(1.0, float(PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS or 12))
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='public-mailbox-fetch')
+    if not PUBLIC_MAILBOX_UPSTREAM_GATE.acquire(
+        timeout=PUBLIC_MAILBOX_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS
+    ):
+        return public_mailbox_upstream_busy_error()
+
+    account_lock = _public_mailbox_account_lock(
+        _public_mailbox_account_lock_key(args, kwargs)
+    )
+    if account_lock is not None and not account_lock.acquire(
+        timeout=max(0.0, PUBLIC_MAILBOX_ACCOUNT_LOCK_ACQUIRE_TIMEOUT_SECONDS)
+    ):
+        PUBLIC_MAILBOX_UPSTREAM_GATE.release()
+        return public_mailbox_upstream_busy_error()
+
+    executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix='public-mailbox-fetch',
+    )
+    account_lock_released = False
+    account_lock_release_guard = threading.Lock()
+
+    def release_account_lock() -> None:
+        nonlocal account_lock_released
+        if account_lock is None:
+            return
+        with account_lock_release_guard:
+            if account_lock_released:
+                return
+            account_lock_released = True
+            account_lock.release()
 
     def invoke_with_app_context():
-        with app.app_context():
-            return func(*args, **kwargs)
+        try:
+            with app.app_context():
+                return func(*args, **kwargs)
+        finally:
+            release_account_lock()
+            PUBLIC_MAILBOX_UPSTREAM_GATE.release()
 
-    future = executor.submit(invoke_with_app_context)
+    try:
+        future = executor.submit(invoke_with_app_context)
+    except Exception:
+        if account_lock is not None:
+            account_lock.release()
+        PUBLIC_MAILBOX_UPSTREAM_GATE.release()
+        raise
     try:
         done, _not_done = wait([future], timeout=timeout_seconds)
         if future not in done:
@@ -1778,6 +1908,8 @@ def call_public_mailbox_upstream(func, *args, **kwargs):
     except Exception as exc:
         if is_timeout_like_exception(exc):
             return public_mailbox_fetch_timeout_error()
+        if public_mailbox_exception_is_throttled(exc):
+            return public_mailbox_upstream_busy_error()
         return {
             'success': False,
             'error': build_error_payload(
@@ -1834,6 +1966,8 @@ def get_public_mailbox_cached_result(account: Dict[str, Any], recipient: str, li
 def public_mailbox_result_cache_ttl(result: Dict[str, Any]) -> float:
     if result.get('success'):
         return max(0.0, float(PUBLIC_MAILBOX_RESULT_CACHE_SECONDS or 0))
+    if int(result.get('status') or 0) == 429:
+        return PUBLIC_MAILBOX_BUSY_ERROR_CACHE_SECONDS
     if int(result.get('status') or 0) in {502, 504}:
         return max(0.0, float(PUBLIC_MAILBOX_ERROR_CACHE_SECONDS or 0))
     return 0.0
