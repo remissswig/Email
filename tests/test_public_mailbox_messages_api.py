@@ -2716,7 +2716,7 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
         self.assertEqual(query_payload, {
             'attachments': [],
             'mailbox': 'INBOX',
-            'msg': 'json body',
+            'msg': '<p>json body</p>',
             'status': True,
             'time': 'Fri, 21 Aug 2026 10:00:00 +0000 (UTC)',
         })
