@@ -4,9 +4,11 @@ import html
 import hashlib
 import hmac
 import io
+import re
 import secrets
 import sqlite3
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -1068,6 +1070,166 @@ def _recipient_link_public_json_response(payload: dict[str, Any], status: int = 
     return response
 
 
+class _RecipientLinkHTMLTextExtractor(HTMLParser):
+    _BLOCK_TAGS = {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "br",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "figcaption",
+        "figure",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    }
+    _SKIP_TAGS = {"script", "style"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs):
+        tag = str(tag or "").lower()
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if tag in self._BLOCK_TAGS:
+            self._append_newline()
+
+    def handle_endtag(self, tag: str):
+        tag = str(tag or "").lower()
+        if tag in self._SKIP_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if tag in self._BLOCK_TAGS:
+            self._append_newline()
+
+    def handle_data(self, data: str):
+        if self._skip_depth:
+            return
+        value = str(data or "").strip()
+        if value:
+            self._parts.append(value)
+
+    def _append_newline(self):
+        if not self._parts or self._parts[-1] != "\n":
+            self._parts.append("\n")
+
+    def text(self) -> str:
+        return "".join(self._parts)
+
+
+def _recipient_link_plain_message_body(message: dict[str, Any]) -> str:
+    body = str(message.get("body") or "")
+    if str(message.get("body_type") or "").strip().lower() == "html":
+        parser = _RecipientLinkHTMLTextExtractor()
+        try:
+            parser.feed(body)
+            body = parser.text()
+        except Exception:
+            body = re.sub(r"<[^>]+>", " ", body)
+    body = html.unescape(body)
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    body = re.sub(r"[ \t\f\v]+", " ", body)
+    body = re.sub(r" *\n *", "\n", body)
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    return body.replace("\n", "\r\n")
+
+
+def _recipient_link_query_time(value: Any) -> str:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return ""
+    parsed: datetime | None = None
+    try:
+        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+
+            parsed = parsedate_to_datetime(raw_value)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return raw_value
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc).replace(microsecond=0)
+    weekdays = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    return (
+        f"{weekdays[parsed.weekday()]}, {parsed.day:02d} {months[parsed.month - 1]} "
+        f"{parsed.year:04d} {parsed.hour:02d}:{parsed.minute:02d}:{parsed.second:02d} +0000 (UTC)"
+    )
+
+
+def _recipient_link_query_mailbox(message: dict[str, Any]) -> str:
+    mailbox = str(message.get("mailbox") or message.get("folder") or "").strip()
+    if mailbox:
+        return mailbox.upper()
+    return "INBOX"
+
+
+def _recipient_link_public_query_payload(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("success"):
+        messages = result.get("messages") or []
+        message = dict(messages[0] or {}) if messages else {}
+        return {
+            "attachments": [],
+            "mailbox": _recipient_link_query_mailbox(message),
+            "msg": _recipient_link_plain_message_body(message),
+            "status": True,
+            "time": _recipient_link_query_time(message.get("received_at")),
+        }
+
+    return {
+        "attachments": [],
+        "mailbox": "INBOX",
+        "msg": str(result.get("error") or "未找到匹配邮件"),
+        "status": False,
+        "time": "",
+    }
+
+
+def _recipient_link_public_query_error(message: str, status: int):
+    return _recipient_link_public_json_response(
+        {
+            "attachments": [],
+            "mailbox": "INBOX",
+            "msg": message,
+            "status": False,
+            "time": "",
+        },
+        status,
+    )
+
+
 def _recipient_link_message_srcdoc(message: dict[str, Any]) -> str:
     body = str(message.get("body") or "")
     if str(message.get("body_type") or "").strip().lower() == "html":
@@ -1156,18 +1318,18 @@ def _recipient_link_public_mailbox_response(shared: str, recipient_email: str, *
     row = resolve_recipient_link_public(shared, recipient_email)
     if row is None:
         if response_format == "json":
-            return _recipient_link_public_json_response({"success": False, "error": "链接不存在"}, 404)
+            return _recipient_link_public_query_error("链接不存在", 404)
         return recipient_link_html_response("链接不存在", 404)
 
     expires_at = str(row["expires_at"] or "").strip()
     if expires_at and expires_at <= recipient_link_timestamp():
         if response_format == "json":
-            return _recipient_link_public_json_response({"success": False, "error": "链接已过期"}, 410)
+            return _recipient_link_public_query_error("链接已过期", 410)
         return recipient_link_html_response("链接已过期", 410)
 
     if not row["bound_account_exists"]:
         if response_format == "json":
-            return _recipient_link_public_json_response({"success": False, "error": "链接不存在"}, 404)
+            return _recipient_link_public_query_error("链接不存在", 404)
         return recipient_link_html_response("链接不存在", 404)
 
     if CLUSTER_CONFIG.is_replica:
@@ -1179,9 +1341,7 @@ def _recipient_link_public_mailbox_response(shared: str, recipient_email: str, *
         )
         if not is_ready:
             if response_format == "json":
-                response = _replica_readiness_error_response(error_code, "json")
-                response.headers["X-Robots-Tag"] = "noindex"
-                return response
+                return _recipient_link_public_query_error(error_code, 503)
             response = _replica_readiness_error_response(error_code, "html")
             response.headers["X-Robots-Tag"] = "noindex"
             return response
@@ -1189,7 +1349,7 @@ def _recipient_link_public_mailbox_response(shared: str, recipient_email: str, *
     account = get_account_by_id(int(row["account_id"]))
     if not account:
         if response_format == "json":
-            return _recipient_link_public_json_response({"success": False, "error": "链接不存在"}, 404)
+            return _recipient_link_public_query_error("链接不存在", 404)
         return recipient_link_html_response("链接不存在", 404)
 
     if not CLUSTER_CONFIG.is_replica:
@@ -1210,7 +1370,7 @@ def _recipient_link_public_mailbox_response(shared: str, recipient_email: str, *
     if response_format == "json":
         result = find_public_mailbox_messages(account, requested_recipient, 1)
         status = int(result.get("status") or (200 if result.get("success") else 502))
-        payload = {key: value for key, value in result.items() if key != "status"}
+        payload = _recipient_link_public_query_payload(result)
         return _recipient_link_public_json_response(payload, status)
 
     show_all = _recipient_link_public_show_all_requested()

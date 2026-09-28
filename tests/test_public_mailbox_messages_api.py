@@ -2612,7 +2612,14 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
 
         self.assertEqual(query_response.status_code, 200)
         self.assertTrue(query_response.content_type.startswith('application/json'))
-        self.assertTrue(query_response.get_json()['success'])
+        query_payload = query_response.get_json()
+        self.assertEqual(query_payload, {
+            'attachments': [],
+            'mailbox': 'INBOX',
+            'msg': 'json body',
+            'status': True,
+            'time': 'Fri, 21 Aug 2026 10:00:00 +0000 (UTC)',
+        })
         self.assert_public_token_headers(query_response)
         account_mock.assert_called_once_with(int(link['account_id']))
         search_mock.assert_called_once_with(
