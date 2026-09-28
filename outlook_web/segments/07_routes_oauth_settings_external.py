@@ -1539,7 +1539,7 @@ def _public_mailbox_cache_seconds(name: str, default: float, maximum: float = 30
 
 PUBLIC_MAILBOX_RESULT_CACHE_SECONDS = _public_mailbox_cache_seconds(
     "PUBLIC_MAILBOX_RESULT_CACHE_SECONDS",
-    15.0,
+    8.0,
 )
 PUBLIC_MAILBOX_EMPTY_CACHE_SECONDS = _public_mailbox_cache_seconds(
     "PUBLIC_MAILBOX_EMPTY_CACHE_SECONDS",
@@ -1992,6 +1992,8 @@ def public_mailbox_message_key(item: Dict[str, Any]) -> tuple:
 PUBLIC_MAILBOX_RESULT_CACHE_LOCK = threading.Lock()
 PUBLIC_MAILBOX_RESULT_CACHE: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
 PUBLIC_MAILBOX_RESULT_CACHE_MAX_ENTRIES = 512
+PUBLIC_MAILBOX_INFLIGHT_LOCK = threading.Lock()
+PUBLIC_MAILBOX_INFLIGHT_REQUESTS: Dict[tuple, Dict[str, Any]] = {}
 
 
 def public_mailbox_result_cache_key(account: Dict[str, Any], recipient: str, limit: int) -> tuple:
@@ -2056,9 +2058,74 @@ def cache_public_mailbox_result(account: Dict[str, Any], recipient: str, limit: 
     return result
 
 
+def begin_public_mailbox_inflight_result(key: tuple) -> tuple[bool, Dict[str, Any]]:
+    with PUBLIC_MAILBOX_INFLIGHT_LOCK:
+        entry = PUBLIC_MAILBOX_INFLIGHT_REQUESTS.get(key)
+        if entry is not None:
+            return False, entry
+        entry = {
+            'event': threading.Event(),
+            'result': None,
+        }
+        PUBLIC_MAILBOX_INFLIGHT_REQUESTS[key] = entry
+        return True, entry
+
+
+def wait_public_mailbox_inflight_result(key: tuple, entry: Dict[str, Any]) -> Dict[str, Any]:
+    event = entry.get('event')
+    if not isinstance(event, threading.Event):
+        return {
+            'success': False,
+            'status': 502,
+            'error': '邮箱服务查询失败',
+        }
+    timeout_seconds = max(
+        0.1,
+        float(PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS or 0) + 1.0,
+    )
+    if not event.wait(timeout_seconds):
+        try:
+            app.logger.warning(
+                "PUBLIC_MAILBOX_SINGLEFLIGHT_TIMEOUT key=%s wait=%ss",
+                key,
+                timeout_seconds,
+            )
+        except Exception:
+            pass
+        return {
+            'success': False,
+            'status': 504,
+            'error': '邮箱服务查询超时',
+        }
+    result = entry.get('result')
+    if isinstance(result, dict):
+        return copy.deepcopy(result)
+    return {
+        'success': False,
+        'status': 502,
+        'error': '邮箱服务查询失败',
+    }
+
+
+def finish_public_mailbox_inflight_result(key: tuple, entry: Dict[str, Any], result: Dict[str, Any]) -> None:
+    with PUBLIC_MAILBOX_INFLIGHT_LOCK:
+        if PUBLIC_MAILBOX_INFLIGHT_REQUESTS.get(key) is entry:
+            PUBLIC_MAILBOX_INFLIGHT_REQUESTS.pop(key, None)
+        entry['result'] = copy.deepcopy(result)
+        event = entry.get('event')
+        if isinstance(event, threading.Event):
+            event.set()
+
+
 def clear_public_mailbox_result_cache() -> None:
     with PUBLIC_MAILBOX_RESULT_CACHE_LOCK:
         PUBLIC_MAILBOX_RESULT_CACHE.clear()
+    with PUBLIC_MAILBOX_INFLIGHT_LOCK:
+        for entry in PUBLIC_MAILBOX_INFLIGHT_REQUESTS.values():
+            event = entry.get('event')
+            if isinstance(event, threading.Event):
+                event.set()
+        PUBLIC_MAILBOX_INFLIGHT_REQUESTS.clear()
 
 
 def build_public_mailbox_message(
@@ -2084,6 +2151,49 @@ def find_public_mailbox_messages(
     cached_result = get_public_mailbox_cached_result(account, recipient, limit)
     if cached_result is not None:
         return cached_result
+
+    cache_key = public_mailbox_result_cache_key(account, recipient, limit)
+    is_owner, inflight_entry = begin_public_mailbox_inflight_result(cache_key)
+    if not is_owner:
+        return wait_public_mailbox_inflight_result(cache_key, inflight_entry)
+
+    result: Dict[str, Any]
+    try:
+        cached_result = get_public_mailbox_cached_result(account, recipient, limit)
+        if cached_result is not None:
+            result = cached_result
+        else:
+            result = find_public_mailbox_messages_uncached(account, recipient, limit)
+    except Exception as exc:
+        if is_timeout_like_exception(exc):
+            result = {
+                'success': False,
+                'status': 504,
+                'error': '邮箱服务查询超时',
+            }
+        else:
+            result = {
+                'success': False,
+                'status': 502,
+                'error': '邮箱服务查询失败',
+            }
+            try:
+                app.logger.exception(
+                    "PUBLIC_MAILBOX_FIND_FAILED account_id=%s recipient=%s",
+                    account.get('id'),
+                    recipient,
+                )
+            except Exception:
+                pass
+    finish_public_mailbox_inflight_result(cache_key, inflight_entry, result)
+    return result
+
+
+def find_public_mailbox_messages_uncached(
+    account: Dict[str, Any],
+    recipient: str,
+    limit: int,
+) -> Dict[str, Any]:
 
     matches: List[Dict[str, Any]] = []
     seen = set()
