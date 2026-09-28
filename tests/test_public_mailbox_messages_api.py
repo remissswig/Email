@@ -2606,7 +2606,10 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
         ) as account_mock, patch.object(
             web_outlook_app,
             'find_public_mailbox_messages',
-            return_value=self.success_result(body='<p>json body</p>', body_type='html'),
+            return_value=self.success_result(
+                body='<html><body><div>Hello<br><br>Your code is: 123456.<br><br>Yours,<br>Team<br></div></body></html>',
+                body_type='html',
+            ),
         ) as search_mock:
             query_response = self.client.get(f"/query/{shared}/Recipient01@iCloud.com")
 
@@ -2616,7 +2619,7 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
         self.assertEqual(query_payload, {
             'attachments': [],
             'mailbox': 'INBOX',
-            'msg': '<p>json body</p>',
+            'msg': 'Hello\r\n\r\nYour code is: 123456.\r\n\r\nYours,\r\nTeam\r\n',
             'status': True,
             'time': 'Fri, 21 Aug 2026 10:00:00 +0000 (UTC)',
         })
