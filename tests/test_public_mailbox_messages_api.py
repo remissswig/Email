@@ -540,7 +540,11 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertTrue(result['success'])
         self.assertEqual(result['count'], 1)
         self.assertEqual(result['messages'][0]['body'], '<p>fast body</p>')
-        graph_search_mock.assert_called_once_with(account, 'inbox', 'target@example.com', 1)
+        self.assertEqual(graph_search_mock.call_args_list, [
+            call(account, 'inbox', 'target@example.com', 1),
+            call(account, 'junkemail', 'target@example.com', 1),
+            call(account, 'deleteditems', 'target@example.com', 1),
+        ])
         scan_mock.assert_not_called()
         detail_mock.assert_not_called()
 
@@ -582,7 +586,11 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
 
         self.assertTrue(first['success'])
         self.assertEqual(first, second)
-        graph_search_mock.assert_called_once_with(account, 'inbox', 'target@example.com', 1)
+        self.assertEqual(graph_search_mock.call_args_list, [
+            call(account, 'inbox', 'target@example.com', 1),
+            call(account, 'junkemail', 'target@example.com', 1),
+            call(account, 'deleteditems', 'target@example.com', 1),
+        ])
 
     def test_concurrent_same_public_mailbox_lookup_shares_inflight_result(self):
         account = {
@@ -704,9 +712,8 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         }
 
         def graph_side_effect(_account, folder, recipient, limit):
-            self.assertEqual(folder, 'inbox')
             self.assertEqual(limit, 1)
-            if recipient == 'owner@outlook.com':
+            if folder == 'inbox' and recipient == 'owner@outlook.com':
                 return {
                     'success': True,
                     'emails': [matching],
@@ -740,6 +747,83 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertEqual(graph_search_mock.call_args_list, [
             call(account, 'inbox', 'owner+tag@outlook.com', 1),
             call(account, 'inbox', 'owner@outlook.com', 1),
+            call(account, 'junkemail', 'owner+tag@outlook.com', 1),
+            call(account, 'junkemail', 'owner@outlook.com', 1),
+            call(account, 'deleteditems', 'owner+tag@outlook.com', 1),
+            call(account, 'deleteditems', 'owner@outlook.com', 1),
+        ])
+        scan_mock.assert_not_called()
+
+    def test_outlook_graph_recipient_search_uses_latest_match_across_folders(self):
+        account = {
+            **self.account,
+            'client_id': 'client-id',
+            'refresh_token': 'refresh-token',
+        }
+        old_inbox = {
+            **self.item('old-inbox', 'target@example.com', '2026-08-21T12:00:00Z'),
+            '_detail': {
+                'id': 'old-inbox',
+                'subject': 'Old inbox',
+                'from': 'sender@example.com',
+                'to': 'target@example.com',
+                'date': '2026-08-21T12:00:00Z',
+                'body': '<p>old</p>',
+                'body_type': 'html',
+            },
+        }
+        new_junk = {
+            **self.item('new-junk', 'target@example.com', '2026-08-22T12:00:00Z'),
+            'folder': 'junkemail',
+            '_detail': {
+                'id': 'new-junk',
+                'subject': 'New junk',
+                'from': 'sender@example.com',
+                'to': 'target@example.com',
+                'date': '2026-08-22T12:00:00Z',
+                'body': '<p>new</p>',
+                'body_type': 'html',
+            },
+        }
+
+        def graph_side_effect(_account, folder, recipient, limit):
+            self.assertEqual(recipient, 'target@example.com')
+            self.assertEqual(limit, 1)
+            if folder == 'inbox':
+                emails = [old_inbox]
+            elif folder == 'junkemail':
+                emails = [new_junk]
+            else:
+                emails = []
+            return {
+                'success': True,
+                'emails': emails,
+                'recipient_search_supported': True,
+                'request_method': 'graph',
+            }
+
+        with patch.object(
+            web_outlook_app,
+            'fetch_account_graph_emails_by_recipient',
+            side_effect=graph_side_effect,
+        ) as graph_search_mock, patch.object(
+            web_outlook_app,
+            'fetch_account_emails',
+            return_value={'success': True, 'emails': [], 'has_more': False},
+        ) as scan_mock:
+            result = web_outlook_app.find_public_mailbox_messages(
+                account,
+                'target@example.com',
+                1,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['messages'][0]['id'], 'new-junk')
+        self.assertEqual(result['messages'][0]['body'], '<p>new</p>')
+        self.assertEqual(graph_search_mock.call_args_list, [
+            call(account, 'inbox', 'target@example.com', 1),
+            call(account, 'junkemail', 'target@example.com', 1),
+            call(account, 'deleteditems', 'target@example.com', 1),
         ])
         scan_mock.assert_not_called()
 

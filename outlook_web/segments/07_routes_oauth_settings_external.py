@@ -2215,6 +2215,7 @@ def find_public_mailbox_messages_uncached(
             include_gmail_suffix=False,
         ) or [recipient]
         for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
+            folder_has_matches = False
             for graph_recipient in graph_recipient_candidates:
                 graph_result = call_public_mailbox_upstream(
                     fetch_account_graph_emails_by_recipient,
@@ -2238,11 +2239,12 @@ def find_public_mailbox_messages_uncached(
                     seen.add(key)
                     item['_request_method'] = 'graph'
                     matches.append(item)
+                    folder_has_matches = True
 
-                if matches:
+                if folder_has_matches:
                     break
 
-            if matches or not fast_search_complete:
+            if not fast_search_complete:
                 break
 
         if matches:
