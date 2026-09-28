@@ -1526,8 +1526,36 @@ def _public_mailbox_fetch_timeout_seconds() -> float:
 
 
 PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS = _public_mailbox_fetch_timeout_seconds()
-PUBLIC_MAILBOX_RESULT_CACHE_SECONDS = float(os.getenv("PUBLIC_MAILBOX_RESULT_CACHE_SECONDS", "8"))
-PUBLIC_MAILBOX_ERROR_CACHE_SECONDS = float(os.getenv("PUBLIC_MAILBOX_ERROR_CACHE_SECONDS", "5"))
+
+
+def _public_mailbox_cache_seconds(name: str, default: float, maximum: float = 300.0) -> float:
+    raw_value = str(os.getenv(name, str(default)) or "").strip()
+    try:
+        value = float(raw_value)
+    except ValueError:
+        value = default
+    return max(0.0, min(value, maximum))
+
+
+PUBLIC_MAILBOX_RESULT_CACHE_SECONDS = _public_mailbox_cache_seconds(
+    "PUBLIC_MAILBOX_RESULT_CACHE_SECONDS",
+    15.0,
+)
+PUBLIC_MAILBOX_EMPTY_CACHE_SECONDS = _public_mailbox_cache_seconds(
+    "PUBLIC_MAILBOX_EMPTY_CACHE_SECONDS",
+    5.0,
+    60.0,
+)
+PUBLIC_MAILBOX_ERROR_CACHE_SECONDS = _public_mailbox_cache_seconds(
+    "PUBLIC_MAILBOX_ERROR_CACHE_SECONDS",
+    10.0,
+    120.0,
+)
+PUBLIC_MAILBOX_IMAP_AUTH_ERROR_CACHE_SECONDS = _public_mailbox_cache_seconds(
+    "PUBLIC_MAILBOX_IMAP_AUTH_ERROR_CACHE_SECONDS",
+    60.0,
+    300.0,
+)
 
 
 def _public_mailbox_upstream_concurrency() -> int:
@@ -1773,7 +1801,36 @@ def public_mailbox_payload_is_throttled(value: Any) -> bool:
     return False
 
 
+def public_mailbox_payload_is_imap_auth_failed(value: Any) -> bool:
+    if isinstance(value, dict):
+        code = str(
+            value.get("code")
+            or value.get("error_code")
+            or value.get("errorCode")
+            or ""
+        ).upper()
+        if code in {"IMAP_AUTH_FAILED", "IMAP_LOGIN_FAILED"}:
+            return True
+        return any(
+            public_mailbox_payload_is_imap_auth_failed(item)
+            for item in value.values()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(
+            public_mailbox_payload_is_imap_auth_failed(item)
+            for item in value
+        )
+    return False
+
+
 def public_mailbox_upstream_error(value: Any) -> Dict[str, Any]:
+    if public_mailbox_payload_is_imap_auth_failed(value):
+        return {
+            "success": False,
+            "status": 401,
+            "error": "主邮箱 IMAP 授权失败，请检查 iCloud 应用专用密码",
+            "error_code": "IMAP_AUTH_FAILED",
+        }
     if public_mailbox_payload_is_throttled(value):
         return {
             'success': False,
@@ -1966,8 +2023,14 @@ def get_public_mailbox_cached_result(account: Dict[str, Any], recipient: str, li
 def public_mailbox_result_cache_ttl(result: Dict[str, Any]) -> float:
     if result.get('success'):
         return max(0.0, float(PUBLIC_MAILBOX_RESULT_CACHE_SECONDS or 0))
+    if int(result.get('status') or 0) == 401 and (
+        result.get('error_code') == 'IMAP_AUTH_FAILED'
+    ):
+        return max(0.0, float(PUBLIC_MAILBOX_IMAP_AUTH_ERROR_CACHE_SECONDS or 0))
     if int(result.get('status') or 0) == 429:
         return PUBLIC_MAILBOX_BUSY_ERROR_CACHE_SECONDS
+    if int(result.get('status') or 0) == 404:
+        return max(0.0, float(PUBLIC_MAILBOX_EMPTY_CACHE_SECONDS or 0))
     if int(result.get('status') or 0) in {502, 504}:
         return max(0.0, float(PUBLIC_MAILBOX_ERROR_CACHE_SECONDS or 0))
     return 0.0
@@ -2120,11 +2183,16 @@ def find_public_mailbox_messages(
                     public_mailbox_upstream_error(folder_errors[0]),
                 )
             if not matches:
-                return {
-                    'success': False,
-                    'status': 404,
-                    'error': '未找到匹配邮件',
-                }
+                return cache_public_mailbox_result(
+                    account,
+                    recipient,
+                    limit,
+                    {
+                        'success': False,
+                        'status': 404,
+                        'error': '未找到匹配邮件',
+                    },
+                )
 
     if should_scan:
         for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
@@ -2179,17 +2247,22 @@ def find_public_mailbox_messages(
     )
     if not matches:
         scan_limit_reached = scanned_count >= scan_limit and candidates_remain
-        return {
-            'success': False,
-            'status': 404,
-            'error': (
-                '未在扫描范围内找到匹配邮件'
-                if scan_limit_reached
-                else '未找到匹配邮件'
-            ),
-            'scan_limit_reached': scan_limit_reached,
-            'scanned_count': scanned_count,
-        }
+        return cache_public_mailbox_result(
+            account,
+            recipient,
+            limit,
+            {
+                'success': False,
+                'status': 404,
+                'error': (
+                    '未在扫描范围内找到匹配邮件'
+                    if scan_limit_reached
+                    else '未找到匹配邮件'
+                ),
+                'scan_limit_reached': scan_limit_reached,
+                'scanned_count': scanned_count,
+            },
+        )
 
     messages = []
     requires_delivery_header_match = public_mailbox_requires_delivery_header_match(recipient)
@@ -2238,17 +2311,22 @@ def find_public_mailbox_messages(
 
     if not messages:
         scan_limit_reached = scanned_count >= scan_limit and candidates_remain
-        return {
-            'success': False,
-            'status': 404,
-            'error': (
-                '未在扫描范围内找到匹配邮件'
-                if scan_limit_reached
-                else '未找到匹配邮件'
-            ),
-            'scan_limit_reached': scan_limit_reached,
-            'scanned_count': scanned_count,
-        }
+        return cache_public_mailbox_result(
+            account,
+            recipient,
+            limit,
+            {
+                'success': False,
+                'status': 404,
+                'error': (
+                    '未在扫描范围内找到匹配邮件'
+                    if scan_limit_reached
+                    else '未找到匹配邮件'
+                ),
+                'scan_limit_reached': scan_limit_reached,
+                'scanned_count': scanned_count,
+            },
+        )
 
     result = {
         'success': True,
