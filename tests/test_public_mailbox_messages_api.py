@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -582,6 +583,105 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertTrue(first['success'])
         self.assertEqual(first, second)
         graph_search_mock.assert_called_once_with(account, 'inbox', 'target@example.com', 1)
+
+    def test_concurrent_same_public_mailbox_lookup_shares_inflight_result(self):
+        account = {
+            **self.account,
+            'client_id': 'client-id',
+            'refresh_token': 'refresh-token',
+        }
+        matching = {
+            **self.item('singleflight-match', 'target@example.com', '2026-08-21T12:00:00Z'),
+            '_detail': {
+                'id': 'singleflight-match',
+                'subject': 'Singleflight match',
+                'from': 'sender@example.com',
+                'to': 'target@example.com',
+                'date': '2026-08-21T12:00:00Z',
+                'body': '<p>shared body</p>',
+                'body_type': 'html',
+            },
+        }
+        started = threading.Event()
+        release = threading.Event()
+        results = []
+
+        def slow_graph_search(*_args):
+            started.set()
+            self.assertTrue(release.wait(2))
+            return {
+                'success': True,
+                'emails': [matching],
+                'recipient_search_supported': True,
+                'request_method': 'graph',
+            }
+
+        def run_lookup():
+            results.append(web_outlook_app.find_public_mailbox_messages(
+                account,
+                'target@example.com',
+                1,
+            ))
+
+        with patch.object(
+            web_outlook_app,
+            'fetch_account_graph_emails_by_recipient',
+            side_effect=slow_graph_search,
+        ) as graph_search_mock:
+            first_thread = threading.Thread(target=run_lookup)
+            second_thread = threading.Thread(target=run_lookup)
+            first_thread.start()
+            self.assertTrue(started.wait(2))
+            second_thread.start()
+            release.set()
+            first_thread.join(2)
+            second_thread.join(2)
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result['success'] for result in results))
+        self.assertEqual(results[0], results[1])
+        graph_search_mock.assert_called_once_with(account, 'inbox', 'target@example.com', 1)
+
+    def test_public_mailbox_upstream_calls_are_limited_per_account(self):
+        account = {
+            **self.account,
+            'id': 708,
+            'email': 'limited-account@example.com',
+        }
+        started = threading.Event()
+        release = threading.Event()
+        first_result = []
+
+        def slow_fetch(*_args):
+            started.set()
+            self.assertTrue(release.wait(2))
+            return {'success': True, 'emails': [], 'has_more': False}
+
+        def run_first_call():
+            first_result.append(web_outlook_app.call_public_mailbox_upstream(
+                slow_fetch,
+                account,
+            ))
+
+        with patch.object(
+            web_outlook_app,
+            'PUBLIC_MAILBOX_ACCOUNT_LOCK_ACQUIRE_TIMEOUT_SECONDS',
+            0.05,
+        ):
+            first_thread = threading.Thread(target=run_first_call)
+            first_thread.start()
+            self.assertTrue(started.wait(2))
+            second_result = web_outlook_app.call_public_mailbox_upstream(
+                slow_fetch,
+                account,
+            )
+            release.set()
+            first_thread.join(2)
+
+        self.assertEqual(first_result, [{'success': True, 'emails': [], 'has_more': False}])
+        self.assertFalse(second_result['success'])
+        self.assertEqual(second_result['error']['code'], 'EMAIL_FETCH_THROTTLED')
+        self.assertEqual(second_result['error']['status'], 429)
 
     def test_outlook_plus_recipient_uses_graph_base_address_candidate_before_scan(self):
         account = {
