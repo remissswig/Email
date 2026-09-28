@@ -4,11 +4,9 @@ import html
 import hashlib
 import hmac
 import io
-import re
 import secrets
 import sqlite3
 from datetime import datetime, timezone
-from html.parser import HTMLParser
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -1070,96 +1068,12 @@ def _recipient_link_public_json_response(payload: dict[str, Any], status: int = 
     return response
 
 
-class _RecipientLinkHTMLTextExtractor(HTMLParser):
-    _BLOCK_TAGS = {
-        "address",
-        "article",
-        "aside",
-        "blockquote",
-        "br",
-        "dd",
-        "div",
-        "dl",
-        "dt",
-        "figcaption",
-        "figure",
-        "footer",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "header",
-        "hr",
-        "li",
-        "main",
-        "nav",
-        "ol",
-        "p",
-        "pre",
-        "section",
-        "table",
-        "tbody",
-        "td",
-        "tfoot",
-        "th",
-        "thead",
-        "tr",
-        "ul",
-    }
-    _SKIP_TAGS = {"script", "style"}
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self._parts: list[str] = []
-        self._skip_depth = 0
-
-    def handle_starttag(self, tag: str, attrs):
-        tag = str(tag or "").lower()
-        if tag in self._SKIP_TAGS:
-            self._skip_depth += 1
-            return
-        if tag in self._BLOCK_TAGS:
-            self._append_newline()
-
-    def handle_endtag(self, tag: str):
-        tag = str(tag or "").lower()
-        if tag in self._SKIP_TAGS:
-            self._skip_depth = max(0, self._skip_depth - 1)
-            return
-        if tag in self._BLOCK_TAGS:
-            self._append_newline()
-
-    def handle_data(self, data: str):
-        if self._skip_depth:
-            return
-        value = str(data or "").strip()
-        if value:
-            self._parts.append(value)
-
-    def _append_newline(self):
-        if not self._parts or self._parts[-1] != "\n":
-            self._parts.append("\n")
-
-    def text(self) -> str:
-        return "".join(self._parts)
-
-
-def _recipient_link_plain_message_body(message: dict[str, Any]) -> str:
+def _recipient_link_query_message_body(message: dict[str, Any]) -> str:
     body = str(message.get("body") or "")
     if str(message.get("body_type") or "").strip().lower() == "html":
-        parser = _RecipientLinkHTMLTextExtractor()
-        try:
-            parser.feed(body)
-            body = parser.text()
-        except Exception:
-            body = re.sub(r"<[^>]+>", " ", body)
-    body = html.unescape(body)
+        return body
+
     body = body.replace("\r\n", "\n").replace("\r", "\n")
-    body = re.sub(r"[ \t\f\v]+", " ", body)
-    body = re.sub(r" *\n *", "\n", body)
-    body = re.sub(r"\n{3,}", "\n\n", body).strip()
     return body.replace("\n", "\r\n")
 
 
@@ -1203,7 +1117,7 @@ def _recipient_link_public_query_payload(result: dict[str, Any]) -> dict[str, An
         return {
             "attachments": [],
             "mailbox": _recipient_link_query_mailbox(message),
-            "msg": _recipient_link_plain_message_body(message),
+            "msg": _recipient_link_query_message_body(message),
             "status": True,
             "time": _recipient_link_query_time(message.get("received_at")),
         }
