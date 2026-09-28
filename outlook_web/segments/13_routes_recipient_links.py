@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 from datetime import datetime, timezone
 from functools import wraps
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlencode
@@ -1068,13 +1069,100 @@ def _recipient_link_public_json_response(payload: dict[str, Any], status: int = 
     return response
 
 
+class _RecipientLinkQueryHTMLTextExtractor(HTMLParser):
+    _BLOCK_TAGS = {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "figcaption",
+        "figure",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    }
+    _SKIP_TAGS = {"script", "style"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs):
+        tag = str(tag or "").lower()
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if tag == "br":
+            self._append_newline(force=True)
+            return
+        if tag in self._BLOCK_TAGS and self._parts:
+            self._append_newline()
+
+    def handle_endtag(self, tag: str):
+        tag = str(tag or "").lower()
+        if tag in self._SKIP_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if tag in self._BLOCK_TAGS:
+            self._append_newline()
+
+    def handle_data(self, data: str):
+        if self._skip_depth:
+            return
+        value = html.unescape(str(data or "")).strip()
+        if value:
+            self._parts.append(value)
+
+    def _append_newline(self, *, force: bool = False):
+        if force or not self._parts or self._parts[-1] != "\n":
+            self._parts.append("\n")
+
+    def text(self) -> str:
+        return "".join(self._parts)
+
+
+def _recipient_link_normalize_query_text(value: str) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in text.split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    return "\r\n".join(lines)
+
+
 def _recipient_link_query_message_body(message: dict[str, Any]) -> str:
     body = str(message.get("body") or "")
     if str(message.get("body_type") or "").strip().lower() == "html":
-        return body
+        parser = _RecipientLinkQueryHTMLTextExtractor()
+        parser.feed(body)
+        body = parser.text()
 
-    body = body.replace("\r\n", "\n").replace("\r", "\n")
-    return body.replace("\n", "\r\n")
+    return _recipient_link_normalize_query_text(body)
 
 
 def _recipient_link_query_time(value: Any) -> str:
