@@ -397,7 +397,8 @@ def get_access_token_graph(client_id: str, refresh_token: str, proxy_url: str = 
 
 def get_emails_graph(client_id: str, refresh_token: str, folder: str = 'inbox', skip: int = 0,
                      top: int = 20, proxy_url: str = None,
-                     fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
+                     fallback_proxy_urls: Optional[List[str]] = None,
+                     include_body: bool = False) -> Dict[str, Any]:
     """使用 Graph API 获取邮件列表（支持分页和文件夹选择）"""
     token_result = get_access_token_graph_result(client_id, refresh_token, proxy_url, fallback_proxy_urls)
     if not token_result.get("success"):
@@ -417,15 +418,18 @@ def get_emails_graph(client_id: str, refresh_token: str, folder: str = 'inbox', 
         folder_name = folder_map.get(folder.lower(), 'inbox')
 
         url = f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder_name}/messages"
+        selected_fields = "id,subject,from,toRecipients,receivedDateTime,isRead,hasAttachments,bodyPreview"
+        if include_body:
+            selected_fields += ",body"
         params = {
             "$top": top,
             "$skip": skip,
-            "$select": "id,subject,from,toRecipients,receivedDateTime,isRead,hasAttachments,bodyPreview",
+            "$select": selected_fields,
             "$orderby": "receivedDateTime desc"
         }
         headers = {
             "Authorization": f"Bearer {access_token}",
-            "Prefer": "outlook.body-content-type='text'"
+            "Prefer": "outlook.body-content-type='html'" if include_body else "outlook.body-content-type='text'"
         }
 
         res = get_with_proxy_fallback(
