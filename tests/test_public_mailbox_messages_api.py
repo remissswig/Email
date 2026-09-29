@@ -746,6 +746,62 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         graph_search_mock.assert_not_called()
         detail_mock.assert_not_called()
 
+    def test_concurrent_same_account_snapshot_miss_does_not_fan_out_graph_search(self):
+        account = {
+            **self.account,
+            'id': 710,
+            'client_id': 'client-id',
+            'refresh_token': 'refresh-token',
+        }
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def snapshot_page(_account, _folder, _top):
+            return {
+                'success': True,
+                'emails': [],
+                'has_more': True,
+                'request_method': 'graph',
+            }
+
+        def run_lookup(recipient):
+            barrier.wait(2)
+            results[recipient] = web_outlook_app.find_public_mailbox_messages(
+                account,
+                recipient,
+                1,
+            )
+
+        with patch.object(
+            web_outlook_app,
+            'PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_COALESCE_SECONDS',
+            0.1,
+        ), patch.object(
+            web_outlook_app,
+            'fetch_public_mailbox_account_snapshot_page',
+            side_effect=snapshot_page,
+        ) as snapshot_mock, patch.object(
+            web_outlook_app,
+            'fetch_account_graph_emails_by_recipient',
+            return_value={'success': True, 'emails': [], 'recipient_search_supported': True},
+        ) as graph_search_mock:
+            threads = [
+                threading.Thread(target=run_lookup, args=('alpha@example.com',)),
+                threading.Thread(target=run_lookup, args=('beta@example.com',)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+
+        self.assertEqual(set(results), {'alpha@example.com', 'beta@example.com'})
+        self.assertTrue(all(not result['success'] for result in results.values()))
+        self.assertTrue(all(result['status'] == 404 for result in results.values()))
+        self.assertTrue(all(result['source'] == 'account_snapshot' for result in results.values()))
+        self.assertTrue(all(result['scan_limit_reached'] for result in results.values()))
+        self.assertEqual(snapshot_mock.call_count, len(web_outlook_app.PUBLIC_MAILBOX_SEARCH_FOLDERS))
+        graph_search_mock.assert_not_called()
+
     def test_public_mailbox_upstream_calls_are_limited_per_account(self):
         account = {
             **self.account,
