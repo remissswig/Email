@@ -2454,6 +2454,29 @@ def find_public_mailbox_messages_from_snapshot(
     return cache_public_mailbox_result(account, recipient, limit, result)
 
 
+def public_mailbox_snapshot_no_match_result(
+    account: Dict[str, Any],
+    recipient: str,
+    limit: int,
+    snapshot: Dict[str, Any],
+) -> Dict[str, Any]:
+    scan_limit_reached = bool(snapshot.get('candidates_remain'))
+    scanned_count = int(snapshot.get('scanned_count') or 0)
+    result = {
+        'success': False,
+        'status': 404,
+        'error': (
+            '未在扫描范围内找到匹配邮件'
+            if scan_limit_reached
+            else '未找到匹配邮件'
+        ),
+        'scan_limit_reached': scan_limit_reached,
+        'scanned_count': scanned_count,
+        'source': 'account_snapshot',
+    }
+    return cache_public_mailbox_result(account, recipient, limit, result)
+
+
 def find_public_mailbox_messages(
     account: Dict[str, Any],
     recipient: str,
@@ -2528,6 +2551,13 @@ def find_public_mailbox_messages_uncached(
     )
     if snapshot_result is not None:
         return snapshot_result
+    if isinstance(snapshot, dict) and snapshot.get('success'):
+        return public_mailbox_snapshot_no_match_result(
+            account,
+            recipient,
+            limit,
+            snapshot,
+        )
 
     if should_scan:
         fast_search_complete = True
