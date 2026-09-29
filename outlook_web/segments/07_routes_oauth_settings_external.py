@@ -1568,9 +1568,24 @@ def _public_mailbox_upstream_concurrency() -> int:
 
 
 PUBLIC_MAILBOX_UPSTREAM_CONCURRENCY = _public_mailbox_upstream_concurrency()
-PUBLIC_MAILBOX_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS = 0.25
+
+
+def _public_mailbox_upstream_acquire_timeout_seconds() -> float:
+    raw_value = str(
+        os.getenv("PUBLIC_MAILBOX_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS", "1.5") or "1.5"
+    ).strip()
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return 1.5
+    return max(0.25, min(value, 5.0))
+
+
+PUBLIC_MAILBOX_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS = (
+    _public_mailbox_upstream_acquire_timeout_seconds()
+)
 PUBLIC_MAILBOX_ACCOUNT_LOCK_ACQUIRE_TIMEOUT_SECONDS = float(
-    os.getenv("PUBLIC_MAILBOX_ACCOUNT_LOCK_ACQUIRE_TIMEOUT_SECONDS", "1.5") or "1.5"
+    os.getenv("PUBLIC_MAILBOX_ACCOUNT_LOCK_ACQUIRE_TIMEOUT_SECONDS", "3.0") or "3.0"
 )
 PUBLIC_MAILBOX_UPSTREAM_GATE = threading.BoundedSemaphore(
     PUBLIC_MAILBOX_UPSTREAM_CONCURRENCY,

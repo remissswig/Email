@@ -14,10 +14,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     GUNICORN_TIMEOUT=300 \
-    GUNICORN_THREADS=8 \
+    GUNICORN_THREADS=32 \
+    GUNICORN_BACKLOG=2048 \
     IMAP_TIMEOUT=45 \
     PUBLIC_MAILBOX_UPSTREAM_CONCURRENCY=3 \
-    PUBLIC_MAILBOX_ACCOUNT_LOCK_ACQUIRE_TIMEOUT_SECONDS=1.5 \
+    PUBLIC_MAILBOX_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS=1.5 \
+    PUBLIC_MAILBOX_ACCOUNT_LOCK_ACQUIRE_TIMEOUT_SECONDS=3.0 \
     PUBLIC_MAILBOX_RESULT_CACHE_SECONDS=8 \
     PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_SECONDS=8 \
     PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_COALESCE_SECONDS=0.05 \
@@ -43,4 +45,4 @@ RUN mkdir -p /app/data
 EXPOSE 5000
 
 # 启动应用（保持单 worker，使用线程提升慢请求容错）
-CMD ["sh", "-c", "gunicorn -k gthread -w 1 --threads ${GUNICORN_THREADS:-8} -b 0.0.0.0:5000 --timeout ${GUNICORN_TIMEOUT:-300} --graceful-timeout 30 --access-logfile - --error-logfile - --capture-output web_outlook_app:app"]
+CMD ["sh", "-c", "gunicorn -k gthread -w 1 --threads ${GUNICORN_THREADS:-32} --backlog ${GUNICORN_BACKLOG:-2048} -b 0.0.0.0:5000 --timeout ${GUNICORN_TIMEOUT:-300} --graceful-timeout 30 --access-logfile - --error-logfile - --capture-output web_outlook_app:app"]
