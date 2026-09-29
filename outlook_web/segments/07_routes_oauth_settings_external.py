@@ -1578,6 +1578,16 @@ PUBLIC_MAILBOX_UPSTREAM_GATE = threading.BoundedSemaphore(
 PUBLIC_MAILBOX_ACCOUNT_LOCKS: Dict[str, threading.Lock] = {}
 PUBLIC_MAILBOX_ACCOUNT_LOCKS_GUARD = threading.Lock()
 PUBLIC_MAILBOX_BUSY_ERROR_CACHE_SECONDS = 2.0
+PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_SECONDS = _public_mailbox_cache_seconds(
+    "PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_SECONDS",
+    8.0,
+    60.0,
+)
+PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_COALESCE_SECONDS = _public_mailbox_cache_seconds(
+    "PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_COALESCE_SECONDS",
+    0.05,
+    1.0,
+)
 PUBLIC_MAILBOX_FORMATS = {'html', 'json'}
 PUBLIC_MAILBOX_SEARCH_FOLDERS = ('inbox', 'junkemail', 'deleteditems')
 PUBLIC_MAILBOX_DELIVERY_HEADER_NAMES = {
@@ -1994,6 +2004,11 @@ PUBLIC_MAILBOX_RESULT_CACHE: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
 PUBLIC_MAILBOX_RESULT_CACHE_MAX_ENTRIES = 512
 PUBLIC_MAILBOX_INFLIGHT_LOCK = threading.Lock()
 PUBLIC_MAILBOX_INFLIGHT_REQUESTS: Dict[tuple, Dict[str, Any]] = {}
+PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_LOCK = threading.Lock()
+PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
+PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_MAX_ENTRIES = 128
+PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_INFLIGHT_LOCK = threading.Lock()
+PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_INFLIGHT: Dict[tuple, Dict[str, Any]] = {}
 
 
 def public_mailbox_result_cache_key(account: Dict[str, Any], recipient: str, limit: int) -> tuple:
@@ -2002,6 +2017,14 @@ def public_mailbox_result_cache_key(account: Dict[str, Any], recipient: str, lim
         normalize_email_address(account.get('email') or ''),
         normalize_email_address(recipient),
         int(limit or 1),
+    )
+
+
+def public_mailbox_account_snapshot_cache_key(account: Dict[str, Any], scan_limit: int) -> tuple:
+    return (
+        int(account.get('id') or 0),
+        normalize_email_address(account.get('email') or ''),
+        int(scan_limit or 0),
     )
 
 
@@ -2117,6 +2140,100 @@ def finish_public_mailbox_inflight_result(key: tuple, entry: Dict[str, Any], res
             event.set()
 
 
+def get_public_mailbox_cached_account_snapshot(
+    account: Dict[str, Any],
+    scan_limit: int,
+) -> Optional[Dict[str, Any]]:
+    ttl = max(0.0, float(PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_SECONDS or 0))
+    if ttl <= 0:
+        return None
+    key = public_mailbox_account_snapshot_cache_key(account, scan_limit)
+    now = time.time()
+    with PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_LOCK:
+        cached = PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE.get(key)
+        if not cached:
+            return None
+        expires_at, snapshot = cached
+        if expires_at <= now:
+            PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE.pop(key, None)
+            return None
+        return copy.deepcopy(snapshot)
+
+
+def set_public_mailbox_cached_account_snapshot(
+    account: Dict[str, Any],
+    scan_limit: int,
+    snapshot: Dict[str, Any],
+) -> None:
+    ttl = max(0.0, float(PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_SECONDS or 0))
+    if ttl <= 0 or not snapshot.get('success'):
+        return
+    key = public_mailbox_account_snapshot_cache_key(account, scan_limit)
+    with PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_LOCK:
+        if len(PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE) >= PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE,
+                key=lambda item_key: PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE[item_key][0],
+            )
+            PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE.pop(oldest_key, None)
+        PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE[key] = (
+            time.time() + ttl,
+            copy.deepcopy(snapshot),
+        )
+
+
+def begin_public_mailbox_account_snapshot(key: tuple) -> tuple[bool, Dict[str, Any]]:
+    with PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_INFLIGHT_LOCK:
+        entry = PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_INFLIGHT.get(key)
+        if entry is not None:
+            entry['waiters'] = int(entry.get('waiters') or 0) + 1
+            return False, entry
+        entry = {
+            'event': threading.Event(),
+            'result': None,
+            'waiters': 0,
+        }
+        PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_INFLIGHT[key] = entry
+        return True, entry
+
+
+def wait_public_mailbox_account_snapshot(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    event = entry.get('event')
+    if not isinstance(event, threading.Event):
+        return None
+    timeout_seconds = max(
+        0.1,
+        float(PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS or 0) + 2.0,
+    )
+    if not event.wait(timeout_seconds):
+        try:
+            app.logger.warning(
+                "PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_TIMEOUT wait=%ss",
+                timeout_seconds,
+            )
+        except Exception:
+            pass
+        return None
+    result = entry.get('result')
+    if isinstance(result, dict) and result.get('success'):
+        return copy.deepcopy(result)
+    return None
+
+
+def finish_public_mailbox_account_snapshot(
+    key: tuple,
+    entry: Dict[str, Any],
+    snapshot: Optional[Dict[str, Any]],
+) -> None:
+    with PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_INFLIGHT_LOCK:
+        if PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_INFLIGHT.get(key) is entry:
+            PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_INFLIGHT.pop(key, None)
+        entry['result'] = copy.deepcopy(snapshot) if isinstance(snapshot, dict) else None
+        event = entry.get('event')
+        if isinstance(event, threading.Event):
+            event.set()
+
+
 def clear_public_mailbox_result_cache() -> None:
     with PUBLIC_MAILBOX_RESULT_CACHE_LOCK:
         PUBLIC_MAILBOX_RESULT_CACHE.clear()
@@ -2126,6 +2243,14 @@ def clear_public_mailbox_result_cache() -> None:
             if isinstance(event, threading.Event):
                 event.set()
         PUBLIC_MAILBOX_INFLIGHT_REQUESTS.clear()
+    with PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_LOCK:
+        PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE.clear()
+    with PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_INFLIGHT_LOCK:
+        for entry in PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_INFLIGHT.values():
+            event = entry.get('event')
+            if isinstance(event, threading.Event):
+                event.set()
+        PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_INFLIGHT.clear()
 
 
 def build_public_mailbox_message(
@@ -2141,6 +2266,192 @@ def build_public_mailbox_message(
         'body': str(detail.get('body') or ''),
         'body_type': str(detail.get('body_type') or 'text').strip().lower(),
     }
+
+
+def public_mailbox_account_snapshot_enabled(account: Dict[str, Any]) -> bool:
+    if str(account.get('account_type') or '').strip().lower() == 'imap':
+        return False
+    return bool(
+        str(account.get('client_id') or '').strip()
+        and str(account.get('refresh_token') or '').strip()
+    )
+
+
+def fetch_public_mailbox_account_snapshot_page(
+    account: Dict[str, Any],
+    folder: str,
+    top: int,
+) -> Dict[str, Any]:
+    folder_name = normalize_folder_name(folder)
+    result = get_emails_graph(
+        str(account.get('client_id') or ''),
+        str(account.get('refresh_token') or ''),
+        folder_name,
+        0,
+        max(1, int(top or 1)),
+        get_account_proxy_url(account),
+        get_account_proxy_failover_urls(account),
+        include_body=True,
+    )
+    if not result.get('success'):
+        return result
+    emails = [
+        format_graph_recipient_search_item(item, folder_name)
+        for item in (result.get('emails') or [])
+    ]
+    emails.sort(
+        key=lambda item: parse_email_datetime(item.get('date')) or datetime.min,
+        reverse=True,
+    )
+    return {
+        'success': True,
+        'emails': emails,
+        'method': 'Graph API Public Snapshot',
+        'has_more': len(emails) >= max(1, int(top or 1)),
+        'request_method': 'graph',
+    }
+
+
+def build_public_mailbox_account_snapshot(
+    account: Dict[str, Any],
+    scan_limit: int,
+) -> Dict[str, Any]:
+    page_size = max(1, min(PUBLIC_MAILBOX_BATCH_SIZE, int(scan_limit or PUBLIC_MAILBOX_BATCH_SIZE)))
+    folders: Dict[str, Dict[str, Any]] = {}
+    scanned_count = 0
+    candidates_remain = False
+    for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
+        page = call_public_mailbox_upstream(
+            fetch_public_mailbox_account_snapshot_page,
+            account,
+            folder_name,
+            page_size,
+        )
+        if not page.get('success'):
+            return {
+                'success': False,
+                'status': int((page.get('error') or {}).get('status') or 502)
+                if isinstance(page.get('error'), dict)
+                else 502,
+                'error': page.get('error') or '邮箱服务查询失败',
+            }
+        items = list(page.get('emails') or [])
+        scanned_count += len(items)
+        candidates_remain = candidates_remain or bool(page.get('has_more'))
+        folders[folder_name] = {
+            'success': True,
+            'emails': items,
+            'has_more': bool(page.get('has_more')),
+            'request_method': str(page.get('request_method') or 'graph').strip().lower(),
+        }
+    return {
+        'success': True,
+        'status': 200,
+        'folders': folders,
+        'scanned_count': scanned_count,
+        'candidates_remain': candidates_remain,
+    }
+
+
+def get_public_mailbox_account_snapshot_for_lookup(
+    account: Dict[str, Any],
+    scan_limit: int,
+) -> Optional[Dict[str, Any]]:
+    if not public_mailbox_account_snapshot_enabled(account):
+        return None
+    cached_snapshot = get_public_mailbox_cached_account_snapshot(account, scan_limit)
+    if cached_snapshot is not None:
+        return cached_snapshot
+
+    key = public_mailbox_account_snapshot_cache_key(account, scan_limit)
+    is_owner, entry = begin_public_mailbox_account_snapshot(key)
+    if not is_owner:
+        return wait_public_mailbox_account_snapshot(entry)
+
+    snapshot: Optional[Dict[str, Any]] = None
+    try:
+        coalesce_seconds = max(0.0, float(PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_COALESCE_SECONDS or 0))
+        if coalesce_seconds > 0:
+            time.sleep(coalesce_seconds)
+        if int(entry.get('waiters') or 0) <= 0:
+            return None
+        cached_snapshot = get_public_mailbox_cached_account_snapshot(account, scan_limit)
+        if cached_snapshot is not None:
+            snapshot = cached_snapshot
+            return snapshot
+        snapshot = build_public_mailbox_account_snapshot(account, scan_limit)
+        if snapshot.get('success'):
+            set_public_mailbox_cached_account_snapshot(account, scan_limit, snapshot)
+            return snapshot
+        return None
+    finally:
+        finish_public_mailbox_account_snapshot(key, entry, snapshot)
+
+
+def find_public_mailbox_messages_from_snapshot(
+    account: Dict[str, Any],
+    recipient: str,
+    limit: int,
+    snapshot: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(snapshot, dict) or not snapshot.get('success'):
+        return None
+
+    matches: List[Dict[str, Any]] = []
+    seen = set()
+    for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
+        folder = (snapshot.get('folders') or {}).get(folder_name) or {}
+        request_method = str(folder.get('request_method') or 'graph').strip().lower()
+        for source in folder.get('emails') or []:
+            item = dict(source or {})
+            key = public_mailbox_message_key(item)
+            if not key[2] or key in seen:
+                continue
+            seen.add(key)
+            if public_mailbox_to_matches(item.get('to'), recipient):
+                item['_request_method'] = request_method
+                matches.append(item)
+        if matches:
+            break
+
+    if not matches:
+        return None
+
+    matches.sort(
+        key=lambda item: parse_email_datetime(item.get('date')) or datetime.min,
+        reverse=True,
+    )
+    messages = []
+    requires_delivery_header_match = public_mailbox_requires_delivery_header_match(recipient)
+    for item in matches:
+        if len(messages) >= limit:
+            break
+        item_detail = item.get('_detail')
+        if not isinstance(item_detail, dict):
+            return None
+        if (
+            requires_delivery_header_match
+            and not public_mailbox_detail_has_header_field(item_detail)
+        ):
+            return None
+        if (
+            requires_delivery_header_match
+            and not public_mailbox_delivery_headers_match(item_detail, recipient)
+        ):
+            continue
+        messages.append(build_public_mailbox_message(item, item_detail))
+
+    if not messages:
+        return None
+
+    result = {
+        'success': True,
+        'status': 200,
+        'count': len(messages),
+        'messages': messages,
+        'source': 'account_snapshot',
+    }
+    return cache_public_mailbox_result(account, recipient, limit, result)
 
 
 def find_public_mailbox_messages(
@@ -2207,6 +2518,16 @@ def find_public_mailbox_messages_uncached(
     is_imap_account = str(account.get('account_type') or '').strip().lower() == 'imap'
     should_scan = not is_imap_account
     candidates_remain = False
+
+    snapshot = get_public_mailbox_account_snapshot_for_lookup(account, scan_limit)
+    snapshot_result = find_public_mailbox_messages_from_snapshot(
+        account,
+        recipient,
+        limit,
+        snapshot,
+    )
+    if snapshot_result is not None:
+        return snapshot_result
 
     if should_scan:
         fast_search_complete = True

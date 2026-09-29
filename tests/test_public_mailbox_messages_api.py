@@ -648,7 +648,103 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertTrue(all(result['success'] for result in results))
         self.assertEqual(results[0], results[1])
-        graph_search_mock.assert_called_once_with(account, 'inbox', 'target@example.com', 1)
+        self.assertEqual(graph_search_mock.call_args_list, [
+            call(account, 'inbox', 'target@example.com', 1),
+            call(account, 'junkemail', 'target@example.com', 1),
+            call(account, 'deleteditems', 'target@example.com', 1),
+        ])
+
+    def test_concurrent_same_account_lookups_share_account_snapshot(self):
+        account = {
+            **self.account,
+            'id': 709,
+            'client_id': 'client-id',
+            'refresh_token': 'refresh-token',
+        }
+        alpha = {
+            **self.item('snapshot-alpha', 'alpha@example.com', '2026-08-21T12:00:00Z'),
+            '_detail': {
+                'id': 'snapshot-alpha',
+                'subject': 'Alpha',
+                'from': 'sender@example.com',
+                'to': 'alpha@example.com',
+                'date': '2026-08-21T12:00:00Z',
+                'body': '<p>alpha body</p>',
+                'body_type': 'html',
+            },
+        }
+        beta = {
+            **self.item('snapshot-beta', 'beta@example.com', '2026-08-21T12:01:00Z'),
+            '_detail': {
+                'id': 'snapshot-beta',
+                'subject': 'Beta',
+                'from': 'sender@example.com',
+                'to': 'beta@example.com',
+                'date': '2026-08-21T12:01:00Z',
+                'body': '<p>beta body</p>',
+                'body_type': 'html',
+            },
+        }
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def snapshot_page(_account, folder, _top):
+            if folder == 'inbox':
+                return {
+                    'success': True,
+                    'emails': [alpha, beta],
+                    'has_more': False,
+                    'request_method': 'graph',
+                }
+            return {
+                'success': True,
+                'emails': [],
+                'has_more': False,
+                'request_method': 'graph',
+            }
+
+        def run_lookup(recipient):
+            barrier.wait(2)
+            results[recipient] = web_outlook_app.find_public_mailbox_messages(
+                account,
+                recipient,
+                1,
+            )
+
+        with patch.object(
+            web_outlook_app,
+            'PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_COALESCE_SECONDS',
+            0.1,
+        ), patch.object(
+            web_outlook_app,
+            'fetch_public_mailbox_account_snapshot_page',
+            side_effect=snapshot_page,
+        ) as snapshot_mock, patch.object(
+            web_outlook_app,
+            'fetch_account_graph_emails_by_recipient',
+            return_value={'success': True, 'emails': [], 'recipient_search_supported': True},
+        ) as graph_search_mock, patch.object(
+            web_outlook_app,
+            'fetch_email_detail_for_account',
+            return_value=self.detail(alpha),
+        ) as detail_mock:
+            threads = [
+                threading.Thread(target=run_lookup, args=('alpha@example.com',)),
+                threading.Thread(target=run_lookup, args=('beta@example.com',)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+
+        self.assertEqual(set(results), {'alpha@example.com', 'beta@example.com'})
+        self.assertTrue(results['alpha@example.com']['success'])
+        self.assertTrue(results['beta@example.com']['success'])
+        self.assertEqual(results['alpha@example.com']['messages'][0]['body'], '<p>alpha body</p>')
+        self.assertEqual(results['beta@example.com']['messages'][0]['body'], '<p>beta body</p>')
+        self.assertEqual(snapshot_mock.call_count, len(web_outlook_app.PUBLIC_MAILBOX_SEARCH_FOLDERS))
+        graph_search_mock.assert_not_called()
+        detail_mock.assert_not_called()
 
     def test_public_mailbox_upstream_calls_are_limited_per_account(self):
         account = {
