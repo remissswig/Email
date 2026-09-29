@@ -2621,7 +2621,14 @@ def find_public_mailbox_messages_uncached(
             should_scan = False
 
     if is_imap_account:
-        imap_search_folders = ('inbox',)
+        # iCloud commonly delivers Hide My Email messages into Junk.
+        # Search both folders and choose the newest match below.
+        imap_provider = str(account.get('provider') or '').strip().lower()
+        imap_search_folders = (
+            ('inbox', 'junkemail')
+            if imap_provider == 'icloud'
+            else ('inbox',)
+        )
         for folder_name in imap_search_folders:
             account['_public_mailbox_disable_imap_recovery_scan'] = True
             try:
@@ -2640,8 +2647,6 @@ def find_public_mailbox_messages_uncached(
                 break
             if not imap_result.get('success'):
                 folder_errors.append(imap_result)
-                if public_mailbox_payload_has_timeout(imap_result):
-                    break
                 continue
             strict_items = list(imap_result.get('emails') or [])
             for source in strict_items:
@@ -2652,9 +2657,6 @@ def find_public_mailbox_messages_uncached(
                 seen.add(key)
                 item['_request_method'] = 'imap'
                 matches.append(item)
-
-            if matches:
-                break
 
         if not should_scan:
             if folder_errors and not matches:

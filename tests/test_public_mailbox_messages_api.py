@@ -1361,6 +1361,89 @@ class PublicMailboxMessageSearchTests(unittest.TestCase):
             structured_error=True,
         )
 
+    def test_icloud_imap_searches_inbox_and_junk_and_returns_latest_limit(self):
+        account = {
+            **self.imap_account,
+            'id': 9,
+            'provider': 'icloud',
+            'email': 'icloud-owner@example.com',
+        }
+        inbox_messages = [
+            {
+                **self.item('inbox-older', 'target@example.com', '2026-08-21T10:00:00Z'),
+                'folder': 'inbox',
+                'id_mode': 'uid',
+            },
+            {
+                **self.item('inbox-newer', 'target@example.com', '2026-08-21T12:00:00Z'),
+                'folder': 'inbox',
+                'id_mode': 'uid',
+            },
+        ]
+        junk_messages = [
+            {
+                **self.item('junk-newest', 'target@example.com', '2026-08-21T14:00:00Z'),
+                'folder': 'junkemail',
+                'id_mode': 'uid',
+            },
+            {
+                **self.item('junk-middle', 'target@example.com', '2026-08-21T13:00:00Z'),
+                'folder': 'junkemail',
+                'id_mode': 'uid',
+            },
+        ]
+        messages_by_folder = {
+            'inbox': inbox_messages,
+            'junkemail': junk_messages,
+        }
+
+        def imap_side_effect(account, folder, recipient, limit, scan_limit):
+            self.assertEqual(limit, 2)
+            return {
+                'success': True,
+                'emails': messages_by_folder[folder][:limit],
+                'request_method': 'imap',
+                'recipient_search_supported': True,
+            }
+
+        def detail_side_effect(account, message_id, request_method, folder, id_mode, structured_error):
+            source = next(
+                item
+                for item in inbox_messages + junk_messages
+                if item['id'] == message_id
+            )
+            return self.detail(source)
+
+        with patch.object(
+            web_outlook_app,
+            'fetch_account_imap_emails_by_recipient',
+            create=True,
+            side_effect=imap_side_effect,
+        ) as imap_search_mock, patch.object(
+            web_outlook_app,
+            'fetch_email_detail_for_account',
+            side_effect=detail_side_effect,
+        ) as detail_mock:
+            result = web_outlook_app.find_public_mailbox_messages(
+                account,
+                'target@example.com',
+                2,
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(
+            [message['id'] for message in result['messages']],
+            ['junk-newest', 'junk-middle'],
+        )
+        self.assertEqual(imap_search_mock.call_args_list, [
+            call(account, 'inbox', 'target@example.com', 2, 100),
+            call(account, 'junkemail', 'target@example.com', 2, 100),
+        ])
+        self.assertEqual(
+            [call_args.args[1] for call_args in detail_mock.call_args_list],
+            ['junk-newest', 'junk-middle'],
+        )
+
     def test_imap_recipient_search_stops_after_folder_timeout(self):
         timeout_result = {
             'success': False,
