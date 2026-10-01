@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import os
+import socket
 import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
+from urllib.parse import unquote, urlparse
 
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -2028,6 +2032,263 @@ PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_INFLIGHT_LOCK = threading.Lock()
 PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_INFLIGHT: Dict[tuple, Dict[str, Any]] = {}
 
 
+def _public_mailbox_redis_url() -> str:
+    url = str(os.getenv("PUBLIC_MAILBOX_REDIS_URL") or "").strip()
+    if url:
+        return url
+    path = str(
+        os.getenv("PUBLIC_MAILBOX_REDIS_URL_FILE")
+        or "/app/data/public_mailbox_redis_url"
+    ).strip()
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+PUBLIC_MAILBOX_REDIS_URL = _public_mailbox_redis_url()
+PUBLIC_MAILBOX_REDIS_KEY_PREFIX = (
+    str(os.getenv("PUBLIC_MAILBOX_REDIS_KEY_PREFIX") or "mailbox-cache:v1").strip()
+    or "mailbox-cache:v1"
+)
+try:
+    PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS = max(
+        0.05,
+        min(
+            float(os.getenv("PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS", "1.5") or "1.5"),
+            2.0,
+        ),
+    )
+except ValueError:
+    PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS = 1.5
+try:
+    PUBLIC_MAILBOX_REDIS_MAX_VALUE_BYTES = max(
+        16 * 1024,
+        min(
+            int(os.getenv("PUBLIC_MAILBOX_REDIS_MAX_VALUE_BYTES", "262144") or "262144"),
+            2 * 1024 * 1024,
+        ),
+    )
+except ValueError:
+    PUBLIC_MAILBOX_REDIS_MAX_VALUE_BYTES = 262144
+PUBLIC_MAILBOX_REDIS_ERROR_LOG_THROTTLE_SECONDS = 60.0
+PUBLIC_MAILBOX_REDIS_LAST_ERROR_AT = 0.0
+PUBLIC_MAILBOX_REDIS_WRITE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="public-mailbox-redis",
+)
+
+
+class _PublicMailboxRedisClient:
+    def __init__(self, url: str, timeout: float):
+        parsed = urlparse(url)
+        if parsed.scheme not in {"redis", "rediss"}:
+            raise ValueError("unsupported redis url scheme")
+        self.host = parsed.hostname or "127.0.0.1"
+        self.port = int(parsed.port or 6379)
+        self.password = unquote(parsed.password or "")
+        self.db = int((parsed.path or "/0").lstrip("/") or "0")
+        self.timeout = timeout
+        self.use_tls = parsed.scheme == "rediss"
+
+    def execute(self, *parts: Any) -> Any:
+        import ssl
+
+        payload = self._encode_command(parts)
+        with socket.create_connection((self.host, self.port), self.timeout) as sock:
+            sock.settimeout(self.timeout)
+            if self.use_tls:
+                with ssl.create_default_context().wrap_socket(
+                    sock,
+                    server_hostname=self.host,
+                ) as tls_sock:
+                    return self._execute_on_socket(tls_sock, payload)
+            return self._execute_on_socket(sock, payload)
+
+    def _execute_on_socket(self, sock, payload: list[bytes]) -> Any:
+        if self.password:
+            self._send_command(sock, self._encode_command(("AUTH", self.password)))
+            self._read_response(sock)
+        if self.db:
+            self._send_command(sock, self._encode_command(("SELECT", self.db)))
+            self._read_response(sock)
+        self._send_command(sock, payload)
+        return self._read_response(sock)
+
+    @staticmethod
+    def _send_command(sock, payload: list[bytes]) -> None:
+        sock.sendall(b"".join(payload))
+
+    @staticmethod
+    def _encode_command(parts: Any) -> list[bytes]:
+        raw_parts = [
+            part if isinstance(part, bytes) else str(part).encode("utf-8")
+            for part in parts
+        ]
+        payload = [f"*{len(raw_parts)}\r\n".encode("ascii")]
+        for part in raw_parts:
+            payload.append(f"${len(part)}\r\n".encode("ascii"))
+            payload.append(part)
+            payload.append(b"\r\n")
+        return payload
+
+    def _read_response(self, sock) -> Any:
+        prefix = self._read_exact(sock, 1)
+        if prefix == b"+":
+            return self._read_line(sock).decode("utf-8", "replace")
+        if prefix == b"-":
+            raise RuntimeError(self._read_line(sock).decode("utf-8", "replace"))
+        if prefix == b":":
+            return int(self._read_line(sock))
+        if prefix == b"$":
+            length = int(self._read_line(sock))
+            if length < 0:
+                return None
+            data = self._read_exact(sock, length)
+            self._read_exact(sock, 2)
+            return data
+        if prefix == b"*":
+            length = int(self._read_line(sock))
+            if length < 0:
+                return None
+            return [self._read_response(sock) for _ in range(length)]
+        raise RuntimeError("invalid redis response")
+
+    @staticmethod
+    def _read_exact(sock, length: int) -> bytes:
+        chunks = []
+        remaining = length
+        while remaining > 0:
+            chunk = sock.recv(remaining)
+            if not chunk:
+                raise RuntimeError("redis connection closed")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    @staticmethod
+    def _read_line(sock) -> bytes:
+        chunks = []
+        while True:
+            chunk = sock.recv(1)
+            if not chunk:
+                raise RuntimeError("redis connection closed")
+            chunks.append(chunk)
+            if len(chunks) >= 2 and chunks[-2:] == [b"\r", b"\n"]:
+                return b"".join(chunks[:-2])
+
+
+def _public_mailbox_redis_client() -> Optional[_PublicMailboxRedisClient]:
+    if not PUBLIC_MAILBOX_REDIS_URL:
+        return None
+    try:
+        return _PublicMailboxRedisClient(
+            PUBLIC_MAILBOX_REDIS_URL,
+            PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        _log_public_mailbox_redis_error("init", exc)
+        return None
+
+
+def _log_public_mailbox_redis_error(operation: str, exc: Exception) -> None:
+    global PUBLIC_MAILBOX_REDIS_LAST_ERROR_AT
+    now = time.time()
+    if now - PUBLIC_MAILBOX_REDIS_LAST_ERROR_AT < PUBLIC_MAILBOX_REDIS_ERROR_LOG_THROTTLE_SECONDS:
+        return
+    PUBLIC_MAILBOX_REDIS_LAST_ERROR_AT = now
+    try:
+        app.logger.warning(
+            "PUBLIC_MAILBOX_REDIS_%s_FAILED error=%s",
+            str(operation or "operation").upper(),
+            sanitize_error_details(str(exc)),
+        )
+    except Exception:
+        pass
+
+
+def public_mailbox_redis_cache_key(namespace: str, key: tuple) -> str:
+    payload = json.dumps(key, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"{PUBLIC_MAILBOX_REDIS_KEY_PREFIX}:{namespace}:{digest}"
+
+
+def get_public_mailbox_redis_cache(namespace: str, key: tuple) -> Optional[Dict[str, Any]]:
+    client = _public_mailbox_redis_client()
+    if client is None:
+        return None
+    redis_key = public_mailbox_redis_cache_key(namespace, key)
+    try:
+        raw_value = client.execute("GET", redis_key)
+        if not raw_value:
+            return None
+        if len(raw_value) > PUBLIC_MAILBOX_REDIS_MAX_VALUE_BYTES:
+            return None
+        payload = json.loads(raw_value.decode("utf-8"))
+        if isinstance(payload, dict):
+            return payload
+    except Exception as exc:
+        _log_public_mailbox_redis_error("get", exc)
+    return None
+
+
+def set_public_mailbox_redis_cache(namespace: str, key: tuple, value: Dict[str, Any], ttl: float) -> None:
+    if ttl <= 0:
+        return
+    value_copy = copy.deepcopy(value)
+    try:
+        serialized_value = json.dumps(
+            value_copy,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return
+    if len(serialized_value.encode("utf-8")) > PUBLIC_MAILBOX_REDIS_MAX_VALUE_BYTES:
+        return
+
+    def write_cache() -> None:
+        client = _public_mailbox_redis_client()
+        if client is None:
+            return
+        redis_key = public_mailbox_redis_cache_key(namespace, key)
+        ttl_seconds = max(1, int(round(ttl)))
+        try:
+            client.execute("SETEX", redis_key, ttl_seconds, serialized_value)
+        except Exception as exc:
+            _log_public_mailbox_redis_error("set", exc)
+
+    try:
+        PUBLIC_MAILBOX_REDIS_WRITE_EXECUTOR.submit(write_cache)
+    except Exception as exc:
+        _log_public_mailbox_redis_error("queue_set", exc)
+
+
+def clear_public_mailbox_redis_cache() -> None:
+    client = _public_mailbox_redis_client()
+    if client is None:
+        return
+    cursor = "0"
+    pattern = f"{PUBLIC_MAILBOX_REDIS_KEY_PREFIX}:*"
+    try:
+        while True:
+            response = client.execute("SCAN", cursor, "MATCH", pattern, "COUNT", "200")
+            if not isinstance(response, list) or len(response) != 2:
+                return
+            raw_cursor, raw_keys = response
+            cursor = raw_cursor.decode("utf-8") if isinstance(raw_cursor, bytes) else str(raw_cursor)
+            keys = raw_keys if isinstance(raw_keys, list) else []
+            if keys:
+                client.execute("DEL", *keys)
+            if cursor == "0":
+                return
+    except Exception as exc:
+        _log_public_mailbox_redis_error("clear", exc)
+
+
 def public_mailbox_result_cache_key(account: Dict[str, Any], recipient: str, limit: int) -> tuple:
     return (
         int(account.get('id') or 0),
@@ -2053,13 +2314,26 @@ def get_public_mailbox_cached_result(account: Dict[str, Any], recipient: str, li
     key = public_mailbox_result_cache_key(account, recipient, limit)
     with PUBLIC_MAILBOX_RESULT_CACHE_LOCK:
         cached = PUBLIC_MAILBOX_RESULT_CACHE.get(key)
-        if not cached:
-            return None
-        expires_at, result = cached
-        if expires_at <= now:
+        if cached:
+            expires_at, result = cached
+            if expires_at > now:
+                return copy.deepcopy(result)
             PUBLIC_MAILBOX_RESULT_CACHE.pop(key, None)
-            return None
-        return copy.deepcopy(result)
+    cached_result = get_public_mailbox_redis_cache("result", key)
+    if cached_result is not None:
+        with PUBLIC_MAILBOX_RESULT_CACHE_LOCK:
+            if len(PUBLIC_MAILBOX_RESULT_CACHE) >= PUBLIC_MAILBOX_RESULT_CACHE_MAX_ENTRIES:
+                oldest_key = min(
+                    PUBLIC_MAILBOX_RESULT_CACHE,
+                    key=lambda item_key: PUBLIC_MAILBOX_RESULT_CACHE[item_key][0],
+                )
+                PUBLIC_MAILBOX_RESULT_CACHE.pop(oldest_key, None)
+            PUBLIC_MAILBOX_RESULT_CACHE[key] = (
+                now + min(ttl, public_mailbox_result_cache_ttl(cached_result) or ttl),
+                copy.deepcopy(cached_result),
+            )
+        return copy.deepcopy(cached_result)
+    return None
 
 
 def public_mailbox_result_cache_ttl(result: Dict[str, Any]) -> float:
@@ -2083,6 +2357,7 @@ def set_public_mailbox_cached_result(account: Dict[str, Any], recipient: str, li
     if ttl <= 0:
         return
     key = public_mailbox_result_cache_key(account, recipient, limit)
+    set_public_mailbox_redis_cache("result", key, result, ttl)
     with PUBLIC_MAILBOX_RESULT_CACHE_LOCK:
         if len(PUBLIC_MAILBOX_RESULT_CACHE) >= PUBLIC_MAILBOX_RESULT_CACHE_MAX_ENTRIES:
             oldest_key = min(
@@ -2168,13 +2443,26 @@ def get_public_mailbox_cached_account_snapshot(
     now = time.time()
     with PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_LOCK:
         cached = PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE.get(key)
-        if not cached:
-            return None
-        expires_at, snapshot = cached
-        if expires_at <= now:
+        if cached:
+            expires_at, snapshot = cached
+            if expires_at > now:
+                return copy.deepcopy(snapshot)
             PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE.pop(key, None)
-            return None
-        return copy.deepcopy(snapshot)
+    cached_snapshot = get_public_mailbox_redis_cache("snapshot", key)
+    if cached_snapshot is not None and cached_snapshot.get('success'):
+        with PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_LOCK:
+            if len(PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE) >= PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_MAX_ENTRIES:
+                oldest_key = min(
+                    PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE,
+                    key=lambda item_key: PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE[item_key][0],
+                )
+                PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE.pop(oldest_key, None)
+            PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE[key] = (
+                now + ttl,
+                copy.deepcopy(cached_snapshot),
+            )
+        return copy.deepcopy(cached_snapshot)
+    return None
 
 
 def set_public_mailbox_cached_account_snapshot(
@@ -2186,6 +2474,7 @@ def set_public_mailbox_cached_account_snapshot(
     if ttl <= 0 or not snapshot.get('success'):
         return
     key = public_mailbox_account_snapshot_cache_key(account, scan_limit)
+    set_public_mailbox_redis_cache("snapshot", key, snapshot, ttl)
     with PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_LOCK:
         if len(PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE) >= PUBLIC_MAILBOX_ACCOUNT_SNAPSHOT_CACHE_MAX_ENTRIES:
             oldest_key = min(
@@ -2252,6 +2541,7 @@ def finish_public_mailbox_account_snapshot(
 
 
 def clear_public_mailbox_result_cache() -> None:
+    clear_public_mailbox_redis_cache()
     with PUBLIC_MAILBOX_RESULT_CACHE_LOCK:
         PUBLIC_MAILBOX_RESULT_CACHE.clear()
     with PUBLIC_MAILBOX_INFLIGHT_LOCK:
