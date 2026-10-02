@@ -7,6 +7,8 @@ import io
 import os
 import secrets
 import sqlite3
+import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -41,6 +43,8 @@ RECIPIENT_LINK_MAX_MAILBOX_OPTIONS = 10
 RECIPIENT_LINK_PUBLIC_PAGE_LIMIT = 20
 RECIPIENT_LINK_PUBLIC_PAGE_MAX_LIMIT = 10_000
 RECIPIENT_LINK_STICKY_FORWARD_HEADER = "X-Public-Mailbox-Sticky-Forwarded"
+RECIPIENT_LINK_STICKY_NODE_COOLDOWNS: dict[str, float] = {}
+RECIPIENT_LINK_STICKY_NODE_COOLDOWNS_LOCK = threading.Lock()
 
 RECIPIENT_LINK_ERROR_MESSAGES = {
     "invalid_mode": "导入模式无效",
@@ -1148,6 +1152,36 @@ def _recipient_link_sticky_target_url(base_url: str) -> str:
     ))
 
 
+def _recipient_link_sticky_node_is_cooling_down(node_id: str) -> bool:
+    now = time.monotonic()
+    with RECIPIENT_LINK_STICKY_NODE_COOLDOWNS_LOCK:
+        expires_at = RECIPIENT_LINK_STICKY_NODE_COOLDOWNS.get(node_id, 0.0)
+        if expires_at <= now:
+            RECIPIENT_LINK_STICKY_NODE_COOLDOWNS.pop(node_id, None)
+            return False
+        return True
+
+
+def _recipient_link_sticky_mark_node_failure(node_id: str) -> None:
+    try:
+        cooldown = max(
+            1.0,
+            min(
+                float(os.getenv("PUBLIC_MAILBOX_STICKY_NODE_COOLDOWN_SECONDS", "5") or "5"),
+                60.0,
+            ),
+        )
+    except ValueError:
+        cooldown = 5.0
+    with RECIPIENT_LINK_STICKY_NODE_COOLDOWNS_LOCK:
+        RECIPIENT_LINK_STICKY_NODE_COOLDOWNS[node_id] = time.monotonic() + cooldown
+
+
+def _recipient_link_sticky_clear_node_failure(node_id: str) -> None:
+    with RECIPIENT_LINK_STICKY_NODE_COOLDOWNS_LOCK:
+        RECIPIENT_LINK_STICKY_NODE_COOLDOWNS.pop(node_id, None)
+
+
 def _recipient_link_try_sticky_forward(account_id: int):
     if not _recipient_link_sticky_enabled():
         return None
@@ -1162,6 +1196,8 @@ def _recipient_link_try_sticky_forward(account_id: int):
         return None
     target_base = nodes.get(owner_node)
     if not target_base:
+        return None
+    if _recipient_link_sticky_node_is_cooling_down(owner_node):
         return None
 
     target_url = _recipient_link_sticky_target_url(target_base)
@@ -1202,6 +1238,7 @@ def _recipient_link_try_sticky_forward(account_id: int):
                 if header_value:
                     response.headers[header_name] = header_value
             response.headers["X-Public-Mailbox-Sticky-Routed"] = owner_node
+            _recipient_link_sticky_clear_node_failure(owner_node)
             return response
     except urllib.error.HTTPError as exc:
         body = exc.read()
@@ -1219,8 +1256,11 @@ def _recipient_link_try_sticky_forward(account_id: int):
             if header_value:
                 response.headers[header_name] = header_value
         response.headers["X-Public-Mailbox-Sticky-Routed"] = owner_node
+        if int(exc.code or 0) >= 500:
+            _recipient_link_sticky_mark_node_failure(owner_node)
         return response
     except Exception:
+        _recipient_link_sticky_mark_node_failure(owner_node)
         app.logger.exception(
             "recipient mailbox sticky forward failed account_id=%s owner=%s",
             account_id,

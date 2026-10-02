@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import queue
 import socket
 import sqlite3
 import threading
@@ -2074,12 +2075,24 @@ try:
     )
 except ValueError:
     PUBLIC_MAILBOX_REDIS_MAX_VALUE_BYTES = 262144
+try:
+    PUBLIC_MAILBOX_REDIS_POOL_SIZE = max(
+        1,
+        min(
+            int(os.getenv("PUBLIC_MAILBOX_REDIS_POOL_SIZE", "8") or "8"),
+            32,
+        ),
+    )
+except ValueError:
+    PUBLIC_MAILBOX_REDIS_POOL_SIZE = 8
 PUBLIC_MAILBOX_REDIS_ERROR_LOG_THROTTLE_SECONDS = 60.0
 PUBLIC_MAILBOX_REDIS_LAST_ERROR_AT = 0.0
 PUBLIC_MAILBOX_REDIS_WRITE_EXECUTOR = ThreadPoolExecutor(
     max_workers=2,
     thread_name_prefix="public-mailbox-redis",
 )
+PUBLIC_MAILBOX_REDIS_CLIENT_LOCK = threading.Lock()
+PUBLIC_MAILBOX_REDIS_CLIENT = None
 
 
 class _PublicMailboxRedisClient:
@@ -2093,28 +2106,72 @@ class _PublicMailboxRedisClient:
         self.db = int((parsed.path or "/0").lstrip("/") or "0")
         self.timeout = timeout
         self.use_tls = parsed.scheme == "rediss"
+        self._pool = queue.LifoQueue(maxsize=PUBLIC_MAILBOX_REDIS_POOL_SIZE)
 
     def execute(self, *parts: Any) -> Any:
+        payload = self._encode_command(parts)
+        sock = self._borrow_socket()
+        try:
+            result = self._execute_on_socket(sock, payload)
+        except Exception:
+            self._close_socket(sock)
+            sock = None
+            # A pooled TCP connection can go stale while idle. Retry once
+            # with a fresh authenticated connection before failing the cache op.
+            sock = self._connect()
+            try:
+                result = self._execute_on_socket(sock, payload)
+            except Exception:
+                self._close_socket(sock)
+                raise
+        self._return_socket(sock)
+        return result
+
+    def _connect(self):
         import ssl
 
-        payload = self._encode_command(parts)
-        with socket.create_connection((self.host, self.port), self.timeout) as sock:
+        sock = socket.create_connection((self.host, self.port), self.timeout)
+        try:
             sock.settimeout(self.timeout)
             if self.use_tls:
-                with ssl.create_default_context().wrap_socket(
+                sock = ssl.create_default_context().wrap_socket(
                     sock,
                     server_hostname=self.host,
-                ) as tls_sock:
-                    return self._execute_on_socket(tls_sock, payload)
-            return self._execute_on_socket(sock, payload)
+                )
+                sock.settimeout(self.timeout)
+            if self.password:
+                self._send_command(sock, self._encode_command(("AUTH", self.password)))
+                self._read_response(sock)
+            if self.db:
+                self._send_command(sock, self._encode_command(("SELECT", self.db)))
+                self._read_response(sock)
+            return sock
+        except Exception:
+            self._close_socket(sock)
+            raise
+
+    def _borrow_socket(self):
+        try:
+            return self._pool.get_nowait()
+        except queue.Empty:
+            return self._connect()
+
+    def _return_socket(self, sock) -> None:
+        if sock is None:
+            return
+        try:
+            self._pool.put_nowait(sock)
+        except queue.Full:
+            self._close_socket(sock)
+
+    @staticmethod
+    def _close_socket(sock) -> None:
+        try:
+            sock.close()
+        except Exception:
+            pass
 
     def _execute_on_socket(self, sock, payload: list[bytes]) -> Any:
-        if self.password:
-            self._send_command(sock, self._encode_command(("AUTH", self.password)))
-            self._read_response(sock)
-        if self.db:
-            self._send_command(sock, self._encode_command(("SELECT", self.db)))
-            self._read_response(sock)
         self._send_command(sock, payload)
         return self._read_response(sock)
 
@@ -2184,14 +2241,21 @@ class _PublicMailboxRedisClient:
 def _public_mailbox_redis_client() -> Optional[_PublicMailboxRedisClient]:
     if not PUBLIC_MAILBOX_REDIS_URL:
         return None
-    try:
-        return _PublicMailboxRedisClient(
-            PUBLIC_MAILBOX_REDIS_URL,
-            PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:
-        _log_public_mailbox_redis_error("init", exc)
-        return None
+    global PUBLIC_MAILBOX_REDIS_CLIENT
+    if PUBLIC_MAILBOX_REDIS_CLIENT is not None:
+        return PUBLIC_MAILBOX_REDIS_CLIENT
+    with PUBLIC_MAILBOX_REDIS_CLIENT_LOCK:
+        if PUBLIC_MAILBOX_REDIS_CLIENT is not None:
+            return PUBLIC_MAILBOX_REDIS_CLIENT
+        try:
+            PUBLIC_MAILBOX_REDIS_CLIENT = _PublicMailboxRedisClient(
+                PUBLIC_MAILBOX_REDIS_URL,
+                PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS,
+            )
+            return PUBLIC_MAILBOX_REDIS_CLIENT
+        except Exception as exc:
+            _log_public_mailbox_redis_error("init", exc)
+            return None
 
 
 def _log_public_mailbox_redis_error(operation: str, exc: Exception) -> None:
