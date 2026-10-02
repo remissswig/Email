@@ -39,6 +39,7 @@
 | GET | `/api/external/accounts` | API Key | JSON | 获取普通邮箱账号列表 |
 | GET | `/api/external/emails` | API Key | JSON | 获取指定邮箱邮件列表 |
 | POST | `/api/external/outlook/upload` | API Key | JSON | 上传 Outlook 邮箱账号密码到上传表（默认未授权，支持单条/批量） |
+| POST | `/api/external/verification-links/import` | API Key | TXT / ZIP | 上传 TXT 并返回服务器生成的 `api-*.txt` 文件 |
 
 ### 邮箱消息读取 API
 
@@ -731,6 +732,32 @@ curl -X POST -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
 - 入库记录 `is_authorized` 一律为 `0`（未授权）
 - 请求体既无 `email` 也无非空 `accounts` 时返回 HTTP 400
 - 缺少 / 无效 API Key 时由鉴权层返回 HTTP 401 / 403
+
+### POST `/api/external/verification-links/import`
+
+使用 API Key 上传一个 TXT 文件，并由主服务器生成对应的 `api-<文件名>.txt`。该外部接口固定按单文件批量模式处理，因此主邮箱或收件人数据已存在时仍会生成新的 API 文件，响应类型为 ZIP，ZIP 内包含对应的 `api-*.txt`。
+
+请求使用 `multipart/form-data`：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `files` | file | 是 | 一个 TXT 文件；第一行是主邮箱信息，后续行是收件人邮箱 |
+| `mode` | string | 是 | 固定为 `batch` |
+| `auto_export` | string | 是 | 固定为 `1` |
+
+示例：
+
+```bash
+curl -X POST \
+  -H "X-API-Key: your-api-key" \
+  -F "mode=batch" \
+  -F "auto_export=1" \
+  -F "files=@customers.txt" \
+  "http://localhost:5000/api/external/verification-links/import" \
+  -o verification-links.zip
+```
+
+成功时 ZIP 内文件名为 `api-customers.txt`。调用方应先完整保存该文件，确认保存成功后再删除本地源文件。缺少或无效 API Key 返回 HTTP 401 / 403；文件校验或导入失败返回错误 JSON 或包含 `失败-*.txt` 的 ZIP。
 
 ## 内部 API
 
