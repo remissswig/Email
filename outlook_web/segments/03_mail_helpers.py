@@ -2103,7 +2103,8 @@ def mark_emails_read_imap_generic_result(email_addr: str, imap_password: str, im
 def get_emails_imap_generic(email_addr: str, imap_password: str, imap_host: str,
                             imap_port: int = 993, folder: str = 'inbox',
                             provider: str = 'custom', skip: int = 0, top: int = 20,
-                            proxy_url: str = '') -> Dict[str, Any]:
+                            proxy_url: str = '',
+                            include_details: bool = False) -> Dict[str, Any]:
     mail = None
     imap_id_info = {}
     try:
@@ -2205,7 +2206,7 @@ def get_emails_imap_generic(email_addr: str, imap_password: str, imap_host: str,
                 body_text, body_html = extract_text_and_html(msg)
                 preview_source = body_text or strip_html_content(body_html)
                 preview = preview_source[:200] + ('...' if len(preview_source) > 200 else '')
-                emails_data.append({
+                item = {
                     'id': uid.decode('utf-8', errors='ignore') if isinstance(uid, (bytes, bytearray)) else str(uid),
                     'subject': decode_header_value(msg.get('Subject', '无主题')),
                     'from': decode_header_value(msg.get('From', '未知')),
@@ -2215,7 +2216,14 @@ def get_emails_imap_generic(email_addr: str, imap_password: str, imap_host: str,
                     'is_read': bool(re.search(r'\\Seen\b', fetch_response_text, flags=re.IGNORECASE)),
                     'has_attachments': has_message_attachments(msg),
                     'body_preview': preview,
-                })
+                }
+                if include_details:
+                    item['_detail'] = build_email_detail_from_message(
+                        msg,
+                        item['id'],
+                        internal_date,
+                    )
+                emails_data.append(item)
             except Exception:
                 continue
 

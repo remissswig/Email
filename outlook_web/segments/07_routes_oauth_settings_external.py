@@ -2641,7 +2641,11 @@ def build_public_mailbox_message(
 
 def public_mailbox_account_snapshot_enabled(account: Dict[str, Any]) -> bool:
     if str(account.get('account_type') or '').strip().lower() == 'imap':
-        return False
+        return bool(
+            str(account.get('email') or '').strip()
+            and str(account.get('imap_password') or '').strip()
+            and str(account.get('imap_host') or '').strip()
+        )
     return bool(
         str(account.get('client_id') or '').strip()
         and str(account.get('refresh_token') or '').strip()
@@ -2653,6 +2657,23 @@ def fetch_public_mailbox_account_snapshot_page(
     folder: str,
     top: int,
 ) -> Dict[str, Any]:
+    if str(account.get('account_type') or '').strip().lower() == 'imap':
+        result = fetch_account_emails(
+            account,
+            folder,
+            0,
+            max(1, int(top or 1)),
+            include_details=True,
+        )
+        if not result.get('success'):
+            return result
+        return {
+            'success': True,
+            'emails': list(result.get('emails') or []),
+            'method': result.get('method') or 'IMAP Snapshot',
+            'has_more': bool(result.get('has_more')),
+            'request_method': 'imap',
+        }
     folder_name = normalize_folder_name(folder)
     result = get_emails_graph(
         str(account.get('client_id') or ''),
@@ -2691,7 +2712,13 @@ def build_public_mailbox_account_snapshot(
     folders: Dict[str, Dict[str, Any]] = {}
     scanned_count = 0
     candidates_remain = False
-    for folder_name in PUBLIC_MAILBOX_SEARCH_FOLDERS:
+    account_type = str(account.get('account_type') or '').strip().lower()
+    snapshot_folders = (
+        ('inbox', 'junkemail')
+        if account_type == 'imap'
+        else PUBLIC_MAILBOX_SEARCH_FOLDERS
+    )
+    for folder_name in snapshot_folders:
         page = call_public_mailbox_upstream(
             fetch_public_mailbox_account_snapshot_page,
             account,

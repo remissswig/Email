@@ -3418,7 +3418,8 @@ def merge_folder_results(results: Dict[str, Dict[str, Any]], skip: int, top: int
 
 
 def fetch_account_folder_emails(account: Dict[str, Any], folder: str, skip: int, top: int,
-                                proxy_url: str = '', fallback_proxy_urls: List[str] = None) -> Dict[str, Any]:
+                                proxy_url: str = '', fallback_proxy_urls: List[str] = None,
+                                include_details: bool = False) -> Dict[str, Any]:
     folder_name = normalize_folder_name(folder)
     if folder_name not in VALID_MAIL_FOLDERS or folder_name == 'all':
         return {
@@ -3436,7 +3437,8 @@ def fetch_account_folder_emails(account: Dict[str, Any], folder: str, skip: int,
             account.get('provider', 'custom'),
             skip,
             top,
-            proxy_url
+            proxy_url,
+            include_details=include_details,
         )
         if result.get('success'):
             return {
@@ -3586,7 +3588,13 @@ def fetch_account_graph_emails_by_recipient(
     }
 
 
-def fetch_account_emails(account: Dict[str, Any], folder: str, skip: int, top: int) -> Dict[str, Any]:
+def fetch_account_emails(
+    account: Dict[str, Any],
+    folder: str,
+    skip: int,
+    top: int,
+    include_details: bool = False,
+) -> Dict[str, Any]:
     proxy_url = get_account_proxy_url(account)
     fallback_proxy_urls = get_account_proxy_failover_urls(account)
     folder_name = normalize_folder_name(folder)
@@ -3601,6 +3609,7 @@ def fetch_account_emails(account: Dict[str, Any], folder: str, skip: int, top: i
         folder_jobs = ('inbox', 'junkemail')
         results = {}
         executor = ThreadPoolExecutor(max_workers=len(folder_jobs), thread_name_prefix='mail-folder-fetch')
+        detail_kwargs = {'include_details': True} if include_details else {}
         future_map = {
             folder_job: executor.submit(
                 fetch_account_folder_emails,
@@ -3610,6 +3619,7 @@ def fetch_account_emails(account: Dict[str, Any], folder: str, skip: int, top: i
                 top,
                 proxy_url,
                 fallback_proxy_urls,
+                **detail_kwargs,
             )
             for folder_job in folder_jobs
         }
@@ -3652,6 +3662,16 @@ def fetch_account_emails(account: Dict[str, Any], folder: str, skip: int, top: i
             merged_top
         )
 
+    if include_details:
+        return fetch_account_folder_emails(
+            account,
+            folder_name,
+            skip,
+            top,
+            proxy_url,
+            fallback_proxy_urls,
+            include_details=True,
+        )
     return fetch_account_folder_emails(account, folder_name, skip, top, proxy_url, fallback_proxy_urls)
 
 
