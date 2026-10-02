@@ -4,14 +4,17 @@ import html
 import hashlib
 import hmac
 import io
+import os
 import secrets
 import sqlite3
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from functools import wraps
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 import zipfile
 
 from outlook_web.recipient_links import (
@@ -37,6 +40,7 @@ RECIPIENT_LINK_MAX_PAGE_SIZE = 100
 RECIPIENT_LINK_MAX_MAILBOX_OPTIONS = 10
 RECIPIENT_LINK_PUBLIC_PAGE_LIMIT = 20
 RECIPIENT_LINK_PUBLIC_PAGE_MAX_LIMIT = 10_000
+RECIPIENT_LINK_STICKY_FORWARD_HEADER = "X-Public-Mailbox-Sticky-Forwarded"
 
 RECIPIENT_LINK_ERROR_MESSAGES = {
     "invalid_mode": "导入模式无效",
@@ -1069,6 +1073,162 @@ def _recipient_link_public_json_response(payload: dict[str, Any], status: int = 
     return response
 
 
+def _recipient_link_sticky_enabled() -> bool:
+    return _recipient_link_sticky_config_value(
+        "PUBLIC_MAILBOX_STICKY_ENABLED",
+        "/app/data/public_mailbox_sticky_enabled",
+    ).lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _recipient_link_sticky_config_value(env_name: str, file_path: str) -> str:
+    value = str(os.getenv(env_name) or "").strip()
+    if value:
+        return value
+    try:
+        with open(file_path, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _recipient_link_sticky_node_id() -> str:
+    explicit = _recipient_link_sticky_config_value(
+        "PUBLIC_MAILBOX_STICKY_NODE_ID",
+        "/app/data/public_mailbox_sticky_node_id",
+    )
+    if explicit:
+        return explicit
+    return _mailbox_node_identifier()
+
+
+def _recipient_link_sticky_nodes() -> dict[str, str]:
+    raw_value = _recipient_link_sticky_config_value(
+        "PUBLIC_MAILBOX_STICKY_NODES",
+        "/app/data/public_mailbox_sticky_nodes",
+    )
+    nodes: dict[str, str] = {}
+    for chunk in raw_value.replace("\n", ",").split(","):
+        item = chunk.strip()
+        if not item or "=" not in item:
+            continue
+        node_id, base_url = item.split("=", 1)
+        node_id = node_id.strip()
+        base_url = base_url.strip().rstrip("/")
+        if node_id and base_url:
+            nodes[node_id] = base_url
+    return nodes
+
+
+def _recipient_link_sticky_owner(account_id: int, nodes: dict[str, str]) -> str:
+    owner = ""
+    best_score = ""
+    account_key = str(int(account_id or 0))
+    for node_id in sorted(nodes):
+        score = hashlib.sha256(f"{account_key}:{node_id}".encode("utf-8")).hexdigest()
+        if not owner or score > best_score:
+            owner = node_id
+            best_score = score
+    return owner
+
+
+def _recipient_link_sticky_target_url(base_url: str) -> str:
+    current = urlsplit(request.url)
+    base = urlsplit(str(base_url or "").rstrip("/"))
+    return urlunsplit((
+        base.scheme or current.scheme,
+        base.netloc,
+        current.path,
+        current.query,
+        "",
+    ))
+
+
+def _recipient_link_try_sticky_forward(account_id: int):
+    if not _recipient_link_sticky_enabled():
+        return None
+    if request.headers.get(RECIPIENT_LINK_STICKY_FORWARD_HEADER):
+        return None
+    nodes = _recipient_link_sticky_nodes()
+    if len(nodes) < 2:
+        return None
+    current_node = _recipient_link_sticky_node_id()
+    owner_node = _recipient_link_sticky_owner(account_id, nodes)
+    if not owner_node or owner_node == current_node:
+        return None
+    target_base = nodes.get(owner_node)
+    if not target_base:
+        return None
+
+    target_url = _recipient_link_sticky_target_url(target_base)
+    timeout = 15.0
+    try:
+        timeout = max(
+            1.0,
+            min(
+                float(os.getenv("PUBLIC_MAILBOX_STICKY_FORWARD_TIMEOUT_SECONDS", "15") or "15"),
+                60.0,
+            ),
+        )
+    except ValueError:
+        timeout = 15.0
+
+    headers = {
+        "User-Agent": str(request.headers.get("User-Agent") or "mailbox-sticky-forwarder"),
+        "Accept": str(request.headers.get("Accept") or "*/*"),
+        RECIPIENT_LINK_STICKY_FORWARD_HEADER: current_node or "1",
+        "X-Public-Mailbox-Sticky-Owner": owner_node,
+    }
+    try:
+        forwarded = urllib.request.Request(target_url, headers=headers, method="GET")
+        with urllib.request.urlopen(forwarded, timeout=timeout) as upstream:
+            body = upstream.read()
+            status = int(upstream.getcode() or 200)
+            response = make_response(body, status)
+            for header_name in (
+                "Content-Type",
+                "Cache-Control",
+                "Content-Security-Policy",
+                "Referrer-Policy",
+                "X-Content-Type-Options",
+                "X-Robots-Tag",
+                "X-Mailbox-Node",
+            ):
+                header_value = upstream.headers.get(header_name)
+                if header_value:
+                    response.headers[header_name] = header_value
+            response.headers["X-Public-Mailbox-Sticky-Routed"] = owner_node
+            return response
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        response = make_response(body, int(exc.code or 502))
+        for header_name in (
+            "Content-Type",
+            "Cache-Control",
+            "Content-Security-Policy",
+            "Referrer-Policy",
+            "X-Content-Type-Options",
+            "X-Robots-Tag",
+            "X-Mailbox-Node",
+        ):
+            header_value = exc.headers.get(header_name)
+            if header_value:
+                response.headers[header_name] = header_value
+        response.headers["X-Public-Mailbox-Sticky-Routed"] = owner_node
+        return response
+    except Exception:
+        app.logger.exception(
+            "recipient mailbox sticky forward failed account_id=%s owner=%s",
+            account_id,
+            owner_node,
+        )
+        return None
+
+
 class _RecipientLinkQueryHTMLTextExtractor(HTMLParser):
     _BLOCK_TAGS = {
         "address",
@@ -1333,6 +1493,10 @@ def _recipient_link_public_mailbox_response(shared: str, recipient_email: str, *
         if response_format == "json":
             return _recipient_link_public_query_error("链接不存在", 404)
         return recipient_link_html_response("链接不存在", 404)
+
+    sticky_response = _recipient_link_try_sticky_forward(int(row["account_id"]))
+    if sticky_response is not None:
+        return sticky_response
 
     if CLUSTER_CONFIG.is_replica:
         replica_state = _load_replica_state_with_repair()

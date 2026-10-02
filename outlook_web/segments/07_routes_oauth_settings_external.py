@@ -1563,12 +1563,12 @@ PUBLIC_MAILBOX_IMAP_AUTH_ERROR_CACHE_SECONDS = _public_mailbox_cache_seconds(
 
 
 def _public_mailbox_upstream_concurrency() -> int:
-    raw_value = str(os.getenv("PUBLIC_MAILBOX_UPSTREAM_CONCURRENCY", "12") or "").strip()
+    raw_value = str(os.getenv("PUBLIC_MAILBOX_UPSTREAM_CONCURRENCY", "100") or "").strip()
     try:
         value = int(raw_value)
     except ValueError:
-        return 12
-    return max(12, min(value, 24))
+        return 100
+    return max(1, min(value, 100))
 
 
 def _public_mailbox_upstream_acquire_timeout_seconds() -> float:
