@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +18,7 @@ DEFAULT_NODES = {
     "68.221.72.212:5000": 1,
     "91.233.10.96:5005": 1,
     "172.93.219.182:5000": 1,
+    "172.188.64.234:5000": 1,
 }
 
 
@@ -104,6 +106,161 @@ def load_expected_nodes() -> dict[str, int]:
         return {str(key): int(value) for key, value in dict(parsed).items()}
     except (TypeError, ValueError, json.JSONDecodeError):
         return dict(DEFAULT_NODES)
+
+
+def apisix_management_enabled() -> bool:
+    return os.getenv("MAIL_CLUSTER_APISIX_MANAGE", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def apisix_admin_context() -> tuple[str, str, dict[str, str]]:
+    admin_url = os.getenv("APISIX_ADMIN_URL", "http://127.0.0.1:9180/apisix/admin").rstrip("/")
+    upstream_id = os.getenv("APISIX_UPSTREAM_ID", "00000000000000000015").strip()
+    api_key = os.getenv("APISIX_API_KEY", "").strip()
+    return admin_url, upstream_id, {"X-API-KEY": api_key}
+
+
+def read_current_upstream_nodes() -> tuple[dict[str, int] | None, list[str]]:
+    if not apisix_management_enabled():
+        return None, []
+    admin_url, upstream_id, headers = apisix_admin_context()
+    if not upstream_id or not headers["X-API-KEY"]:
+        return None, ["APISIX upstream state unavailable: missing APISIX_UPSTREAM_ID or APISIX_API_KEY"]
+    try:
+        status, payload, _text = http_json(
+            f"{admin_url}/upstreams/{upstream_id}",
+            headers=headers,
+            timeout=5,
+        )
+    except Exception as exc:
+        return None, [f"APISIX upstream read failed: {exc!r}"]
+    if status != 200 or not isinstance(payload, dict):
+        return None, [f"APISIX upstream read failed status={status}"]
+    value = payload.get("value") or {}
+    return dict(value.get("nodes") or {}), []
+
+
+def monitor_state_path() -> str:
+    return (
+        os.getenv(
+            "MAIL_CLUSTER_STATE_FILE",
+            "/var/lib/mail-cluster-monitor/state.json",
+        ).strip()
+        or "/var/lib/mail-cluster-monitor/state.json"
+    )
+
+
+def load_monitor_state(
+    expected_nodes: dict[str, int],
+    current_nodes: dict[str, int] | None,
+) -> dict[str, Any]:
+    path = monitor_state_path()
+    payload: dict[str, Any] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            candidate = json.load(handle)
+        if isinstance(candidate, dict):
+            payload = candidate
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+
+    stored_nodes = payload.get("nodes")
+    if not isinstance(stored_nodes, dict):
+        stored_nodes = {}
+
+    def safe_int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def safe_float(value: Any) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    nodes: dict[str, dict[str, Any]] = {}
+    for node in expected_nodes:
+        stored = stored_nodes.get(node)
+        if not isinstance(stored, dict):
+            stored = {}
+        initial_online = node in current_nodes if current_nodes is not None else True
+        nodes[node] = {
+            "online": bool(stored.get("online", initial_online)),
+            "failure_count": safe_int(stored.get("failure_count", 0)),
+            "success_count": safe_int(stored.get("success_count", 0)),
+            "cooldown_until": safe_float(stored.get("cooldown_until", 0.0)),
+            "last_change_at": safe_float(stored.get("last_change_at", 0.0)),
+        }
+    return {"version": 1, "nodes": nodes}
+
+
+def save_monitor_state(state: dict[str, Any]) -> None:
+    path = monitor_state_path()
+    directory = os.path.dirname(path) or "."
+    try:
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(prefix=".state-", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, ensure_ascii=False, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, path)
+        finally:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+    except OSError as exc:
+        print(f"monitor state save failed: {exc!r}", file=sys.stderr, flush=True)
+
+
+def update_monitor_state(
+    state: dict[str, Any],
+    node_results: list[CheckResult],
+    *,
+    weights: dict[str, int],
+    failure_threshold: int,
+    success_threshold: int,
+    cooldown_seconds: float,
+) -> dict[str, int]:
+    now = time.time()
+    active_nodes: dict[str, int] = {}
+    for result in node_results:
+        node = result.name.split(":", 1)[1].split("/", 1)[0]
+        entry = state["nodes"][node]
+        if result.ok:
+            entry["failure_count"] = 0
+            entry["success_count"] = int(entry.get("success_count", 0)) + 1
+            if (
+                not entry["online"]
+                and entry["success_count"] >= success_threshold
+                and now >= float(entry.get("cooldown_until", 0.0) or 0.0)
+            ):
+                entry["online"] = True
+                entry["last_change_at"] = now
+                entry["cooldown_until"] = now + cooldown_seconds
+        else:
+            entry["success_count"] = 0
+            entry["failure_count"] = int(entry.get("failure_count", 0)) + 1
+            if (
+                entry["online"]
+                and entry["failure_count"] >= failure_threshold
+                and now >= float(entry.get("cooldown_until", 0.0) or 0.0)
+            ):
+                entry["online"] = False
+                entry["last_change_at"] = now
+                entry["cooldown_until"] = now + cooldown_seconds
+        if entry["online"]:
+            active_nodes[node] = weights[node]
+    return active_nodes
 
 
 def upstream_payload(expected_nodes: dict[str, int]) -> dict[str, Any]:
@@ -272,36 +429,39 @@ def notify(message: str) -> None:
         print(f"webhook failed: {exc!r}", file=sys.stderr, flush=True)
 
 
-def ensure_upstream(active_nodes: dict[str, int], expected_nodes: dict[str, int] | None = None) -> list[str]:
-    if os.getenv("MAIL_CLUSTER_APISIX_MANAGE", "false").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+def ensure_upstream(
+    active_nodes: dict[str, int],
+    expected_nodes: dict[str, int] | None = None,
+    current_nodes: dict[str, int] | None = None,
+) -> list[str]:
+    if not apisix_management_enabled():
         return []
-    admin_url = os.getenv("APISIX_ADMIN_URL", "http://127.0.0.1:9180/apisix/admin").rstrip("/")
-    upstream_id = os.getenv("APISIX_UPSTREAM_ID", "00000000000000000015").strip()
-    api_key = os.getenv("APISIX_API_KEY", "").strip()
-    if not upstream_id or not api_key:
+    admin_url, upstream_id, headers = apisix_admin_context()
+    if not upstream_id or not headers["X-API-KEY"]:
         return ["APISIX upstream enforcement skipped: missing APISIX_UPSTREAM_ID or APISIX_API_KEY"]
-    headers = {"X-API-KEY": api_key}
     url = f"{admin_url}/upstreams/{upstream_id}"
-    try:
-        status, payload, _text = http_json(url, headers=headers, timeout=5)
-    except Exception as exc:
-        return [f"APISIX upstream read failed: {exc!r}"]
-    if status != 200 or not isinstance(payload, dict):
-        return [f"APISIX upstream read failed status={status}"]
-    current = dict((payload.get("value") or {}).get("nodes") or {})
-    alerts = []
-    if current != active_nodes:
+    alerts: list[str] = []
+    if current_nodes is None:
+        current_nodes, read_alerts = read_current_upstream_nodes()
+        alerts.extend(read_alerts)
+    if current_nodes is None:
+        return alerts
+    if current_nodes != active_nodes:
         put_status = put_json(url, upstream_payload(active_nodes), headers=headers, timeout=5)
-        alerts.append(f"APISIX upstream nodes corrected status={put_status} from={current} to={active_nodes}")
+        alerts.append(
+            f"APISIX upstream nodes corrected status={put_status} "
+            f"from={current_nodes} to={active_nodes}"
+        )
         if expected_nodes:
             offline_nodes = sorted(set(expected_nodes) - set(active_nodes))
             if offline_nodes:
                 alerts.append(f"APISIX upstream business-unhealthy nodes offline nodes={offline_nodes}")
+    try:
+        status, payload, _text = http_json(url, headers=headers, timeout=5)
+    except Exception as exc:
+        return alerts + [f"APISIX upstream re-read failed: {exc!r}"]
+    if status != 200 or not isinstance(payload, dict):
+        return alerts + [f"APISIX upstream re-read failed status={status}"]
     value = payload.get("value") or {}
     checks = value.get("checks") if isinstance(value, dict) else None
     active = checks.get("active") if isinstance(checks, dict) else None
@@ -322,16 +482,29 @@ def main() -> int:
     probe_timeout = env_float("MAIL_CLUSTER_PROBE_TIMEOUT_SECONDS", 12.0)
     probe_slow_seconds = env_float("MAIL_CLUSTER_PROBE_SLOW_SECONDS", 5.0)
     failures_allowed = env_int("MAIL_CLUSTER_FAILURES_ALLOWED", 0)
+    failure_threshold = max(1, env_int("MAIL_CLUSTER_FAILURES_TO_OFFLINE", 2))
+    success_threshold = max(1, env_int("MAIL_CLUSTER_SUCCESSES_TO_ONLINE", 2))
+    cooldown_seconds = max(
+        0.0,
+        min(env_float("MAIL_CLUSTER_NODE_COOLDOWN_SECONDS", 120.0), 3600.0),
+    )
 
     node_results = [check_node(node, ready_timeout, node_probe_path) for node in expected_nodes]
-    active_nodes = {
-        node: expected_nodes[node]
-        for node, result in zip(expected_nodes, node_results)
-        if result.ok
-    }
+    current_nodes, state_alerts = read_current_upstream_nodes()
+    state = load_monitor_state(expected_nodes, current_nodes)
+    active_nodes = update_monitor_state(
+        state,
+        node_results,
+        weights=expected_nodes,
+        failure_threshold=failure_threshold,
+        success_threshold=success_threshold,
+        cooldown_seconds=cooldown_seconds,
+    )
+    save_monitor_state(state)
     alerts = []
+    alerts.extend(state_alerts)
     if active_nodes:
-        alerts.extend(ensure_upstream(active_nodes, expected_nodes))
+        alerts.extend(ensure_upstream(active_nodes, expected_nodes, current_nodes))
     else:
         alerts.append("APISIX upstream update skipped: all expected nodes failed business probe")
     results = list(node_results)

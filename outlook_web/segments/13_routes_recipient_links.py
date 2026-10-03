@@ -9,8 +9,6 @@ import secrets
 import sqlite3
 import threading
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from functools import wraps
 from html.parser import HTMLParser
@@ -18,6 +16,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 import zipfile
+
+import requests
+from requests.adapters import HTTPAdapter
 
 from outlook_web.recipient_links import (
     RecipientLinkInputError,
@@ -45,6 +46,8 @@ RECIPIENT_LINK_PUBLIC_PAGE_MAX_LIMIT = 10_000
 RECIPIENT_LINK_STICKY_FORWARD_HEADER = "X-Public-Mailbox-Sticky-Forwarded"
 RECIPIENT_LINK_STICKY_NODE_COOLDOWNS: dict[str, float] = {}
 RECIPIENT_LINK_STICKY_NODE_COOLDOWNS_LOCK = threading.Lock()
+RECIPIENT_LINK_STICKY_SESSION: requests.Session | None = None
+RECIPIENT_LINK_STICKY_SESSION_LOCK = threading.Lock()
 
 RECIPIENT_LINK_ERROR_MESSAGES = {
     "invalid_mode": "导入模式无效",
@@ -979,23 +982,45 @@ def resolve_recipient_link_public(shared: Any, recipient_email: Any):
     except RecipientLinkInputError:
         return None
 
-    rows = get_db().execute(
+    row = get_db().execute(
         """
         SELECT
             l.*,
             a.id AS bound_account_exists,
             a.recipient_share_segment AS recipient_share_segment
         FROM recipient_mail_links AS l
-        LEFT JOIN accounts AS a ON a.id = l.account_id
+        INNER JOIN accounts AS a ON a.id = l.account_id
         WHERE l.recipient_email_normalized = ?
+          AND a.recipient_share_segment = ?
+        ORDER BY l.id
+        LIMIT 1
+        """,
+        (lookup_recipient, normalized_shared),
+    ).fetchone()
+    if row is not None:
+        return row
+
+    # Older databases may still have an empty segment until the primary
+    # migration backfills it. Preserve those links without making the normal
+    # lookup scan every binding for the recipient.
+    legacy_rows = get_db().execute(
+        """
+        SELECT
+            l.*,
+            a.id AS bound_account_exists,
+            a.recipient_share_segment AS recipient_share_segment
+        FROM recipient_mail_links AS l
+        INNER JOIN accounts AS a ON a.id = l.account_id
+        WHERE l.recipient_email_normalized = ?
+          AND COALESCE(a.recipient_share_segment, '') = ''
         ORDER BY l.id
         """,
         (lookup_recipient,),
     ).fetchall()
-    for row in rows:
-        persisted_shared = str(row["recipient_share_segment"] or "").strip()
-        if persisted_shared and hmac.compare_digest(persisted_shared, normalized_shared):
-            return row
+    for legacy_row in legacy_rows:
+        legacy_shared = legacy_recipient_share_segment(int(legacy_row["account_id"]))
+        if hmac.compare_digest(legacy_shared, normalized_shared):
+            return legacy_row
     return None
 
 
@@ -1182,6 +1207,39 @@ def _recipient_link_sticky_clear_node_failure(node_id: str) -> None:
         RECIPIENT_LINK_STICKY_NODE_COOLDOWNS.pop(node_id, None)
 
 
+def _recipient_link_sticky_session() -> requests.Session:
+    global RECIPIENT_LINK_STICKY_SESSION
+    if RECIPIENT_LINK_STICKY_SESSION is not None:
+        return RECIPIENT_LINK_STICKY_SESSION
+    with RECIPIENT_LINK_STICKY_SESSION_LOCK:
+        if RECIPIENT_LINK_STICKY_SESSION is not None:
+            return RECIPIENT_LINK_STICKY_SESSION
+        try:
+            pool_size = max(
+                1,
+                min(
+                    int(os.getenv("PUBLIC_MAILBOX_STICKY_POOL_SIZE", "16") or "16"),
+                    128,
+                ),
+            )
+        except ValueError:
+            pool_size = 16
+        pool_block = str(
+            os.getenv("PUBLIC_MAILBOX_STICKY_POOL_BLOCK", "true") or "true"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        session = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=pool_size,
+            pool_maxsize=pool_size,
+            pool_block=pool_block,
+            max_retries=0,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        RECIPIENT_LINK_STICKY_SESSION = session
+        return session
+
+
 def _recipient_link_try_sticky_forward(account_id: int):
     if not _recipient_link_sticky_enabled():
         return None
@@ -1220,29 +1278,13 @@ def _recipient_link_try_sticky_forward(account_id: int):
         "X-Public-Mailbox-Sticky-Owner": owner_node,
     }
     try:
-        forwarded = urllib.request.Request(target_url, headers=headers, method="GET")
-        with urllib.request.urlopen(forwarded, timeout=timeout) as upstream:
-            body = upstream.read()
-            status = int(upstream.getcode() or 200)
-            response = make_response(body, status)
-            for header_name in (
-                "Content-Type",
-                "Cache-Control",
-                "Content-Security-Policy",
-                "Referrer-Policy",
-                "X-Content-Type-Options",
-                "X-Robots-Tag",
-                "X-Mailbox-Node",
-            ):
-                header_value = upstream.headers.get(header_name)
-                if header_value:
-                    response.headers[header_name] = header_value
-            response.headers["X-Public-Mailbox-Sticky-Routed"] = owner_node
-            _recipient_link_sticky_clear_node_failure(owner_node)
-            return response
-    except urllib.error.HTTPError as exc:
-        body = exc.read()
-        response = make_response(body, int(exc.code or 502))
+        upstream = _recipient_link_sticky_session().get(
+            target_url,
+            headers=headers,
+            timeout=timeout,
+        )
+        status = int(upstream.status_code or 200)
+        response = make_response(upstream.content, status)
         for header_name in (
             "Content-Type",
             "Cache-Control",
@@ -1252,14 +1294,16 @@ def _recipient_link_try_sticky_forward(account_id: int):
             "X-Robots-Tag",
             "X-Mailbox-Node",
         ):
-            header_value = exc.headers.get(header_name)
+            header_value = upstream.headers.get(header_name)
             if header_value:
                 response.headers[header_name] = header_value
         response.headers["X-Public-Mailbox-Sticky-Routed"] = owner_node
-        if int(exc.code or 0) >= 500:
+        if status >= 500:
             _recipient_link_sticky_mark_node_failure(owner_node)
+        else:
+            _recipient_link_sticky_clear_node_failure(owner_node)
         return response
-    except Exception:
+    except requests.RequestException:
         _recipient_link_sticky_mark_node_failure(owner_node)
         app.logger.exception(
             "recipient mailbox sticky forward failed account_id=%s owner=%s",

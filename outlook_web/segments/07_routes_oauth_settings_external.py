@@ -1583,6 +1583,20 @@ def _public_mailbox_upstream_acquire_timeout_seconds() -> float:
     return max(3.0, min(value, 10.0))
 
 
+def _public_mailbox_upstream_workers() -> int:
+    raw_value = str(
+        os.getenv("PUBLIC_MAILBOX_UPSTREAM_WORKERS", "") or ""
+    ).strip()
+    default_value = min(PUBLIC_MAILBOX_UPSTREAM_CONCURRENCY, 32)
+    if not raw_value:
+        return max(1, default_value)
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return max(1, default_value)
+    return max(1, min(value, PUBLIC_MAILBOX_UPSTREAM_CONCURRENCY))
+
+
 PUBLIC_MAILBOX_UPSTREAM_CONCURRENCY = _public_mailbox_upstream_concurrency()
 PUBLIC_MAILBOX_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS = (
     _public_mailbox_upstream_acquire_timeout_seconds()
@@ -1592,6 +1606,11 @@ PUBLIC_MAILBOX_ACCOUNT_LOCK_ACQUIRE_TIMEOUT_SECONDS = float(
 )
 PUBLIC_MAILBOX_UPSTREAM_GATE = threading.BoundedSemaphore(
     PUBLIC_MAILBOX_UPSTREAM_CONCURRENCY,
+)
+PUBLIC_MAILBOX_UPSTREAM_WORKERS = _public_mailbox_upstream_workers()
+PUBLIC_MAILBOX_UPSTREAM_EXECUTOR = ThreadPoolExecutor(
+    max_workers=PUBLIC_MAILBOX_UPSTREAM_WORKERS,
+    thread_name_prefix='public-mailbox-fetch',
 )
 PUBLIC_MAILBOX_ACCOUNT_LOCKS: Dict[str, threading.Lock] = {}
 PUBLIC_MAILBOX_ACCOUNT_LOCKS_GUARD = threading.Lock()
@@ -1956,42 +1975,36 @@ def call_public_mailbox_upstream(func, *args, **kwargs):
         PUBLIC_MAILBOX_UPSTREAM_GATE.release()
         return public_mailbox_upstream_busy_error()
 
-    executor = ThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix='public-mailbox-fetch',
-    )
-    account_lock_released = False
-    account_lock_release_guard = threading.Lock()
+    resources_released = False
+    resource_release_guard = threading.Lock()
 
-    def release_account_lock() -> None:
-        nonlocal account_lock_released
-        if account_lock is None:
-            return
-        with account_lock_release_guard:
-            if account_lock_released:
+    def release_resources() -> None:
+        nonlocal resources_released
+        with resource_release_guard:
+            if resources_released:
                 return
-            account_lock_released = True
-            account_lock.release()
+            resources_released = True
+            if account_lock is not None:
+                account_lock.release()
+            PUBLIC_MAILBOX_UPSTREAM_GATE.release()
 
     def invoke_with_app_context():
         try:
             with app.app_context():
                 return func(*args, **kwargs)
         finally:
-            release_account_lock()
-            PUBLIC_MAILBOX_UPSTREAM_GATE.release()
+            release_resources()
 
     try:
-        future = executor.submit(invoke_with_app_context)
+        future = PUBLIC_MAILBOX_UPSTREAM_EXECUTOR.submit(invoke_with_app_context)
     except Exception:
-        if account_lock is not None:
-            account_lock.release()
-        PUBLIC_MAILBOX_UPSTREAM_GATE.release()
+        release_resources()
         raise
     try:
         done, _not_done = wait([future], timeout=timeout_seconds)
         if future not in done:
-            future.cancel()
+            if future.cancel():
+                release_resources()
             return public_mailbox_fetch_timeout_error()
         return future.result()
     except Exception as exc:
@@ -2010,7 +2023,8 @@ def call_public_mailbox_upstream(func, *args, **kwargs):
             ),
         }
     finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+        if future.done():
+            release_resources()
 
 
 def public_mailbox_message_key(item: Dict[str, Any]) -> tuple:

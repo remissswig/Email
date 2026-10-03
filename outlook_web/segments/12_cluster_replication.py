@@ -1172,11 +1172,21 @@ def health_ready():
 
 
 def _business_probe_error(code: str, message: str, checks: dict[str, Any], status: int = 503):
+    replica_check = checks.get('replica') if isinstance(checks, dict) else {}
+    sticky_check = checks.get('sticky') if isinstance(checks, dict) else {}
     return public_mailbox_json_response({
         'success': False,
         'status': 'business_unhealthy',
         'error_code': code,
         'error': message,
+        'app_version': APP_VERSION,
+        'build_sha': BUILD_GIT_SHA,
+        'node_id': (
+            (replica_check or {}).get('node_id')
+            or (sticky_check or {}).get('node_id')
+            or (replica_check or {}).get('role')
+            or 'unknown'
+        ),
         'checks': checks,
     }, status)
 
@@ -1249,6 +1259,8 @@ def health_business():
     return public_mailbox_json_response({
         'success': True,
         'status': 'business_ready',
+        'app_version': APP_VERSION,
+        'build_sha': BUILD_GIT_SHA,
         'node_id': checks['replica'].get('node_id') or sticky.get('node_id') or checks['replica'].get('role') or 'unknown',
         'checks': checks,
     })

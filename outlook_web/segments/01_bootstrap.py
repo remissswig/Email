@@ -221,6 +221,8 @@ try:
 except Exception:
     APP_VERSION = '1.0.0'
 
+BUILD_GIT_SHA = str(os.getenv('BUILD_GIT_SHA', 'unknown') or 'unknown').strip() or 'unknown'
+
 REPOSITORY_OWNER = os.getenv('REPOSITORY_OWNER', 'assast')
 REPOSITORY_NAME = os.getenv('REPOSITORY_NAME', 'outlookEmail')
 CHANGELOG_URL = os.getenv(
@@ -1920,6 +1922,13 @@ def init_db():
             "ADD COLUMN recipient_share_segment TEXT NOT NULL DEFAULT ''"
         )
         recipient_share_segment_added = True
+
+    cursor.execute(
+        '''
+        CREATE INDEX IF NOT EXISTS idx_accounts_recipient_share_segment
+        ON accounts(recipient_share_segment)
+        '''
+    )
 
     cursor.execute("PRAGMA table_info(public_mailbox_api_keys)")
     public_mailbox_api_key_columns = [col[1] for col in cursor.fetchall()]

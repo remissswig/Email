@@ -4119,6 +4119,7 @@ class ReplicaPublicMailboxMessagesApiTests(unittest.TestCase):
         )
         with self.app.app_context():
             db = self.replica_module.get_db()
+            db.execute('DROP INDEX IF EXISTS idx_accounts_recipient_share_segment')
             db.execute('ALTER TABLE accounts DROP COLUMN recipient_share_segment')
             db.commit()
 
