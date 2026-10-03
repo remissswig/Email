@@ -107,11 +107,14 @@ def load_expected_nodes() -> dict[str, int]:
 
 
 def upstream_payload(expected_nodes: dict[str, int]) -> dict[str, Any]:
+    healthcheck_path = os.getenv("MAIL_CLUSTER_APISIX_HEALTHCHECK_PATH", "/health/business").strip()
+    if not healthcheck_path.startswith("/"):
+        healthcheck_path = "/health/business"
     return {
         "name": os.getenv("MAIL_CLUSTER_UPSTREAM_NAME", "mail-cluster"),
         "desc": os.getenv(
             "MAIL_CLUSTER_UPSTREAM_DESC",
-            "mail-cluster active nodes; managed healthcheck enabled",
+            "mail-cluster active business-ready nodes; managed healthcheck enabled",
         ),
         "type": "chash",
         "hash_on": "vars",
@@ -122,7 +125,7 @@ def upstream_payload(expected_nodes: dict[str, int]) -> dict[str, Any]:
         "checks": {
             "active": {
                 "type": "http",
-                "http_path": "/health/ready",
+                "http_path": healthcheck_path,
                 "timeout": 2,
                 "concurrency": 4,
                 "healthy": {
@@ -155,17 +158,23 @@ def upstream_payload(expected_nodes: dict[str, int]) -> dict[str, Any]:
     }
 
 
-def check_ready(node: str, timeout: float) -> CheckResult:
-    url = f"http://{node}/health/ready"
+def check_node(node: str, timeout: float, path: str) -> CheckResult:
+    if not path.startswith("/"):
+        path = "/health/business"
+    url = f"http://{node}{path}"
     started = time.time()
     try:
         status, payload, text = http_json(url, timeout=timeout)
         seconds = time.time() - started
         ok = status == 200 and isinstance(payload, dict) and payload.get("success") is True
         message = text[:200].replace("\n", " ")
-        return CheckResult(f"ready:{node}", ok, seconds, status, message)
+        return CheckResult(f"node:{node}{path}", ok, seconds, status, message)
     except Exception as exc:
-        return CheckResult(f"ready:{node}", False, time.time() - started, None, repr(exc))
+        return CheckResult(f"node:{node}{path}", False, time.time() - started, None, repr(exc))
+
+
+def check_ready(node: str, timeout: float) -> CheckResult:
+    return check_node(node, timeout, "/health/ready")
 
 
 def check_probe(url: str, timeout: float, slow_seconds: float) -> CheckResult:
@@ -263,7 +272,7 @@ def notify(message: str) -> None:
         print(f"webhook failed: {exc!r}", file=sys.stderr, flush=True)
 
 
-def ensure_upstream(expected_nodes: dict[str, int]) -> list[str]:
+def ensure_upstream(active_nodes: dict[str, int], expected_nodes: dict[str, int] | None = None) -> list[str]:
     if os.getenv("MAIL_CLUSTER_APISIX_MANAGE", "false").strip().lower() not in {
         "1",
         "true",
@@ -286,13 +295,22 @@ def ensure_upstream(expected_nodes: dict[str, int]) -> list[str]:
         return [f"APISIX upstream read failed status={status}"]
     current = dict((payload.get("value") or {}).get("nodes") or {})
     alerts = []
-    if current != expected_nodes:
-        put_status = put_json(url, upstream_payload(expected_nodes), headers=headers, timeout=5)
-        alerts.append(f"APISIX upstream nodes corrected status={put_status} from={current} to={expected_nodes}")
+    if current != active_nodes:
+        put_status = put_json(url, upstream_payload(active_nodes), headers=headers, timeout=5)
+        alerts.append(f"APISIX upstream nodes corrected status={put_status} from={current} to={active_nodes}")
+        if expected_nodes:
+            offline_nodes = sorted(set(expected_nodes) - set(active_nodes))
+            if offline_nodes:
+                alerts.append(f"APISIX upstream business-unhealthy nodes offline nodes={offline_nodes}")
     value = payload.get("value") or {}
     checks = value.get("checks") if isinstance(value, dict) else None
-    if not isinstance(checks, dict) or "active" not in checks:
-        put_status = put_json(url, upstream_payload(expected_nodes), headers=headers, timeout=5)
+    active = checks.get("active") if isinstance(checks, dict) else None
+    expected_path = os.getenv("MAIL_CLUSTER_APISIX_HEALTHCHECK_PATH", "/health/business").strip()
+    if not expected_path.startswith("/"):
+        expected_path = "/health/business"
+    current_path = active.get("http_path") if isinstance(active, dict) else None
+    if not isinstance(checks, dict) or "active" not in checks or current_path != expected_path:
+        put_status = put_json(url, upstream_payload(active_nodes), headers=headers, timeout=5)
         alerts.append(f"APISIX upstream healthcheck restored status={put_status}")
     return alerts
 
@@ -300,12 +318,23 @@ def ensure_upstream(expected_nodes: dict[str, int]) -> list[str]:
 def main() -> int:
     expected_nodes = load_expected_nodes()
     ready_timeout = env_float("MAIL_CLUSTER_READY_TIMEOUT_SECONDS", 4.0)
+    node_probe_path = os.getenv("MAIL_CLUSTER_NODE_PROBE_PATH", "/health/business").strip() or "/health/business"
     probe_timeout = env_float("MAIL_CLUSTER_PROBE_TIMEOUT_SECONDS", 12.0)
     probe_slow_seconds = env_float("MAIL_CLUSTER_PROBE_SLOW_SECONDS", 5.0)
     failures_allowed = env_int("MAIL_CLUSTER_FAILURES_ALLOWED", 0)
 
-    alerts = ensure_upstream(expected_nodes)
-    results = [check_ready(node, ready_timeout) for node in expected_nodes]
+    node_results = [check_node(node, ready_timeout, node_probe_path) for node in expected_nodes]
+    active_nodes = {
+        node: expected_nodes[node]
+        for node, result in zip(expected_nodes, node_results)
+        if result.ok
+    }
+    alerts = []
+    if active_nodes:
+        alerts.extend(ensure_upstream(active_nodes, expected_nodes))
+    else:
+        alerts.append("APISIX upstream update skipped: all expected nodes failed business probe")
+    results = list(node_results)
 
     raw_probes = os.getenv("MAIL_CLUSTER_PUBLIC_PROBES", "").strip()
     probes = [item.strip() for item in raw_probes.split(",") if item.strip()]

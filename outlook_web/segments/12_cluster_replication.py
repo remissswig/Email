@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
 import threading
@@ -69,6 +70,7 @@ _REPLICA_ALLOWED_EXACT_PATHS = {
     '/',
     '/health/live',
     '/health/ready',
+    '/health/business',
     '/api/v1/mailboxes/messages',
     '/api/v1/cluster/status',
     '/api/v1/cluster/sync/snapshot',
@@ -1166,4 +1168,87 @@ def health_ready():
     return public_mailbox_json_response({
         'success': True,
         'status': 'ready',
+    })
+
+
+def _business_probe_error(code: str, message: str, checks: dict[str, Any], status: int = 503):
+    return public_mailbox_json_response({
+        'success': False,
+        'status': 'business_unhealthy',
+        'error_code': code,
+        'error': message,
+        'checks': checks,
+    }, status)
+
+
+def _business_probe_sticky_config() -> dict[str, Any]:
+    raw_nodes = str(os.getenv('PUBLIC_MAILBOX_STICKY_NODES') or '').strip()
+    nodes = []
+    for chunk in raw_nodes.replace('\n', ',').split(','):
+        item = chunk.strip()
+        if not item or '=' not in item:
+            continue
+        node_id, base_url = item.split('=', 1)
+        node_id = node_id.strip()
+        base_url = base_url.strip().rstrip('/')
+        if node_id and base_url:
+            nodes.append(node_id)
+    return {
+        'enabled': str(os.getenv('PUBLIC_MAILBOX_STICKY_ENABLED') or '').strip().lower()
+        in {'1', 'true', 'yes', 'on'},
+        'node_id': str(os.getenv('PUBLIC_MAILBOX_STICKY_NODE_ID') or '').strip(),
+        'nodes': nodes,
+        'node_count': len(nodes),
+    }
+
+
+@app.route('/health/business', methods=['GET'])
+def health_business():
+    checks: dict[str, Any] = {}
+
+    if CLUSTER_CONFIG.is_replica:
+        replica_state = _load_replica_state_with_repair()
+        is_ready, error_code = replica_readiness(
+            replica_state,
+            datetime.now(timezone.utc),
+            CLUSTER_CONFIG.max_stale_seconds,
+        )
+        checks['replica'] = {
+            'ready': is_ready,
+            'node_id': replica_state.node_id or 'replica',
+            'cursor': replica_state.cursor,
+            'last_success_at': (
+                replica_state.last_success_at.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+                if replica_state.last_success_at is not None
+                else None
+            ),
+            'error_code': '' if is_ready else error_code,
+        }
+        if not is_ready:
+            return _business_probe_error(error_code, 'replica is not ready for public mailbox reads', checks)
+    else:
+        checks['replica'] = {'ready': True, 'role': 'primary'}
+
+    try:
+        db = get_db()
+        db.execute('SELECT 1 FROM accounts LIMIT 1').fetchone()
+        db.execute('SELECT 1 FROM recipient_mail_links LIMIT 1').fetchone()
+        checks['database'] = {
+            'ok': True,
+            'tables': ['accounts', 'recipient_mail_links'],
+        }
+    except Exception as exc:
+        checks['database'] = {'ok': False, 'error': repr(exc)}
+        return _business_probe_error('database_unavailable', 'business database probe failed', checks)
+
+    sticky = _business_probe_sticky_config()
+    checks['sticky'] = sticky
+    if sticky['enabled'] and (not sticky['node_id'] or sticky['node_count'] < 1):
+        return _business_probe_error('sticky_config_invalid', 'sticky routing is enabled but incomplete', checks)
+
+    return public_mailbox_json_response({
+        'success': True,
+        'status': 'business_ready',
+        'node_id': checks['replica'].get('node_id') or sticky.get('node_id') or checks['replica'].get('role') or 'unknown',
+        'checks': checks,
     })
