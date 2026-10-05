@@ -1228,12 +1228,49 @@ def get_response_details(response: requests.Response) -> Any:
 
 # ==================== 数据库操作 ====================
 
+try:
+    SQLITE_CONNECTION_TIMEOUT_SECONDS = max(
+        1.0,
+        min(
+            float(os.getenv("SQLITE_CONNECTION_TIMEOUT_SECONDS", "10") or "10"),
+            60.0,
+        ),
+    )
+except ValueError:
+    SQLITE_CONNECTION_TIMEOUT_SECONDS = 10.0
+try:
+    SQLITE_BUSY_TIMEOUT_MILLISECONDS = max(
+        1000,
+        min(
+            int(os.getenv("SQLITE_BUSY_TIMEOUT_MILLISECONDS", "10000") or "10000"),
+            60000,
+        ),
+    )
+except ValueError:
+    SQLITE_BUSY_TIMEOUT_MILLISECONDS = 10000
+
+
+def configure_sqlite_connection(db) -> None:
+    db.execute(f'PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MILLISECONDS}')
+    db.execute('PRAGMA foreign_keys = ON')
+    try:
+        db.execute('PRAGMA journal_mode = WAL')
+        db.execute('PRAGMA synchronous = NORMAL')
+    except sqlite3.DatabaseError:
+        # Read-only replicas or unusual SQLite files may reject WAL; the
+        # connection remains usable with the busy timeout and foreign keys.
+        pass
+
+
 def get_db():
     """获取数据库连接"""
     db = getattr(g, '_database', None)
     if db is None:
-        db = g._database = sqlite3.connect(DATABASE)
-        db.execute('PRAGMA foreign_keys = ON')
+        db = g._database = sqlite3.connect(
+            DATABASE,
+            timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS,
+        )
+        configure_sqlite_connection(db)
         db.row_factory = sqlite3.Row
     return db
 
@@ -1354,8 +1391,11 @@ def backfill_recipient_share_segments(conn) -> int:
 
 def init_db():
     """初始化数据库"""
-    conn = sqlite3.connect(DATABASE)
-    conn.execute('PRAGMA foreign_keys = ON')
+    conn = sqlite3.connect(
+        DATABASE,
+        timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS,
+    )
+    configure_sqlite_connection(conn)
     cursor = conn.cursor()
     
     # 创建设置表

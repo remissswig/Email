@@ -1613,7 +1613,13 @@ PUBLIC_MAILBOX_UPSTREAM_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix='public-mailbox-fetch',
 )
 PUBLIC_MAILBOX_ACCOUNT_LOCKS: Dict[str, threading.Lock] = {}
+PUBLIC_MAILBOX_ACCOUNT_LOCK_LAST_USED: Dict[str, float] = {}
 PUBLIC_MAILBOX_ACCOUNT_LOCKS_GUARD = threading.Lock()
+PUBLIC_MAILBOX_ACCOUNT_LOCK_MAX_IDLE_SECONDS = _public_mailbox_cache_seconds(
+    "PUBLIC_MAILBOX_ACCOUNT_LOCK_MAX_IDLE_SECONDS",
+    900.0,
+    86400.0,
+)
 PUBLIC_MAILBOX_BUSY_ERROR_CACHE_SECONDS = _public_mailbox_cache_seconds(
     "PUBLIC_MAILBOX_BUSY_ERROR_CACHE_SECONDS",
     0.5,
@@ -1951,28 +1957,40 @@ def _public_mailbox_account_lock_key(args: tuple, kwargs: dict) -> str:
 def _public_mailbox_account_lock(key: str) -> Optional[threading.Lock]:
     if not key:
         return None
+    now = time.monotonic()
     with PUBLIC_MAILBOX_ACCOUNT_LOCKS_GUARD:
+        for stale_key, stale_lock in list(PUBLIC_MAILBOX_ACCOUNT_LOCKS.items()):
+            last_used = PUBLIC_MAILBOX_ACCOUNT_LOCK_LAST_USED.get(stale_key, 0.0)
+            if (
+                stale_key != key
+                and not stale_lock.locked()
+                and now - last_used > PUBLIC_MAILBOX_ACCOUNT_LOCK_MAX_IDLE_SECONDS
+            ):
+                PUBLIC_MAILBOX_ACCOUNT_LOCKS.pop(stale_key, None)
+                PUBLIC_MAILBOX_ACCOUNT_LOCK_LAST_USED.pop(stale_key, None)
         lock = PUBLIC_MAILBOX_ACCOUNT_LOCKS.get(key)
         if lock is None:
             lock = threading.Lock()
             PUBLIC_MAILBOX_ACCOUNT_LOCKS[key] = lock
+        PUBLIC_MAILBOX_ACCOUNT_LOCK_LAST_USED[key] = now
         return lock
 
 
 def call_public_mailbox_upstream(func, *args, **kwargs):
     timeout_seconds = max(1.0, float(PUBLIC_MAILBOX_FETCH_TIMEOUT_SECONDS or 12))
-    if not PUBLIC_MAILBOX_UPSTREAM_GATE.acquire(
-        timeout=PUBLIC_MAILBOX_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS
-    ):
-        return public_mailbox_upstream_busy_error()
-
     account_lock = _public_mailbox_account_lock(
         _public_mailbox_account_lock_key(args, kwargs)
     )
     if account_lock is not None and not account_lock.acquire(
         timeout=max(0.0, PUBLIC_MAILBOX_ACCOUNT_LOCK_ACQUIRE_TIMEOUT_SECONDS)
     ):
-        PUBLIC_MAILBOX_UPSTREAM_GATE.release()
+        return public_mailbox_upstream_busy_error()
+
+    if not PUBLIC_MAILBOX_UPSTREAM_GATE.acquire(
+        timeout=PUBLIC_MAILBOX_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS
+    ):
+        if account_lock is not None:
+            account_lock.release()
         return public_mailbox_upstream_busy_error()
 
     resources_released = False
@@ -2073,12 +2091,12 @@ try:
     PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS = max(
         0.05,
         min(
-            float(os.getenv("PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS", "1.5") or "1.5"),
-            2.0,
+            float(os.getenv("PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS", "0.35") or "0.35"),
+            1.0,
         ),
     )
 except ValueError:
-    PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS = 1.5
+    PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS = 0.35
 try:
     PUBLIC_MAILBOX_REDIS_MAX_VALUE_BYTES = max(
         16 * 1024,
@@ -2101,6 +2119,38 @@ except ValueError:
     PUBLIC_MAILBOX_REDIS_POOL_SIZE = 8
 PUBLIC_MAILBOX_REDIS_ERROR_LOG_THROTTLE_SECONDS = 60.0
 PUBLIC_MAILBOX_REDIS_LAST_ERROR_AT = 0.0
+try:
+    PUBLIC_MAILBOX_REDIS_BREAKER_FAILURE_THRESHOLD = max(
+        1,
+        min(
+            int(os.getenv("PUBLIC_MAILBOX_REDIS_BREAKER_FAILURE_THRESHOLD", "3") or "3"),
+            20,
+        ),
+    )
+except ValueError:
+    PUBLIC_MAILBOX_REDIS_BREAKER_FAILURE_THRESHOLD = 3
+PUBLIC_MAILBOX_REDIS_BREAKER_COOLDOWN_SECONDS = _public_mailbox_cache_seconds(
+    "PUBLIC_MAILBOX_REDIS_BREAKER_COOLDOWN_SECONDS",
+    30.0,
+    300.0,
+)
+PUBLIC_MAILBOX_REDIS_BREAKER_LOCK = threading.Lock()
+PUBLIC_MAILBOX_REDIS_CONSECUTIVE_FAILURES = 0
+PUBLIC_MAILBOX_REDIS_BREAKER_OPEN_UNTIL = 0.0
+PUBLIC_MAILBOX_REDIS_BREAKER_HALF_OPEN = False
+try:
+    PUBLIC_MAILBOX_REDIS_WRITE_QUEUE_LIMIT = max(
+        1,
+        min(
+            int(os.getenv("PUBLIC_MAILBOX_REDIS_WRITE_QUEUE_LIMIT", "128") or "128"),
+            2048,
+        ),
+    )
+except ValueError:
+    PUBLIC_MAILBOX_REDIS_WRITE_QUEUE_LIMIT = 128
+PUBLIC_MAILBOX_REDIS_WRITE_QUEUE_SLOTS = threading.BoundedSemaphore(
+    PUBLIC_MAILBOX_REDIS_WRITE_QUEUE_LIMIT,
+)
 PUBLIC_MAILBOX_REDIS_WRITE_EXECUTOR = ThreadPoolExecutor(
     max_workers=2,
     thread_name_prefix="public-mailbox-redis",
@@ -2288,6 +2338,45 @@ def _log_public_mailbox_redis_error(operation: str, exc: Exception) -> None:
         pass
 
 
+def _public_mailbox_redis_operation_allowed() -> bool:
+    global PUBLIC_MAILBOX_REDIS_BREAKER_HALF_OPEN
+    now = time.monotonic()
+    with PUBLIC_MAILBOX_REDIS_BREAKER_LOCK:
+        if PUBLIC_MAILBOX_REDIS_BREAKER_OPEN_UNTIL > now:
+            return False
+        if PUBLIC_MAILBOX_REDIS_BREAKER_OPEN_UNTIL:
+            if PUBLIC_MAILBOX_REDIS_BREAKER_HALF_OPEN:
+                return False
+            PUBLIC_MAILBOX_REDIS_BREAKER_HALF_OPEN = True
+        return True
+
+
+def _public_mailbox_redis_record_success() -> None:
+    global PUBLIC_MAILBOX_REDIS_CONSECUTIVE_FAILURES
+    global PUBLIC_MAILBOX_REDIS_BREAKER_OPEN_UNTIL
+    global PUBLIC_MAILBOX_REDIS_BREAKER_HALF_OPEN
+    with PUBLIC_MAILBOX_REDIS_BREAKER_LOCK:
+        PUBLIC_MAILBOX_REDIS_CONSECUTIVE_FAILURES = 0
+        PUBLIC_MAILBOX_REDIS_BREAKER_OPEN_UNTIL = 0.0
+        PUBLIC_MAILBOX_REDIS_BREAKER_HALF_OPEN = False
+
+
+def _public_mailbox_redis_record_failure() -> None:
+    global PUBLIC_MAILBOX_REDIS_CONSECUTIVE_FAILURES
+    global PUBLIC_MAILBOX_REDIS_BREAKER_OPEN_UNTIL
+    global PUBLIC_MAILBOX_REDIS_BREAKER_HALF_OPEN
+    with PUBLIC_MAILBOX_REDIS_BREAKER_LOCK:
+        PUBLIC_MAILBOX_REDIS_CONSECUTIVE_FAILURES += 1
+        if (
+            PUBLIC_MAILBOX_REDIS_CONSECUTIVE_FAILURES
+            >= PUBLIC_MAILBOX_REDIS_BREAKER_FAILURE_THRESHOLD
+        ):
+            PUBLIC_MAILBOX_REDIS_BREAKER_OPEN_UNTIL = (
+                time.monotonic() + PUBLIC_MAILBOX_REDIS_BREAKER_COOLDOWN_SECONDS
+            )
+            PUBLIC_MAILBOX_REDIS_BREAKER_HALF_OPEN = False
+
+
 def public_mailbox_redis_cache_key(namespace: str, key: tuple) -> str:
     payload = json.dumps(key, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -2295,12 +2384,15 @@ def public_mailbox_redis_cache_key(namespace: str, key: tuple) -> str:
 
 
 def get_public_mailbox_redis_cache(namespace: str, key: tuple) -> Optional[Dict[str, Any]]:
+    if not _public_mailbox_redis_operation_allowed():
+        return None
     client = _public_mailbox_redis_client()
     if client is None:
         return None
     redis_key = public_mailbox_redis_cache_key(namespace, key)
     try:
         raw_value = client.execute("GET", redis_key)
+        _public_mailbox_redis_record_success()
         if not raw_value:
             return None
         if len(raw_value) > PUBLIC_MAILBOX_REDIS_MAX_VALUE_BYTES:
@@ -2309,6 +2401,7 @@ def get_public_mailbox_redis_cache(namespace: str, key: tuple) -> Optional[Dict[
         if isinstance(payload, dict):
             return payload
     except Exception as exc:
+        _public_mailbox_redis_record_failure()
         _log_public_mailbox_redis_error("get", exc)
     return None
 
@@ -2329,19 +2422,37 @@ def set_public_mailbox_redis_cache(namespace: str, key: tuple, value: Dict[str, 
         return
 
     def write_cache() -> None:
-        client = _public_mailbox_redis_client()
-        if client is None:
-            return
-        redis_key = public_mailbox_redis_cache_key(namespace, key)
-        ttl_seconds = max(1, int(round(ttl)))
         try:
+            if not _public_mailbox_redis_operation_allowed():
+                return
+            client = _public_mailbox_redis_client()
+            if client is None:
+                return
+            redis_key = public_mailbox_redis_cache_key(namespace, key)
+            ttl_seconds = max(1, int(round(ttl)))
             client.execute("SETEX", redis_key, ttl_seconds, serialized_value)
+            _public_mailbox_redis_record_success()
         except Exception as exc:
+            _public_mailbox_redis_record_failure()
             _log_public_mailbox_redis_error("set", exc)
+        finally:
+            PUBLIC_MAILBOX_REDIS_WRITE_QUEUE_SLOTS.release()
 
     try:
+        if not _public_mailbox_redis_operation_allowed():
+            return
+        if not PUBLIC_MAILBOX_REDIS_WRITE_QUEUE_SLOTS.acquire(blocking=False):
+            _log_public_mailbox_redis_error(
+                "queue_full",
+                RuntimeError("redis cache write queue is full"),
+            )
+            return
         PUBLIC_MAILBOX_REDIS_WRITE_EXECUTOR.submit(write_cache)
     except Exception as exc:
+        try:
+            PUBLIC_MAILBOX_REDIS_WRITE_QUEUE_SLOTS.release()
+        except ValueError:
+            pass
         _log_public_mailbox_redis_error("queue_set", exc)
 
 

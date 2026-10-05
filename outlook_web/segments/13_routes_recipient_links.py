@@ -48,6 +48,18 @@ RECIPIENT_LINK_STICKY_NODE_COOLDOWNS: dict[str, float] = {}
 RECIPIENT_LINK_STICKY_NODE_COOLDOWNS_LOCK = threading.Lock()
 RECIPIENT_LINK_STICKY_SESSION: requests.Session | None = None
 RECIPIENT_LINK_STICKY_SESSION_LOCK = threading.Lock()
+try:
+    PRIMARY_RECIPIENT_LINK_TOUCH_DEBOUNCE_SECONDS = max(
+        0.0,
+        min(
+            float(os.getenv("PRIMARY_RECIPIENT_LINK_TOUCH_DEBOUNCE_SECONDS", "45") or "45"),
+            300.0,
+        ),
+    )
+except ValueError:
+    PRIMARY_RECIPIENT_LINK_TOUCH_DEBOUNCE_SECONDS = 45.0
+PRIMARY_RECIPIENT_LINK_TOUCHES: dict[tuple[str, int], float] = {}
+PRIMARY_RECIPIENT_LINK_TOUCHES_LOCK = threading.Lock()
 
 RECIPIENT_LINK_ERROR_MESSAGES = {
     "invalid_mode": "导入模式无效",
@@ -1025,22 +1037,39 @@ def resolve_recipient_link_public(shared: Any, recipient_email: Any):
 
 
 def touch_primary_recipient_link(record_id: int) -> bool:
+    touch_key = (str(DATABASE), int(record_id))
+    now_monotonic = time.monotonic()
+    with PRIMARY_RECIPIENT_LINK_TOUCHES_LOCK:
+        last_touched = PRIMARY_RECIPIENT_LINK_TOUCHES.get(touch_key, 0.0)
+        if (
+            PRIMARY_RECIPIENT_LINK_TOUCH_DEBOUNCE_SECONDS > 0
+            and now_monotonic - last_touched < PRIMARY_RECIPIENT_LINK_TOUCH_DEBOUNCE_SECONDS
+        ):
+            return False
+        PRIMARY_RECIPIENT_LINK_TOUCHES[touch_key] = now_monotonic
+
     db = get_db()
     now = recipient_link_timestamp()
-    db.execute(
-        """
-        UPDATE recipient_mail_links
-        SET primary_access_count = COALESCE(primary_access_count, 0) + 1,
-            last_accessed_at = ?
-        WHERE id = ?
-        """,
-        (
-            now,
-            record_id,
-        ),
-    )
-    db.commit()
-    return True
+    try:
+        db.execute(
+            """
+            UPDATE recipient_mail_links
+            SET primary_access_count = COALESCE(primary_access_count, 0) + 1,
+                last_accessed_at = ?
+            WHERE id = ?
+            """,
+            (
+                now,
+                record_id,
+            ),
+        )
+        db.commit()
+        return True
+    except Exception:
+        with PRIMARY_RECIPIENT_LINK_TOUCHES_LOCK:
+            if PRIMARY_RECIPIENT_LINK_TOUCHES.get(touch_key) == now_monotonic:
+                PRIMARY_RECIPIENT_LINK_TOUCHES.pop(touch_key, None)
+        raise
 
 
 @app.route("/api/v2/mailboxes/", defaults={"token": ""}, methods=["GET"])
@@ -1259,17 +1288,28 @@ def _recipient_link_try_sticky_forward(account_id: int):
         return None
 
     target_url = _recipient_link_sticky_target_url(target_base)
-    timeout = 15.0
+    connect_timeout = 1.5
+    read_timeout = 8.0
     try:
-        timeout = max(
-            1.0,
+        connect_timeout = max(
+            0.5,
             min(
-                float(os.getenv("PUBLIC_MAILBOX_STICKY_FORWARD_TIMEOUT_SECONDS", "15") or "15"),
-                60.0,
+                float(os.getenv("PUBLIC_MAILBOX_STICKY_FORWARD_CONNECT_TIMEOUT_SECONDS", "1.5") or "1.5"),
+                5.0,
             ),
         )
     except ValueError:
-        timeout = 15.0
+        connect_timeout = 1.5
+    try:
+        read_timeout = max(
+            2.0,
+            min(
+                float(os.getenv("PUBLIC_MAILBOX_STICKY_FORWARD_READ_TIMEOUT_SECONDS", "8") or "8"),
+                20.0,
+            ),
+        )
+    except ValueError:
+        read_timeout = 8.0
 
     headers = {
         "User-Agent": str(request.headers.get("User-Agent") or "mailbox-sticky-forwarder"),
@@ -1281,9 +1321,18 @@ def _recipient_link_try_sticky_forward(account_id: int):
         upstream = _recipient_link_sticky_session().get(
             target_url,
             headers=headers,
-            timeout=timeout,
+            timeout=(connect_timeout, read_timeout),
         )
         status = int(upstream.status_code or 200)
+        if status == 429 or status >= 500:
+            _recipient_link_sticky_mark_node_failure(owner_node)
+            app.logger.warning(
+                "recipient mailbox sticky upstream unhealthy account_id=%s owner=%s status=%s",
+                account_id,
+                owner_node,
+                status,
+            )
+            return None
         response = make_response(upstream.content, status)
         for header_name in (
             "Content-Type",
@@ -1298,10 +1347,7 @@ def _recipient_link_try_sticky_forward(account_id: int):
             if header_value:
                 response.headers[header_name] = header_value
         response.headers["X-Public-Mailbox-Sticky-Routed"] = owner_node
-        if status >= 500:
-            _recipient_link_sticky_mark_node_failure(owner_node)
-        else:
-            _recipient_link_sticky_clear_node_failure(owner_node)
+        _recipient_link_sticky_clear_node_failure(owner_node)
         return response
     except requests.RequestException:
         _recipient_link_sticky_mark_node_failure(owner_node)
@@ -1620,6 +1666,17 @@ def _recipient_link_public_mailbox_response(shared: str, recipient_email: str, *
     if response_format == "json":
         result = find_public_mailbox_messages(account, requested_recipient, 1)
         status = int(result.get("status") or (200 if result.get("success") else 502))
+        if not result.get("success") and status == 404:
+            return _recipient_link_public_json_response(
+                {
+                    "attachments": [],
+                    "mailbox": "INBOX",
+                    "msg": "未找到匹配邮件",
+                    "status": False,
+                    "time": "",
+                },
+                200,
+            )
         payload = _recipient_link_public_query_payload(result)
         return _recipient_link_public_json_response(payload, status)
 

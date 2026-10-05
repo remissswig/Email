@@ -141,8 +141,13 @@ def post_with_proxy_fallback(url: str, *, proxy_url: str = None,
 GRAPH_DEFAULT_TOKEN_SCOPE = "https://graph.microsoft.com/.default"
 ACCESS_TOKEN_CACHE_SKEW_SECONDS = 120
 ACCESS_TOKEN_CACHE_MAX_TTL_SECONDS = 3300
+ACCESS_TOKEN_CACHE_MAX_ENTRIES = 1024
+ACCESS_TOKEN_REFRESH_FAILURE_CACHE_SECONDS = 2.0
+ACCESS_TOKEN_REFRESH_WAIT_TIMEOUT_SECONDS = 20.0
 access_token_cache: Dict[str, Dict[str, Any]] = {}
 access_token_cache_lock = threading.Lock()
+access_token_refresh_inflight: Dict[str, Dict[str, Any]] = {}
+access_token_refresh_failure_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
 
 
 def build_access_token_cache_key(kind: str, client_id: str, refresh_token: str) -> str:
@@ -168,6 +173,7 @@ def get_cached_access_token(kind: str, client_id: str, refresh_token: str) -> st
         if float(cached.get('expires_at') or 0) <= now:
             access_token_cache.pop(cache_key, None)
             return ''
+        cached['last_used_at'] = now
         return str(cached.get('access_token') or '')
 
 
@@ -184,7 +190,137 @@ def cache_access_token(kind: str, client_id: str, refresh_token: str, access_tok
         access_token_cache[cache_key] = {
             'access_token': access_token,
             'expires_at': expires_at,
+            'last_used_at': time.monotonic(),
         }
+        if len(access_token_cache) > ACCESS_TOKEN_CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                access_token_cache,
+                key=lambda item_key: (
+                    float(access_token_cache[item_key].get('last_used_at') or 0),
+                    float(access_token_cache[item_key].get('expires_at') or 0),
+                ),
+            )
+            access_token_cache.pop(oldest_key, None)
+
+
+def _access_token_refresh_timeout_result() -> Dict[str, Any]:
+    return {
+        "success": False,
+        "error": build_error_payload(
+            "TOKEN_REFRESH_TIMEOUT",
+            "刷新访问令牌超时，请稍后重试",
+            "TimeoutError",
+            504,
+            "access token refresh singleflight wait timed out",
+        ),
+    }
+
+
+def _get_access_token_result(
+    kind: str,
+    client_id: str,
+    refresh_token: str,
+    request_func,
+    error_code: str,
+    error_message: str,
+    error_type: str,
+) -> Dict[str, Any]:
+    """合并同一 refresh token 的并发刷新，避免瞬时刷新风暴。"""
+    cached_token = get_cached_access_token(kind, client_id, refresh_token)
+    if cached_token:
+        return {"success": True, "access_token": cached_token}
+
+    cache_key = build_access_token_cache_key(kind, client_id, refresh_token)
+    now = time.monotonic()
+    with access_token_cache_lock:
+        failure = access_token_refresh_failure_cache.get(cache_key)
+        if failure:
+            failure_expires_at, failure_result = failure
+            if failure_expires_at > now:
+                return dict(failure_result)
+            access_token_refresh_failure_cache.pop(cache_key, None)
+
+        entry = access_token_refresh_inflight.get(cache_key)
+        if entry is None:
+            entry = {
+                "event": threading.Event(),
+                "result": None,
+            }
+            access_token_refresh_inflight[cache_key] = entry
+            is_owner = True
+        else:
+            is_owner = False
+
+    if not is_owner:
+        event = entry.get("event")
+        if not isinstance(event, threading.Event) or not event.wait(
+            ACCESS_TOKEN_REFRESH_WAIT_TIMEOUT_SECONDS
+        ):
+            return _access_token_refresh_timeout_result()
+        result = entry.get("result")
+        return dict(result) if isinstance(result, dict) else _access_token_refresh_timeout_result()
+
+    result: Dict[str, Any]
+    try:
+        response = request_func()
+        if response.status_code != 200:
+            result = {
+                "success": False,
+                "error": build_error_payload(
+                    error_code,
+                    error_message,
+                    error_type,
+                    response.status_code,
+                    get_response_details(response),
+                ),
+            }
+        else:
+            payload = response.json()
+            access_token = payload.get("access_token")
+            if not access_token:
+                result = {
+                    "success": False,
+                    "error": build_error_payload(
+                        f"{error_code.rsplit('_', 1)[0]}_MISSING",
+                        error_message,
+                        error_type,
+                        response.status_code,
+                        payload,
+                    ),
+                }
+            else:
+                cache_access_token(
+                    kind,
+                    client_id,
+                    refresh_token,
+                    access_token,
+                    payload.get("expires_in"),
+                )
+                result = {"success": True, "access_token": access_token}
+    except Exception as exc:
+        result = {
+            "success": False,
+            "error": build_error_payload(
+                f"{error_code.rsplit('_', 1)[0]}_EXCEPTION",
+                error_message,
+                type(exc).__name__,
+                500,
+                str(exc),
+            ),
+        }
+    finally:
+        with access_token_cache_lock:
+            if not result.get("success"):
+                access_token_refresh_failure_cache[cache_key] = (
+                    time.monotonic() + ACCESS_TOKEN_REFRESH_FAILURE_CACHE_SECONDS,
+                    dict(result),
+                )
+            access_token_refresh_inflight.pop(cache_key, None)
+            event = entry.get("event")
+            entry["result"] = dict(result)
+            if isinstance(event, threading.Event):
+                event.set()
+    return result
 
 
 def build_graph_refresh_scope(graph_scopes: List[str]) -> str:
@@ -332,58 +468,20 @@ def proxy_socket_context(proxy_url: str):
 def get_access_token_graph_result(client_id: str, refresh_token: str, proxy_url: str = None,
                                   fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
     """获取 Graph API access_token（包含错误详情）"""
-    cached_token = get_cached_access_token('graph', client_id, refresh_token)
-    if cached_token:
-        return {"success": True, "access_token": cached_token}
-
-    try:
-        res = request_graph_token_response(
+    return _get_access_token_result(
+        "graph",
+        client_id,
+        refresh_token,
+        lambda: request_graph_token_response(
             client_id,
             refresh_token,
             proxy_url,
             fallback_proxy_urls,
-        )
-
-        if res.status_code != 200:
-            details = get_response_details(res)
-            return {
-                "success": False,
-                "error": build_error_payload(
-                    "GRAPH_TOKEN_FAILED",
-                    "获取访问令牌失败",
-                    "GraphAPIError",
-                    res.status_code,
-                    details
-                )
-            }
-
-        payload = res.json()
-        access_token = payload.get("access_token")
-        if not access_token:
-            return {
-                "success": False,
-                "error": build_error_payload(
-                    "GRAPH_TOKEN_MISSING",
-                    "获取访问令牌失败",
-                    "GraphAPIError",
-                    res.status_code,
-                    payload
-                )
-            }
-
-        cache_access_token('graph', client_id, refresh_token, access_token, payload.get('expires_in'))
-        return {"success": True, "access_token": access_token}
-    except Exception as exc:
-        return {
-            "success": False,
-            "error": build_error_payload(
-                "GRAPH_TOKEN_EXCEPTION",
-                "获取访问令牌失败",
-                type(exc).__name__,
-                500,
-                str(exc)
-            )
-        }
+        ),
+        "GRAPH_TOKEN_FAILED",
+        "获取访问令牌失败",
+        "GraphAPIError",
+    )
 
 
 def get_access_token_graph(client_id: str, refresh_token: str, proxy_url: str = None,
@@ -470,7 +568,8 @@ def get_emails_graph(client_id: str, refresh_token: str, folder: str = 'inbox', 
 
 def get_emails_graph_by_recipient(client_id: str, refresh_token: str, folder: str = 'inbox',
                                   recipient: str = '', top: int = 1, proxy_url: str = None,
-                                  fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
+                                  fallback_proxy_urls: Optional[List[str]] = None,
+                                  include_headers: bool = False) -> Dict[str, Any]:
     """通过 Graph AQS 直接按收件人搜索，避免公开链接先拉大列表再筛。"""
     normalized_recipient = normalize_email_address(recipient)
     if not normalized_recipient:
@@ -498,10 +597,16 @@ def get_emails_graph_by_recipient(client_id: str, refresh_token: str, folder: st
     }
     folder_name = folder_map.get(str(folder or '').lower(), 'inbox')
     url = f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder_name}/messages"
+    selected_fields = (
+        "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,"
+        "hasAttachments,bodyPreview,body"
+    )
+    if include_headers:
+        selected_fields += ",internetMessageHeaders"
     params = {
         "$search": f'"to:{normalized_recipient}"',
         "$top": max(1, min(25, int(top or 1))),
-        "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,bodyPreview,body",
+        "$select": selected_fields,
     }
     headers = {
         "Authorization": f"Bearer {token_result.get('access_token')}",
@@ -923,53 +1028,20 @@ def request_imap_token_response(client_id: str, refresh_token: str, proxy_url: s
 def get_access_token_imap_result(client_id: str, refresh_token: str, proxy_url: str = None,
                                  fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
     """获取 IMAP access_token（包含错误详情）"""
-    cached_token = get_cached_access_token('imap', client_id, refresh_token)
-    if cached_token:
-        return {"success": True, "access_token": cached_token}
-
-    try:
-        res = request_imap_token_response(client_id, refresh_token, proxy_url, fallback_proxy_urls)
-
-        if res.status_code != 200:
-            details = get_response_details(res)
-            return {
-                "success": False,
-                "error": build_error_payload(
-                    "IMAP_TOKEN_FAILED",
-                    "获取访问令牌失败",
-                    "IMAPError",
-                    res.status_code,
-                    details
-                )
-            }
-
-        payload = res.json()
-        access_token = payload.get("access_token")
-        if not access_token:
-            return {
-                "success": False,
-                "error": build_error_payload(
-                    "IMAP_TOKEN_MISSING",
-                    "获取访问令牌失败",
-                    "IMAPError",
-                    res.status_code,
-                    payload
-                )
-            }
-
-        cache_access_token('imap', client_id, refresh_token, access_token, payload.get('expires_in'))
-        return {"success": True, "access_token": access_token}
-    except Exception as exc:
-        return {
-            "success": False,
-            "error": build_error_payload(
-                "IMAP_TOKEN_EXCEPTION",
-                "获取访问令牌失败",
-                type(exc).__name__,
-                500,
-                str(exc)
-            )
-        }
+    return _get_access_token_result(
+        "imap",
+        client_id,
+        refresh_token,
+        lambda: request_imap_token_response(
+            client_id,
+            refresh_token,
+            proxy_url,
+            fallback_proxy_urls,
+        ),
+        "IMAP_TOKEN_FAILED",
+        "获取访问令牌失败",
+        "IMAPError",
+    )
 
 
 def get_access_token_imap(client_id: str, refresh_token: str, proxy_url: str = None,

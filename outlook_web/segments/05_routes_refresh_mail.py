@@ -3567,6 +3567,7 @@ def fetch_account_graph_emails_by_recipient(
         limit,
         get_account_proxy_url(account),
         get_account_proxy_failover_urls(account),
+        include_headers=public_mailbox_requires_delivery_header_match(recipient),
     )
     if not result.get('success'):
         return result

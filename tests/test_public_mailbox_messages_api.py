@@ -127,6 +127,63 @@ class PublicMailboxMessageHelperTests(unittest.TestCase):
         self.assertEqual(second['access_token'], 'cached-graph-token')
         token_request_mock.assert_called_once()
 
+    def test_graph_access_token_refresh_is_singleflight(self):
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    'access_token': 'singleflight-graph-token',
+                    'expires_in': 3600,
+                }
+
+        with web_outlook_app.access_token_cache_lock:
+            web_outlook_app.access_token_cache.clear()
+            web_outlook_app.access_token_refresh_failure_cache.clear()
+            web_outlook_app.access_token_refresh_inflight.clear()
+
+        started = threading.Event()
+        release = threading.Event()
+        barrier = threading.Barrier(5)
+
+        def slow_token_request(*_args):
+            started.set()
+            self.assertTrue(release.wait(2))
+            return FakeResponse()
+
+        results = []
+
+        def refresh_token():
+            barrier.wait(2)
+            results.append(
+                web_outlook_app.get_access_token_graph_result(
+                    'singleflight-client',
+                    'singleflight-refresh-token',
+                )
+            )
+
+        with patch.object(
+            web_outlook_app,
+            'request_graph_token_response',
+            side_effect=slow_token_request,
+        ) as token_request_mock:
+            threads = [threading.Thread(target=refresh_token) for _ in range(5)]
+            for thread in threads:
+                thread.start()
+            self.assertTrue(started.wait(2))
+            release.set()
+            for thread in threads:
+                thread.join(2)
+
+        self.assertEqual(len(results), 5)
+        self.assertTrue(all(result['success'] for result in results))
+        self.assertEqual(
+            {result['access_token'] for result in results},
+            {'singleflight-graph-token'},
+        )
+        token_request_mock.assert_called_once()
+
     def test_shared_email_header_matcher_matches_display_name_and_rejects_substrings(self):
         self.assertTrue(web_outlook_app.email_header_matches_address(
             'Hide My Email <01litany_muster@icloud.com>',
@@ -2966,8 +3023,42 @@ class PublicMailboxMessagesApiTests(unittest.TestCase):
             1,
         )
         row = self.get_public_link_row(int(link['id']))
-        self.assertEqual(int(row['primary_access_count'] or 0), 2)
+        self.assertEqual(int(row['primary_access_count'] or 0), 1)
         self.assertIsNotNone(row['last_accessed_at'])
+
+    def test_public_query_no_mail_returns_normal_business_response(self):
+        link = self.seed_public_link('RecipientNoMail@iCloud.com')
+        shared = self.get_account_share_segment(link['account_id'])
+        account = {
+            'id': int(link['account_id']),
+            'email': 'owner@example.com',
+            'account_type': 'outlook',
+        }
+        with patch.object(
+            web_outlook_app,
+            'get_account_by_id',
+            return_value=account,
+        ), patch.object(
+            web_outlook_app,
+            'find_public_mailbox_messages',
+            return_value={
+                'success': False,
+                'status': 404,
+                'error': '未在扫描范围内找到匹配邮件',
+            },
+        ):
+            response = self.client.get(
+                f"/query/{shared}/RecipientNoMail@iCloud.com"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {
+            'attachments': [],
+            'mailbox': 'INBOX',
+            'msg': '未找到匹配邮件',
+            'status': False,
+            'time': '',
+        })
 
     def test_public_show_route_accepts_plus_alias_for_same_mailbox(self):
         link = self.seed_public_link('Recipient01@iCloud.com')
