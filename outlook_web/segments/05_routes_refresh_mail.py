@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait
+import os
 import secrets
 import threading
 import time
@@ -25,6 +26,20 @@ LOG_PAGINATION_MAX_LIMIT = 1000
 token_refresh_stop_event = threading.Event()
 selected_refresh_tasks: Dict[str, Dict[str, Any]] = {}
 selected_refresh_tasks_lock = threading.Lock()
+try:
+    MAIL_FOLDER_FETCH_WORKERS = max(
+        2,
+        min(
+            int(os.getenv("MAIL_FOLDER_FETCH_WORKERS", "8") or "8"),
+            32,
+        ),
+    )
+except ValueError:
+    MAIL_FOLDER_FETCH_WORKERS = 8
+MAIL_FOLDER_FETCH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=MAIL_FOLDER_FETCH_WORKERS,
+    thread_name_prefix='mail-folder-fetch',
+)
 
 
 def normalize_account_refresh_status_value(status: Any) -> str:
@@ -3608,10 +3623,9 @@ def fetch_account_emails(
         merged_top = max(1, min(100, top * 2))
         folder_jobs = ('inbox', 'junkemail')
         results = {}
-        executor = ThreadPoolExecutor(max_workers=len(folder_jobs), thread_name_prefix='mail-folder-fetch')
         detail_kwargs = {'include_details': True} if include_details else {}
         future_map = {
-            folder_job: executor.submit(
+            folder_job: MAIL_FOLDER_FETCH_EXECUTOR.submit(
                 fetch_account_folder_emails,
                 account,
                 folder_job,
@@ -3653,8 +3667,19 @@ def fetch_account_emails(
                         f'folder={folder_job}, timeout={MAIL_FETCH_OVERALL_TIMEOUT}s'
                     )
                 }
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as exc:
+            for folder_job, future in future_map.items():
+                future.cancel()
+                results[folder_job] = {
+                    'success': False,
+                    'error': build_error_payload(
+                        'EMAIL_FETCH_FAILED',
+                        '获取邮件失败，请检查账号配置',
+                        type(exc).__name__,
+                        500,
+                        str(exc)
+                    )
+                }
 
         return merge_folder_results(
             results,

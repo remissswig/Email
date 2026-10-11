@@ -9,8 +9,6 @@ import secrets
 import sqlite3
 import threading
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from functools import wraps
 from html.parser import HTMLParser
@@ -18,6 +16,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 import zipfile
+
+import requests
 
 from outlook_web.recipient_links import (
     RecipientLinkInputError,
@@ -1201,17 +1201,43 @@ def _recipient_link_try_sticky_forward(account_id: int):
         return None
 
     target_url = _recipient_link_sticky_target_url(target_base)
-    timeout = 15.0
+    timeout_env = str(os.getenv("PUBLIC_MAILBOX_STICKY_FORWARD_TIMEOUT_SECONDS") or "").strip()
     try:
-        timeout = max(
+        fallback_timeout = max(1.0, min(float(timeout_env or "4"), 60.0))
+    except ValueError:
+        fallback_timeout = 4.0
+    try:
+        connect_timeout = max(
+            0.2,
+            min(
+                float(
+                    os.getenv(
+                        "PUBLIC_MAILBOX_STICKY_FORWARD_CONNECT_TIMEOUT_SECONDS",
+                        str(min(fallback_timeout, 1.5)),
+                    )
+                    or "1.5"
+                ),
+                10.0,
+            ),
+        )
+    except ValueError:
+        connect_timeout = min(fallback_timeout, 1.5)
+    try:
+        read_timeout = max(
             1.0,
             min(
-                float(os.getenv("PUBLIC_MAILBOX_STICKY_FORWARD_TIMEOUT_SECONDS", "15") or "15"),
+                float(
+                    os.getenv(
+                        "PUBLIC_MAILBOX_STICKY_FORWARD_READ_TIMEOUT_SECONDS",
+                        str(fallback_timeout),
+                    )
+                    or str(fallback_timeout)
+                ),
                 60.0,
             ),
         )
     except ValueError:
-        timeout = 15.0
+        read_timeout = fallback_timeout
 
     headers = {
         "User-Agent": str(request.headers.get("User-Agent") or "mailbox-sticky-forwarder"),
@@ -1220,29 +1246,13 @@ def _recipient_link_try_sticky_forward(account_id: int):
         "X-Public-Mailbox-Sticky-Owner": owner_node,
     }
     try:
-        forwarded = urllib.request.Request(target_url, headers=headers, method="GET")
-        with urllib.request.urlopen(forwarded, timeout=timeout) as upstream:
-            body = upstream.read()
-            status = int(upstream.getcode() or 200)
-            response = make_response(body, status)
-            for header_name in (
-                "Content-Type",
-                "Cache-Control",
-                "Content-Security-Policy",
-                "Referrer-Policy",
-                "X-Content-Type-Options",
-                "X-Robots-Tag",
-                "X-Mailbox-Node",
-            ):
-                header_value = upstream.headers.get(header_name)
-                if header_value:
-                    response.headers[header_name] = header_value
-            response.headers["X-Public-Mailbox-Sticky-Routed"] = owner_node
-            _recipient_link_sticky_clear_node_failure(owner_node)
-            return response
-    except urllib.error.HTTPError as exc:
-        body = exc.read()
-        response = make_response(body, int(exc.code or 502))
+        upstream = requests.get(
+            target_url,
+            headers=headers,
+            timeout=(connect_timeout, read_timeout),
+            allow_redirects=False,
+        )
+        response = make_response(upstream.content, int(upstream.status_code or 200))
         for header_name in (
             "Content-Type",
             "Cache-Control",
@@ -1252,12 +1262,14 @@ def _recipient_link_try_sticky_forward(account_id: int):
             "X-Robots-Tag",
             "X-Mailbox-Node",
         ):
-            header_value = exc.headers.get(header_name)
+            header_value = upstream.headers.get(header_name)
             if header_value:
                 response.headers[header_name] = header_value
         response.headers["X-Public-Mailbox-Sticky-Routed"] = owner_node
-        if int(exc.code or 0) >= 500:
+        if int(upstream.status_code or 0) >= 500:
             _recipient_link_sticky_mark_node_failure(owner_node)
+        else:
+            _recipient_link_sticky_clear_node_failure(owner_node)
         return response
     except Exception:
         _recipient_link_sticky_mark_node_failure(owner_node)

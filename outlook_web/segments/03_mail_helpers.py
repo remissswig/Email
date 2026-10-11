@@ -1892,6 +1892,8 @@ def fetch_imap_message(mail, message_id: Any, query: str, preferred_mode: str = 
                     'status': type(exc).__name__,
                     'response': sanitize_error_details(str(exc))[:200],
                 })
+                if is_timeout_like_exception(exc):
+                    return 'TIMEOUT', None, mode, attempts
     return 'NO', None, '', attempts
 
 

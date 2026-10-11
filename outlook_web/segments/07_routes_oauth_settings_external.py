@@ -1548,12 +1548,12 @@ PUBLIC_MAILBOX_RESULT_CACHE_SECONDS = _public_mailbox_cache_seconds(
 )
 PUBLIC_MAILBOX_EMPTY_CACHE_SECONDS = _public_mailbox_cache_seconds(
     "PUBLIC_MAILBOX_EMPTY_CACHE_SECONDS",
-    5.0,
+    2.0,
     60.0,
 )
 PUBLIC_MAILBOX_ERROR_CACHE_SECONDS = _public_mailbox_cache_seconds(
     "PUBLIC_MAILBOX_ERROR_CACHE_SECONDS",
-    10.0,
+    2.0,
     120.0,
 )
 PUBLIC_MAILBOX_IMAP_AUTH_ERROR_CACHE_SECONDS = _public_mailbox_cache_seconds(
@@ -2059,12 +2059,22 @@ try:
     PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS = max(
         0.05,
         min(
-            float(os.getenv("PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS", "1.5") or "1.5"),
+            float(os.getenv("PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS", "0.5") or "0.5"),
             2.0,
         ),
     )
 except ValueError:
-    PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS = 1.5
+    PUBLIC_MAILBOX_REDIS_TIMEOUT_SECONDS = 0.5
+try:
+    PUBLIC_MAILBOX_REDIS_WRITE_QUEUE_LIMIT = max(
+        0,
+        min(
+            int(os.getenv("PUBLIC_MAILBOX_REDIS_WRITE_QUEUE_LIMIT", "256") or "256"),
+            10_000,
+        ),
+    )
+except ValueError:
+    PUBLIC_MAILBOX_REDIS_WRITE_QUEUE_LIMIT = 256
 try:
     PUBLIC_MAILBOX_REDIS_MAX_VALUE_BYTES = max(
         16 * 1024,
@@ -2090,6 +2100,9 @@ PUBLIC_MAILBOX_REDIS_LAST_ERROR_AT = 0.0
 PUBLIC_MAILBOX_REDIS_WRITE_EXECUTOR = ThreadPoolExecutor(
     max_workers=2,
     thread_name_prefix="public-mailbox-redis",
+)
+PUBLIC_MAILBOX_REDIS_WRITE_SEMAPHORE = threading.BoundedSemaphore(
+    max(1, PUBLIC_MAILBOX_REDIS_WRITE_QUEUE_LIMIT)
 )
 PUBLIC_MAILBOX_REDIS_CLIENT_LOCK = threading.Lock()
 PUBLIC_MAILBOX_REDIS_CLIENT = None
@@ -2315,19 +2328,31 @@ def set_public_mailbox_redis_cache(namespace: str, key: tuple, value: Dict[str, 
         return
 
     def write_cache() -> None:
-        client = _public_mailbox_redis_client()
-        if client is None:
-            return
-        redis_key = public_mailbox_redis_cache_key(namespace, key)
-        ttl_seconds = max(1, int(round(ttl)))
         try:
-            client.execute("SETEX", redis_key, ttl_seconds, serialized_value)
-        except Exception as exc:
-            _log_public_mailbox_redis_error("set", exc)
+            client = _public_mailbox_redis_client()
+            if client is None:
+                return
+            redis_key = public_mailbox_redis_cache_key(namespace, key)
+            ttl_seconds = max(1, int(round(ttl)))
+            try:
+                client.execute("SETEX", redis_key, ttl_seconds, serialized_value)
+            except Exception as exc:
+                _log_public_mailbox_redis_error("set", exc)
+        finally:
+            try:
+                PUBLIC_MAILBOX_REDIS_WRITE_SEMAPHORE.release()
+            except ValueError:
+                pass
 
     try:
+        if not PUBLIC_MAILBOX_REDIS_WRITE_SEMAPHORE.acquire(blocking=False):
+            return
         PUBLIC_MAILBOX_REDIS_WRITE_EXECUTOR.submit(write_cache)
     except Exception as exc:
+        try:
+            PUBLIC_MAILBOX_REDIS_WRITE_SEMAPHORE.release()
+        except ValueError:
+            pass
         _log_public_mailbox_redis_error("queue_set", exc)
 
 
