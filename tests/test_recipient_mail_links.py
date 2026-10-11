@@ -399,6 +399,38 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
             content_type="multipart/form-data",
         )
 
+    def external_import_links(
+        self,
+        *,
+        mode,
+        files,
+        api_key=None,
+        mainemail=None,
+        expiry=None,
+        expires_at=None,
+        auto_export=None,
+    ):
+        client = self.app.test_client()
+        data = {"mode": mode}
+        if mainemail is not None:
+            data["mainemail"] = mainemail
+        if expiry is not None:
+            data["expiry"] = expiry
+        if expires_at is not None:
+            data["expires_at"] = expires_at
+        if auto_export is not None:
+            data["auto_export"] = auto_export
+        data["files"] = [(io.BytesIO(content), filename) for filename, content in files]
+        headers = {}
+        if api_key is not None:
+            headers["X-API-Key"] = api_key
+        return client.post(
+            "/api/external/verification-links/import",
+            data=data,
+            headers=headers,
+            content_type="multipart/form-data",
+        )
+
     def count_recipient_links(self) -> int:
         with self.app_context():
             row = self.module.get_db().execute(
@@ -927,6 +959,51 @@ class RecipientMailLinkRepositoryTests(unittest.TestCase):
         self.assertEqual(response.content_type, "text/plain; charset=utf-8")
         self.assertIn("api-customers.txt", response.headers.get("Content-Disposition", ""))
         lines = response.get_data(as_text=True).splitlines()
+        self.assertEqual(lines[0], "owner@example.com----password----client-id----token")
+        self.assertTrue(lines[1].startswith("recipient@example.com----http://localhost/show/"))
+        self.assertEqual(self.count_recipient_links(), 1)
+
+    def test_external_import_requires_api_key(self):
+        with self.app_context():
+            self.assertTrue(self.module.set_setting("external_api_key", "external-secret"))
+
+        response = self.external_import_links(
+            mode="batch",
+            files=[
+                (
+                    "customers.txt",
+                    b"owner@example.com----password----client-id----token\nrecipient@example.com\n",
+                )
+            ],
+            auto_export="1",
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("API Key", response.get_json()["error"])
+        self.assertEqual(self.count_recipient_links(), 0)
+
+    def test_external_import_accepts_api_key_and_exports_zip(self):
+        with self.app_context():
+            self.assertTrue(self.module.set_setting("external_api_key", "external-secret"))
+
+        response = self.external_import_links(
+            mode="batch",
+            files=[
+                (
+                    "customers.txt",
+                    b"owner@example.com----password----client-id----token\nrecipient@example.com\n",
+                )
+            ],
+            api_key=" external-secret ",
+            auto_export="1",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content_type, "application/zip")
+        with zipfile.ZipFile(io.BytesIO(response.get_data())) as archive:
+            names = archive.namelist()
+            self.assertEqual(names, ["api-customers.txt"])
+            lines = archive.read(names[0]).decode("utf-8").splitlines()
         self.assertEqual(lines[0], "owner@example.com----password----client-id----token")
         self.assertTrue(lines[1].startswith("recipient@example.com----http://localhost/show/"))
         self.assertEqual(self.count_recipient_links(), 1)

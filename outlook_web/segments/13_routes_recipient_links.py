@@ -647,6 +647,18 @@ def _recipient_import_export_response(export_items: list[dict[str, Any]], *, for
 @csrf_exempt
 @login_required
 def api_import_recipient_verification_links():
+    return _api_import_recipient_verification_links()
+
+
+@app.route("/api/external/verification-links/import", methods=["POST"])
+@recipient_link_no_store
+@csrf_exempt
+@api_key_required
+def api_external_import_recipient_verification_links():
+    return _api_import_recipient_verification_links()
+
+
+def _api_import_recipient_verification_links():
     if CLUSTER_CONFIG.is_replica:
         return _cluster_read_only_error()
 
